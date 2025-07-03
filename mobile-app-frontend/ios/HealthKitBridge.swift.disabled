@@ -1,0 +1,380 @@
+// HealthKitBridge.swift
+// Native iOS bridge for React Native HealthKit integration
+// This enables real Apple Health data access
+
+import Foundation
+import HealthKit
+import React
+
+@objc(HealthKitBridge)
+class HealthKitBridge: NSObject, RCTBridgeModule {
+    
+    static func moduleName() -> String! {
+        return "HealthKitBridge"
+    }
+    
+    static func requiresMainQueueSetup() -> Bool {
+        return true
+    }
+    
+    private let healthStore = HKHealthStore()
+    
+    // MARK: - HealthKit Availability
+    
+    @objc func isAvailable(_ resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+        resolve(HKHealthStore.isHealthDataAvailable())
+    }
+    
+    // MARK: - Permissions
+    
+    @objc func requestPermissions(_ permissionTypes: [String], resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+        
+        var healthDataTypes = Set<HKSampleType>()
+        
+        for permissionType in permissionTypes {
+            switch permissionType {
+            case "HKCategoryTypeIdentifierSleepAnalysis":
+                healthDataTypes.insert(HKObjectType.categoryType(forIdentifier: .sleepAnalysis)!)
+            case "HKQuantityTypeIdentifierStepCount":
+                healthDataTypes.insert(HKObjectType.quantityType(forIdentifier: .stepCount)!)
+            case "HKQuantityTypeIdentifierActiveEnergyBurned":
+                healthDataTypes.insert(HKObjectType.quantityType(forIdentifier: .activeEnergyBurned)!)
+            case "HKQuantityTypeIdentifierDistanceWalkingRunning":
+                healthDataTypes.insert(HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning)!)
+            case "HKQuantityTypeIdentifierHeartRate":
+                healthDataTypes.insert(HKObjectType.quantityType(forIdentifier: .heartRate)!)
+            case "HKQuantityTypeIdentifierRestingHeartRate":
+                healthDataTypes.insert(HKObjectType.quantityType(forIdentifier: .restingHeartRate)!)
+            case "HKQuantityTypeIdentifierBodyMass":
+                healthDataTypes.insert(HKObjectType.quantityType(forIdentifier: .bodyMass)!)
+            default:
+                print("Unknown permission type: \(permissionType)")
+            }
+        }
+        
+        healthStore.requestAuthorization(toShare: nil, read: healthDataTypes) { (granted, error) in
+            if let error = error {
+                reject("PERMISSION_ERROR", "Failed to request permissions: \(error.localizedDescription)", error)
+                return
+            }
+            
+            resolve([
+                "granted": granted,
+                "permissions": permissionTypes
+            ])
+        }
+    }
+    
+    // MARK: - Sleep Data Query
+    
+    @objc func querySleepData(_ startDateString: String, endDateString: String, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+        
+        guard let sleepType = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) else {
+            reject("INVALID_TYPE", "Sleep analysis type not available", nil)
+            return
+        }
+        
+        let formatter = ISO8601DateFormatter()
+        guard let startDate = formatter.date(from: startDateString),
+              let endDate = formatter.date(from: endDateString) else {
+            reject("INVALID_DATE", "Invalid date format", nil)
+            return
+        }
+        
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate)
+        
+        let query = HKSampleQuery(sampleType: sleepType, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, samples, error) in
+            
+            if let error = error {
+                reject("QUERY_ERROR", "Failed to query sleep data: \(error.localizedDescription)", error)
+                return
+            }
+            
+            guard let sleepSamples = samples as? [HKCategorySample] else {
+                resolve([])
+                return
+            }
+            
+            var sleepRecords: [[String: Any]] = []
+            
+            for sample in sleepSamples {
+                let record: [String: Any] = [
+                    "uuid": sample.uuid.uuidString,
+                    "startDate": formatter.string(from: sample.startDate),
+                    "endDate": formatter.string(from: sample.endDate),
+                    "value": sample.value,
+                    "sourceRevision": [
+                        "source": [
+                            "name": sample.sourceRevision.source.name,
+                            "bundleIdentifier": sample.sourceRevision.source.bundleIdentifier
+                        ],
+                        "version": sample.sourceRevision.version ?? ""
+                    ],
+                    "device": sample.device.map { device in
+                        [
+                            "name": device.name ?? "",
+                            "model": device.model ?? "",
+                            "manufacturer": device.manufacturer ?? "",
+                            "hardwareVersion": device.hardwareVersion ?? "",
+                            "softwareVersion": device.softwareVersion ?? ""
+                        ]
+                    } ?? [:],
+                    "metadata": sample.metadata ?? [:]
+                ]
+                sleepRecords.append(record)
+            }
+            
+            resolve(sleepRecords)
+        }
+        
+        healthStore.execute(query)
+    }
+    
+    // MARK: - Step Data Query
+    
+    @objc func queryStepData(_ startDateString: String, endDateString: String, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+        
+        guard let stepType = HKObjectType.quantityType(forIdentifier: .stepCount) else {
+            reject("INVALID_TYPE", "Step count type not available", nil)
+            return
+        }
+        
+        let formatter = ISO8601DateFormatter()
+        guard let startDate = formatter.date(from: startDateString),
+              let endDate = formatter.date(from: endDateString) else {
+            reject("INVALID_DATE", "Invalid date format", nil)
+            return
+        }
+        
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate)
+        
+        let query = HKSampleQuery(sampleType: stepType, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, samples, error) in
+            
+            if let error = error {
+                reject("QUERY_ERROR", "Failed to query step data: \(error.localizedDescription)", error)
+                return
+            }
+            
+            guard let stepSamples = samples as? [HKQuantitySample] else {
+                resolve([])
+                return
+            }
+            
+            var stepRecords: [[String: Any]] = []
+            
+            for sample in stepSamples {
+                let record: [String: Any] = [
+                    "uuid": sample.uuid.uuidString,
+                    "startDate": formatter.string(from: sample.startDate),
+                    "endDate": formatter.string(from: sample.endDate),
+                    "value": sample.quantity.doubleValue(for: HKUnit.count()),
+                    "unit": "count",
+                    "sourceRevision": [
+                        "source": [
+                            "name": sample.sourceRevision.source.name,
+                            "bundleIdentifier": sample.sourceRevision.source.bundleIdentifier
+                        ]
+                    ],
+                    "device": sample.device.map { device in
+                        [
+                            "name": device.name ?? "",
+                            "model": device.model ?? ""
+                        ]
+                    } ?? [:],
+                    "metadata": sample.metadata ?? [:]
+                ]
+                stepRecords.append(record)
+            }
+            
+            resolve(stepRecords)
+        }
+        
+        healthStore.execute(query)
+    }
+    
+    // MARK: - Active Energy Data Query
+    
+    @objc func queryActiveEnergyData(_ startDateString: String, endDateString: String, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+        
+        guard let energyType = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned) else {
+            reject("INVALID_TYPE", "Active energy type not available", nil)
+            return
+        }
+        
+        let formatter = ISO8601DateFormatter()
+        guard let startDate = formatter.date(from: startDateString),
+              let endDate = formatter.date(from: endDateString) else {
+            reject("INVALID_DATE", "Invalid date format", nil)
+            return
+        }
+        
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate)
+        
+        let query = HKSampleQuery(sampleType: energyType, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, samples, error) in
+            
+            if let error = error {
+                reject("QUERY_ERROR", "Failed to query active energy data: \(error.localizedDescription)", error)
+                return
+            }
+            
+            guard let energySamples = samples as? [HKQuantitySample] else {
+                resolve([])
+                return
+            }
+            
+            var energyRecords: [[String: Any]] = []
+            
+            for sample in energySamples {
+                let record: [String: Any] = [
+                    "uuid": sample.uuid.uuidString,
+                    "startDate": formatter.string(from: sample.startDate),
+                    "endDate": formatter.string(from: sample.endDate),
+                    "value": sample.quantity.doubleValue(for: HKUnit.kilocalorie()),
+                    "unit": "kcal",
+                    "sourceRevision": [
+                        "source": [
+                            "name": sample.sourceRevision.source.name,
+                            "bundleIdentifier": sample.sourceRevision.source.bundleIdentifier
+                        ]
+                    ],
+                    "device": sample.device.map { device in
+                        [
+                            "name": device.name ?? "",
+                            "model": device.model ?? ""
+                        ]
+                    } ?? [:],
+                    "metadata": sample.metadata ?? [:]
+                ]
+                energyRecords.append(record)
+            }
+            
+            resolve(energyRecords)
+        }
+        
+        healthStore.execute(query)
+    }
+    
+    // MARK: - Distance Data Query
+    
+    @objc func queryDistanceData(_ startDateString: String, endDateString: String, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+        
+        guard let distanceType = HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning) else {
+            reject("INVALID_TYPE", "Distance type not available", nil)
+            return
+        }
+        
+        let formatter = ISO8601DateFormatter()
+        guard let startDate = formatter.date(from: startDateString),
+              let endDate = formatter.date(from: endDateString) else {
+            reject("INVALID_DATE", "Invalid date format", nil)
+            return
+        }
+        
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate)
+        
+        let query = HKSampleQuery(sampleType: distanceType, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, samples, error) in
+            
+            if let error = error {
+                reject("QUERY_ERROR", "Failed to query distance data: \(error.localizedDescription)", error)
+                return
+            }
+            
+            guard let distanceSamples = samples as? [HKQuantitySample] else {
+                resolve([])
+                return
+            }
+            
+            var distanceRecords: [[String: Any]] = []
+            
+            for sample in distanceSamples {
+                let record: [String: Any] = [
+                    "uuid": sample.uuid.uuidString,
+                    "startDate": formatter.string(from: sample.startDate),
+                    "endDate": formatter.string(from: sample.endDate),
+                    "value": sample.quantity.doubleValue(for: HKUnit.meter()),
+                    "unit": "m",
+                    "sourceRevision": [
+                        "source": [
+                            "name": sample.sourceRevision.source.name,
+                            "bundleIdentifier": sample.sourceRevision.source.bundleIdentifier
+                        ]
+                    ],
+                    "device": sample.device.map { device in
+                        [
+                            "name": device.name ?? "",
+                            "model": device.model ?? ""
+                        ]
+                    } ?? [:],
+                    "metadata": sample.metadata ?? [:]
+                ]
+                distanceRecords.append(record)
+            }
+            
+            resolve(distanceRecords)
+        }
+        
+        healthStore.execute(query)
+    }
+    
+    // MARK: - Heart Rate Data Query
+    
+    @objc func queryHeartRateData(_ startDateString: String, endDateString: String, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
+        
+        guard let heartRateType = HKObjectType.quantityType(forIdentifier: .heartRate) else {
+            reject("INVALID_TYPE", "Heart rate type not available", nil)
+            return
+        }
+        
+        let formatter = ISO8601DateFormatter()
+        guard let startDate = formatter.date(from: startDateString),
+              let endDate = formatter.date(from: endDateString) else {
+            reject("INVALID_DATE", "Invalid date format", nil)
+            return
+        }
+        
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: endDate, options: .strictStartDate)
+        
+        let query = HKSampleQuery(sampleType: heartRateType, predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: nil) { (query, samples, error) in
+            
+            if let error = error {
+                reject("QUERY_ERROR", "Failed to query heart rate data: \(error.localizedDescription)", error)
+                return
+            }
+            
+            guard let heartRateSamples = samples as? [HKQuantitySample] else {
+                resolve([])
+                return
+            }
+            
+            var heartRateRecords: [[String: Any]] = []
+            
+            for sample in heartRateSamples {
+                let record: [String: Any] = [
+                    "uuid": sample.uuid.uuidString,
+                    "startDate": formatter.string(from: sample.startDate),
+                    "endDate": formatter.string(from: sample.endDate),
+                    "value": sample.quantity.doubleValue(for: HKUnit(from: "count/min")),
+                    "unit": "bpm",
+                    "sourceRevision": [
+                        "source": [
+                            "name": sample.sourceRevision.source.name,
+                            "bundleIdentifier": sample.sourceRevision.source.bundleIdentifier
+                        ]
+                    ],
+                    "device": sample.device.map { device in
+                        [
+                            "name": device.name ?? "",
+                            "model": device.model ?? ""
+                        ]
+                    } ?? [:],
+                    "metadata": sample.metadata ?? [:]
+                ]
+                heartRateRecords.append(record)
+            }
+            
+            resolve(heartRateRecords)
+        }
+        
+        healthStore.execute(query)
+    }
+} 

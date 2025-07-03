@@ -1,0 +1,47 @@
+// HealthKitBridge.m
+// Objective-C bridge for HealthKit Swift module
+
+#import <React/RCTBridgeModule.h>
+
+@interface RCT_EXTERN_MODULE(HealthKitBridge, NSObject)
+
+// HealthKit Availability
+RCT_EXTERN_METHOD(isAvailable:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+
+// Permissions
+RCT_EXTERN_METHOD(requestPermissions:(NSArray *)permissionTypes
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+
+// Sleep Data Query
+RCT_EXTERN_METHOD(querySleepData:(NSString *)startDateString
+                  endDateString:(NSString *)endDateString
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+
+// Step Data Query
+RCT_EXTERN_METHOD(queryStepData:(NSString *)startDateString
+                  endDateString:(NSString *)endDateString
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+
+// Active Energy Data Query
+RCT_EXTERN_METHOD(queryActiveEnergyData:(NSString *)startDateString
+                  endDateString:(NSString *)endDateString
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+
+// Distance Data Query
+RCT_EXTERN_METHOD(queryDistanceData:(NSString *)startDateString
+                  endDateString:(NSString *)endDateString
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+
+// Heart Rate Data Query
+RCT_EXTERN_METHOD(queryHeartRateData:(NSString *)startDateString
+                  endDateString:(NSString *)endDateString
+                  resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject)
+
+@end 

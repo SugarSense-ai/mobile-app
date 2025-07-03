@@ -1,0 +1,73 @@
+{
+  "expo": {
+    "name": "sugar-sense-ai",
+    "slug": "sugar-sense-ai",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/sugar-sense-ai-logo.png",
+    "scheme": "sugarsenseai",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": false,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.sugarsenseai.app",
+      "deploymentTarget": "15.1",
+      "jsEngine": "hermes",
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app uses the camera to allow you to scan food items and upload profile pictures.",
+        "NSPhotoLibraryUsageDescription": "This app uses the photo library to allow you to select photos for your profile or food logs.",
+        "NSHealthShareUsageDescription": "This app uses HealthKit to read your glucose data to provide insights and predictions.",
+        "NSHealthUpdateUsageDescription": "This app uses HealthKit to write glucose data from manual entries.",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        }
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/sugar-sense-ai-logo.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.sugarsenseai.app",
+      "favicon": "./assets/images/sugar-sense-ai-logo.png"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/images/sugar-sense-ai-logo.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-dev-client",
+      "@kingstinct/react-native-healthkit",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow SugarSense.ai to access your photos to select images for food logging and profile updates.",
+          "cameraPermission": "Allow SugarSense.ai to access your camera to take photos for food logging and profile updates."
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/sugar-sense-ai-logo.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#ffffff"
+        }
+      ],
+      "expo-font",
+      "expo-secure-store",
+      "expo-web-browser"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "a55c2422-1f0a-41cf-a93c-b5a9b8c65770"
+      }
+    }
+  }
+}

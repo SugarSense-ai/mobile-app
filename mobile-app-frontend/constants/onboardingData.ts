@@ -1,0 +1,48 @@
+export const onboardingData = [
+    {
+        id: '1',
+        logoImage: require('../assets/images/sugar-sense-ai-logo.png'),
+        name: 'SugarSense.ai',
+        tagLine: 'Predict. Prevent. Prosper.',
+        image: require('../assets/images/welcome.png'),
+        title: 'Welcome to SugarSense.ai',
+        description: 'Track food, insulin, exercise, and more by texting, taking a photo, or with a few taps.',
+
+    },
+    {
+        id: '2',
+        logoImage: require('../assets/images/sugar-sense-ai-logo.png'),
+        name: 'SugarSense.ai',
+        tagLine: 'Predict. Prevent. Prosper.',
+        image: require('../assets/images/seamless-logging.png'),
+        title: 'Seamless Logging',
+        description: 'Everything logged is shared privately and instantly with your SugarSense.ai team.',
+    },
+    {
+        id: '3',
+        logoImage: require('../assets/images/sugar-sense-ai-logo.png'),
+        name: 'SugarSense.ai',
+        tagLine: 'Predict. Prevent. Prosper.',
+        image: require('../assets/images/stay-connected.png'),
+        title: 'Stay Connected',
+        description: 'Monitor trends and insights to keep your health on track.',
+    },
+    {
+        id: '4',
+        logoImage: require('../assets/images/sugar-sense-ai-logo.png'),
+        name: 'SugarSense.ai',
+        tagLine: 'Predict. Prevent. Prosper.',
+        image: require('../assets/images/rewards.png'),
+        title: 'Rewards for Healthy Habits',
+        description: 'Earn tokens for maintaining balanced sugar levels and staying active, redeemable for health benefits.',
+    },
+    {
+        id: '5',
+        logoImage: require('../assets/images/sugar-sense-ai-logo.png'),
+        name: 'SugarSense.ai',
+        tagLine: 'Predict. Prevent. Prosper.',
+        image: require('../assets/images/expert-health-consultation.png'),
+        title: 'Expert Health Consultation',
+        description: 'Get advice from certified professionals to improve your diet and well-being.',
+    },
+] as const;
