@@ -1,0 +1,52 @@
+# Dependencies
+/node_modules
+/mobile-app-frontend/node_modules
+/model/venv-tf
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+nohup.out
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+/mobile-app-frontend/android/app/build
+/mobile-app-frontend/android/build
+/mobile-app-frontend/ios/build
+/mobile-app-frontend/web-build
+
+# Editor-specific files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+
+# Other
+/mobile-app-frontend/ios/Pods
+/mobile-app-frontend/ios/Podfile.lock
+/mobile-app-frontend/package-lock.json
+/model/chroma_db
+/model/chroma.sqlite3
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.json
+.pnp.*

@@ -1,0 +1,6 @@
+sqlalchemy
+pymysql
+chromadb
+sentence-transformers
+requests
+python-dotenv

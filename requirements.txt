@@ -1,0 +1,9 @@
+flask
+flask_cors
+dotenv
+PyMySQL
+sentence-transformers
+chromadb
+sqlalchemy
+pillow
+nixtla 
