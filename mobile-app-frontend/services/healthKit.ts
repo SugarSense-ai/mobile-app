@@ -149,6 +149,35 @@ export const isAppleHealthSyncEnabledState = (): boolean => {
   return isAppleHealthSyncEnabled;
 };
 
+// ==================== NEW INCREMENTAL SYNC HELPERS ====================
+// We only need the **latest** data once the initial full sync has completed.
+// This helper queries a specific HealthKit quantity type within a date range
+// using the kingstinct library. The official typings do not expose the
+// options parameter, so we deliberately ignore TS here.
+// ----------------------------------------------------------------------
+const queryQuantitySamplesInRange = async (
+  identifier: QuantityTypeIdentifier,
+  startDate: Date,
+  endDate: Date,
+): Promise<any[]> => {
+  try {
+    // @ts-ignore – the underlying implementation DOES accept an options object
+    const samples = await queryQuantitySamples(identifier, {
+      startDate,
+      endDate,
+      limit: 0,
+    } as any);
+    return samples ? [...samples] : [];
+  } catch (error) {
+    console.error(`❌ Error querying ${identifier} samples (date-range)`, error);
+    return [];
+  }
+};
+
+// Minimum amount of time (ms) that must elapse between successive syncs
+const SYNC_INTERVAL_MS = 1000 * 60 * 10; // 10 minutes
+// ----------------------------------------------------------------------
+
 // Enhanced data collection function that gets MORE samples from HealthKit
 const queryQuantitySamplesEnhanced = async (
   identifier: QuantityTypeIdentifier,
@@ -269,63 +298,87 @@ const queryCategorySamplesWithAnchor = async (
 // Real HealthKit data collection using Kingstinct library
 const collectRealAppleHealthData = async (days: number): Promise<any> => {
   try {
+    console.log(`📅 Querying Apple Health data for the last ${days} days...`);
+
     const endDate = new Date();
     const startDate = new Date();
     startDate.setDate(endDate.getDate() - days);
 
-    console.log(`📅 Querying Apple Health data from ${startDate.toISOString()} to ${endDate.toISOString()}`);
-    
     // Use enhanced anchor queries for quantity types to get full history.
     const [
-      stepsData, 
-      distanceData, 
-      energyData, 
-      heartRateData, 
-      // For Sleep (a category type), we are limited to the standard query which only returns recent items.
-      sleepData
+      stepsData,
+      distanceData,
+      energyData,
+      heartRateData,
+      sleepData,
     ] = await Promise.all([
-      queryQuantitySamplesEnhanced('HKQuantityTypeIdentifierStepCount' as QuantityTypeIdentifier),
-      queryQuantitySamplesEnhanced('HKQuantityTypeIdentifierDistanceWalkingRunning' as QuantityTypeIdentifier),
-      queryQuantitySamplesEnhanced('HKQuantityTypeIdentifierActiveEnergyBurned' as QuantityTypeIdentifier),
-      queryQuantitySamplesEnhanced('HKQuantityTypeIdentifierHeartRate' as QuantityTypeIdentifier),
-      queryCategorySamples('HKCategoryTypeIdentifierSleepAnalysis' as CategoryTypeIdentifier)
+      queryQuantitySamplesInRange(
+        'HKQuantityTypeIdentifierStepCount' as QuantityTypeIdentifier,
+        startDate,
+        endDate,
+      ),
+      queryQuantitySamplesInRange(
+        'HKQuantityTypeIdentifierDistanceWalkingRunning' as QuantityTypeIdentifier,
+        startDate,
+        endDate,
+      ),
+      queryQuantitySamplesInRange(
+        'HKQuantityTypeIdentifierActiveEnergyBurned' as QuantityTypeIdentifier,
+        startDate,
+        endDate,
+      ),
+      queryQuantitySamplesInRange(
+        'HKQuantityTypeIdentifierHeartRate' as QuantityTypeIdentifier,
+        startDate,
+        endDate,
+      ),
+      // @ts-ignore – the underlying implementation DOES accept an options object
+      (async () => {
+        const samples: any[] = await (queryCategorySamples as any)(
+          'HKCategoryTypeIdentifierSleepAnalysis' as CategoryTypeIdentifier,
+          {
+            startDate,
+            endDate,
+            limit: 0,
+          },
+        );
+        // Manually filter in case library ignores date range
+        return samples.filter(
+          s => new Date(s.startDate) >= startDate && new Date(s.startDate) <= endDate,
+        );
+      })(),
     ]);
 
-    const allData: { [key: string]: readonly any[] } = {
+    const allData: {[key: string]: readonly any[]} = {
       steps: stepsData,
       distance: distanceData,
       sleep: sleepData,
       activeEnergy: energyData,
-      heartRate: heartRateData
+      heartRate: heartRateData,
     };
 
-    // Filter all data to only include samples within our requested date range
-    const filterByDateRange = (samples: readonly any[]) => {
-      if (!samples) return [];
-      return samples.filter((s: any) => {
-        const sampleDate = new Date(s.startDate);
-        return sampleDate >= startDate && sampleDate <= endDate;
-      });
-    };
-    
-    const filteredData: { [key: string]: any[] } = {};
+    const mutableData: {[key:string]: any[]} = {};
     for (const key in allData) {
-      filteredData[key] = filterByDateRange(allData[key]);
+      if(allData[key]) {
+        mutableData[key] = [...allData[key]];
+      } else {
+        mutableData[key] = [];
+      }
     }
-    
+
     console.log(`✅ Apple Health data collected successfully:`);
-    console.log(`   • Sleep records: ${filteredData.sleep.length} (filtered from ${sleepData.length})`);
-    console.log(`   • Step records: ${filteredData.steps.length} (filtered from ${stepsData.length})`);
-    console.log(`   • Energy records: ${filteredData.activeEnergy.length} (filtered from ${energyData.length})`);
-    console.log(`   • Distance records: ${filteredData.distance.length} (filtered from ${distanceData.length})`);
-    console.log(`   • Heart rate records: ${filteredData.heartRate.length} (filtered from ${heartRateData.length})`);
+    console.log(`   • Sleep records: ${mutableData.sleep.length}`);
+    console.log(`   • Step records: ${mutableData.steps.length}`);
+    console.log(`   • Energy records: ${mutableData.activeEnergy.length}`);
+    console.log(`   • Distance records: ${mutableData.distance.length}`);
+    console.log(`   • Heart rate records: ${mutableData.heartRate.length}`);
 
     return {
-      sleep: filteredData.sleep,
-      steps: filteredData.steps,
-      activeEnergy: filteredData.activeEnergy,
-      distance: filteredData.distance,
-      heartRate: filteredData.heartRate
+      sleep: mutableData.sleep,
+      steps: mutableData.steps,
+      activeEnergy: mutableData.activeEnergy,
+      distance: mutableData.distance,
+      heartRate: mutableData.heartRate,
     };
   } catch (error) {
     console.error('❌ Error collecting real Apple Health data:', error);
@@ -334,8 +387,32 @@ const collectRealAppleHealthData = async (days: number): Promise<any> => {
 };
 
 // Enhanced sync function with REAL HealthKit integration
-export const syncLatestHealthDataForDashboard = async (userId: number, days: number = 7): Promise<SyncResult> => {
-  console.log(`🔄 Starting REAL Apple Health sync for user ${userId}, last ${days} days`);
+export const syncLatestHealthDataForDashboard = async (
+  userId: number,
+  days: number = 7,
+): Promise<SyncResult> => {
+  console.log(
+    `🔄 Starting REAL Apple Health sync for user ${userId}, last ${days} days`,
+  );
+
+  // ----- New cooldown guard ---------------------------------------------------
+  const now = Date.now();
+  if (now - lastSyncTime < SYNC_INTERVAL_MS) {
+    console.log(
+      `⏸️  Skipping Apple Health sync – last sync was ${Math.round(
+        (now - lastSyncTime) / 1000,
+      )}s ago (cool-down ${SYNC_INTERVAL_MS / 1000}s)`,
+    );
+    return {
+      success: true,
+      message: 'Sync skipped (cool-down active)',
+      recordsSynced: 0,
+    };
+  }
+
+  // Only fetch the full requested range on first sync. Afterwards we just need
+  // the latest 1 day to keep the dashboard fresh without huge payloads.
+  const daysForSync = lastSyncTime === 0 ? days : 1;
 
   try {
     // Test network connectivity first
@@ -343,65 +420,95 @@ export const syncLatestHealthDataForDashboard = async (userId: number, days: num
     if (!workingUrl) {
       return {
         success: false,
-        message: `Network connectivity failed: No backend servers are reachable`
+        message: `Network connectivity failed: No backend servers are reachable`,
       };
     }
     console.log(`✅ Connected to: ${workingUrl}`);
 
     // 🔥 ENHANCED REAL HEALTHKIT DATA COLLECTION STRATEGY
     console.log('📱 Attempting comprehensive Apple Health data collection...');
-    
-    // Strategy: Use larger time windows to capture more data
-    const enhancedDays = Math.max(days * 2, 30); // Request at least 30 days to ensure we get historical data
-    console.log(`🔧 WORKAROUND: Requesting ${enhancedDays} days instead of ${days} to capture more historical data`);
-    
-    const healthData = await collectRealAppleHealthData(enhancedDays);
-    
+
+    const healthData = await collectRealAppleHealthData(daysForSync);
+
     if (!healthData || Object.keys(healthData).length === 0) {
-      console.log('⚠️ No health data collected - HealthKit may not be available or permissions denied');
+      console.log(
+        '⚠️ No health data collected - HealthKit may not be available or permissions denied',
+      );
       return {
         success: false,
-        message: 'No health data available - check HealthKit permissions'
+        message: 'No health data available - check HealthKit permissions',
       };
     }
 
     // Analyze what we actually got vs what we wanted
     if (healthData.steps && healthData.steps.length > 0) {
-      const stepDates = healthData.steps.map((sample: any) => sample.startDate ? new Date(sample.startDate).toISOString().split('T')[0] : 'unknown');
+      const stepDates = healthData.steps.map((sample: any) =>
+        sample.startDate
+          ? new Date(sample.startDate).toISOString().split('T')[0]
+          : 'unknown',
+      );
       const uniqueStepDates = [...new Set(stepDates)].sort();
-      console.log(`📊 SYNC RESULT: Got step data for ${uniqueStepDates.length} unique dates`);
-      
+      console.log(
+        `📊 SYNC RESULT: Got step data for ${uniqueStepDates.length} unique dates`,
+      );
+
       const requestedEndDate = new Date().toISOString().split('T')[0];
-      const requestedStartDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-      console.log(`🎯 REQUESTED: ${requestedStartDate} to ${requestedEndDate} (${days} days)`);
-      
+      const requestedStartDate = new Date(
+        Date.now() - days * 24 * 60 * 60 * 1000,
+      )
+        .toISOString()
+        .split('T')[0];
+      console.log(
+        `🎯 REQUESTED: ${requestedStartDate} to ${requestedEndDate} (${days} days)`,
+      );
+
       // Create a complete list of dates we should have
       const allRequestedDates = [];
       for (let i = 0; i < days; i++) {
-        const checkDate = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const checkDate = new Date(Date.now() - i * 24 * 60 * 60 * 1000)
+          .toISOString()
+          .split('T')[0];
         allRequestedDates.push(checkDate);
       }
-      
+
       // Find missing days
-      const missingDays = allRequestedDates.filter(date => !uniqueStepDates.includes(date)).sort();
-      
+      const missingDays = allRequestedDates
+        .filter(date => !uniqueStepDates.includes(date))
+        .sort();
+
       if (missingDays.length > 0) {
         console.log(`⚠️  MISSING ${missingDays.length} DAYS of step data`);
         if (missingDays.length <= 10) {
           console.log(`   Missing dates: ${missingDays.join(', ')}`);
         } else {
-          console.log(`   Missing dates: ${missingDays.slice(0, 5).join(', ')} ... and ${missingDays.length - 5} more`);
+          console.log(
+            `   Missing dates: ${missingDays
+              .slice(0, 5)
+              .join(', ')} ... and ${missingDays.length - 5} more`,
+          );
         }
         console.log(`📱 Possible reasons:`);
-        console.log(`   • Apple Health doesn't have data for those dates`);
+        console.log(
+          `   • Apple Health doesn't have data for those dates`,
+        );
         console.log(`   • Device wasn't carried/worn on those days`);
-        console.log(`   • Data exists but library can't access older records`);
+        console.log(
+          `   • Data exists but library can't access older records`,
+        );
       } else {
         console.log(`✅ SUCCESS: Got step data for all ${days} requested days!`);
       }
-      
+
       // Show what we actually got
-      console.log(`📊 DATES WITH DATA: ${uniqueStepDates.slice(0, Math.min(7, uniqueStepDates.length)).join(', ')}${uniqueStepDates.length > 7 ? ` ... and ${uniqueStepDates.length - 7} more` : ''}`);
+      console.log(
+        `📊 DATES WITH DATA: ${uniqueStepDates
+          .slice(0, Math.min(7, uniqueStepDates.length))
+          .join(', ')}${
+          uniqueStepDates.length > 7
+            ? ` ... and ${uniqueStepDates.length - 7} more`
+            : ''
+        }`,
+      );
     }
 
     // Transform data for backend API
@@ -411,48 +518,51 @@ export const syncLatestHealthDataForDashboard = async (userId: number, days: num
       sync_timestamp: new Date().toISOString(),
       data_source: 'apple_health',
       sync_type: 'real_healthkit',
-      days_synced: days
+      days_synced: days,
     };
 
     console.log('📡 Sending real Apple Health data to backend...');
-    
+
     // Create abort controller for timeout
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
-    
-    const response = await fetch(`${workingUrl}/api/sync-dashboard-health-data`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
+
+    const response = await fetch(
+      `${workingUrl}/api/sync-dashboard-health-data`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(syncPayload),
+        signal: controller.signal,
       },
-      body: JSON.stringify(syncPayload),
-      signal: controller.signal,
-    });
-    
+    );
+
     clearTimeout(timeoutId);
 
     if (response.ok) {
       const result = await response.json();
       console.log('✅ REAL Apple Health sync completed:', result.message);
+      lastSyncTime = Date.now();
       return {
         success: true,
         message: result.message,
-        recordsSynced: result.records_synced || 0
+        recordsSynced: result.records_synced || 0,
       };
     } else {
       const errorText = await response.text();
       console.error('❌ Backend sync failed:', errorText);
       return {
         success: false,
-        message: `Backend sync failed: ${errorText}`
+        message: `Backend sync failed: ${errorText}`,
       };
     }
-
   } catch (error: any) {
     console.error('❌ Real Apple Health sync failed:', error);
     return {
       success: false,
-      message: `Real sync failed (${error.message}), using existing authentic data`
+      message: `Real sync failed (${error.message}), using existing authentic data`,
     };
   }
 };
@@ -554,18 +664,32 @@ export const performFreshResync = async (userId: number = 1, days: number = 30):
 };
 
 // Enhanced sleep data collection to bypass Sleep Schedule truncation
-export const getDetailedSleepData = async (days: number = 7): Promise<any> => {
+export const getDetailedSleepData = async (
+  days: number = 7,
+): Promise<any> => {
   try {
-    console.log('🔍 Collecting detailed sleep analysis data to bypass Sleep Schedule truncation...');
-    
+    console.log(
+      '🔍 Collecting detailed sleep analysis data to bypass Sleep Schedule truncation...',
+    );
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setDate(endDate.getDate() - days);
+
     // Query all sleep analysis category samples (InBed=0, Asleep=1, Awake=2)
-    const allSleepSamples = await queryCategorySamples('HKCategoryTypeIdentifierSleepAnalysis' as CategoryTypeIdentifier);
-    
+    const allSleepSamples = await (queryCategorySamples as any)(
+      'HKCategoryTypeIdentifierSleepAnalysis' as CategoryTypeIdentifier,
+      {
+        startDate,
+        endDate,
+        limit: 0,
+      },
+    );
+
     // Categorize samples by their value
     const categorizedSamples = {
       inBed: allSleepSamples.filter((sample: any) => sample.value === 0),
-      asleep: allSleepSamples.filter((sample: any) => sample.value === 1), 
-      awake: allSleepSamples.filter((sample: any) => sample.value === 2)
+      asleep: allSleepSamples.filter((sample: any) => sample.value === 1),
+      awake: allSleepSamples.filter((sample: any) => sample.value === 2),
     };
     
     console.log('📊 Sleep sample breakdown:');
