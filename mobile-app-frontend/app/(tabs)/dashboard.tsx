@@ -150,9 +150,11 @@ const Dashboard = () => {
         throw new Error('Network connectivity test failed - unable to reach backend server on any URL');
       }
       
-      console.log(`🔄 Fetching dashboard data from working URL: ${workingUrl}/api/diabetes-dashboard?days=15`);
+      const fetchUrl = `${workingUrl}/api/diabetes-dashboard?days=7`;
+
+      console.log(`🔄 Fetching dashboard data from working URL: ${fetchUrl}`);
       
-              const response = await fetch(`${workingUrl}/api/diabetes-dashboard?days=15`, {
+      const response = await fetch(fetchUrl, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -539,6 +541,9 @@ const Dashboard = () => {
 
   const renderSleepTimeline = () => {
     if (!dashboardData?.sleep.data.length) return null;
+    
+    // Log sleep data dates for debugging
+    console.log("📅 Sleep data dates:", dashboardData.sleep.data.map(d => d.date));
     
     return (
       <>
