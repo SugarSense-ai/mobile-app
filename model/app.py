@@ -186,10 +186,108 @@ def create_verification_health_data_table():
     print("✅ Verification health data table created/verified successfully.")
 
 # --- Database Initialization ---
+def create_glucose_log_table():
+    """Create the glucose_log table for glucose readings"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS glucose_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    glucose_level DECIMAL(5,1) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_user_timestamp (user_id, timestamp)
+                )
+            """))
+            conn.commit()
+            print("✅ Glucose log table created/verified successfully")
+    except Exception as e:
+        print(f"Error creating glucose_log table: {e}")
+        raise
+
+def create_food_log_table():
+    """Create the food_log table for meal logging"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS food_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    meal_type VARCHAR(50) NOT NULL,
+                    food_description TEXT NOT NULL,
+                    calories DECIMAL(8,2) DEFAULT 0,
+                    carbs DECIMAL(8,2) DEFAULT 0,
+                    protein DECIMAL(8,2) DEFAULT 0,
+                    fat DECIMAL(8,2) DEFAULT 0,
+                    sugar DECIMAL(8,2) DEFAULT 0,
+                    fiber DECIMAL(8,2) DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_user_timestamp (user_id, timestamp),
+                    INDEX idx_meal_type (meal_type)
+                )
+            """))
+            conn.commit()
+            print("✅ Food log table created/verified successfully")
+    except Exception as e:
+        print(f"Error creating food_log table: {e}")
+        raise
+
+def create_medication_log_table():
+    """Create the medication_log table for medication tracking"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS medication_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    medication_type VARCHAR(100) NOT NULL,
+                    medication_name VARCHAR(200) NOT NULL,
+                    dosage DECIMAL(8,2) NOT NULL,
+                    insulin_type VARCHAR(50) NULL,
+                    meal_context VARCHAR(50) NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_user_timestamp (user_id, timestamp),
+                    INDEX idx_medication_type (medication_type)
+                )
+            """))
+            conn.commit()
+            print("✅ Medication log table created/verified successfully")
+    except Exception as e:
+        print(f"Error creating medication_log table: {e}")
+        raise
+
+def create_sleep_log_table():
+    """Create the sleep_log table for sleep tracking"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS sleep_log (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    sleep_start DATETIME NOT NULL,
+                    sleep_end DATETIME NOT NULL,
+                    sleep_quality VARCHAR(20) DEFAULT 'Good',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_user_sleep_end (user_id, sleep_end)
+                )
+            """))
+            conn.commit()
+            print("✅ Sleep log table created/verified successfully")
+    except Exception as e:
+        print(f"Error creating sleep_log table: {e}")
+        raise
+
 def initialize_database():
     """Creates all necessary database tables if they don't exist."""
     print("--- Initializing Database ---")
+    create_glucose_log_table()
+    create_food_log_table()
     create_activity_log_table()
+    create_medication_log_table()
+    create_sleep_log_table()
     create_health_data_archive_table()
     create_health_data_display_table()
     create_verification_health_data_table()
@@ -255,257 +353,332 @@ def chat():
     print(f"Received user_message: '{user_message}'")
     print(f"Received image_data (present): {bool(image_data_b64)}")
 
-    contents = []
-
-    # Helper function to parse date ranges from user input
-    def parse_date_range(query: str):
-        today = date.today()
-        start_date = None
-        end_date = None
-
-        query_lower = query.lower()
-
-        # Try to parse specific week of month and year (e.g., "2nd week of May 2025")
-        week_of_month_match = re.search(r'(first|second|third|fourth|fifth|last|[1-5]st|[1-5]nd|[1-5]rd|[1-5]th)\s+week\s+of\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})', query_lower)
-        if week_of_month_match:
-            week_ordinal_str = week_of_month_match.group(1)
-            month_name = week_of_month_match.group(2)
-            year = int(week_of_month_match.group(3))
-            month_num = datetime.strptime(month_name.capitalize(), '%B').month
-
-            # Map ordinal words/strings to week index (0-indexed)
-            week_map = {'first': 0, '1st': 0, 'second': 1, '2nd': 1, 'third': 2, '3rd': 2, 'fourth': 3, '4th': 3, 'fifth': 4, '5th': 4, 'last': -1}
-            week_index = week_map.get(week_ordinal_str, 0)
-            
-            # Calculate start of the specified month
-            start_of_month = date(year, month_num, 1)
-            
-            # Handle 'last' week separately to ensure it's the last full or partial week
-            if week_ordinal_str == 'last':
-                # Get number of days in the month
-                days_in_month = calendar.monthrange(year, month_num)[1]
-                # Find the last day of the month
-                end_date_calc = date(year, month_num, days_in_month)
-                # Find the first day of the last week (Monday-based)
-                start_date_calc = end_date_calc - timedelta(days=end_date_calc.weekday()) # Monday of that week
-                start_date = max(start_date_calc, start_of_month) # Ensure it doesn't go into previous month
-                end_date = end_date_calc
-            else:
-                # Calculate start and end dates for the specific week
-                start_date = start_of_month + timedelta(weeks=week_index)
-                end_date = start_date + timedelta(days=6) # 7 days for the week
-
-                # Ensure end_date does not exceed month end
-                end_of_month = date(year, month_num, calendar.monthrange(year, month_num)[1])
-                end_date = min(end_date, end_of_month)
-
-        # Try to parse specific month and year (e.g., "May 2025")
-        elif re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})', query_lower):
-            month_year_match = re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})', query_lower)
-            month_name = month_year_match.group(1)
-            year = int(month_year_match.group(2))
-            month_num = datetime.strptime(month_name.capitalize(), '%B').month
-            start_date = date(year, month_num, 1)
-            end_date = date(year, month_num, calendar.monthrange(year, month_num)[1])
-
-        elif "yesterday" in query_lower:
-            start_date = today - timedelta(days=1)
-            end_date = today - timedelta(days=1)
-        elif "today" in query_lower:
-            start_date = today
-            end_date = today
-        elif "last 7 days" in query_lower or "past week" in query_lower or "last week" in query_lower:
-            start_date = today - timedelta(days=6)
-            end_date = today
-        elif "last month" in query_lower:
-            # Calculate start and end of previous month
-            last_day_of_prev_month = today.replace(day=1) - timedelta(days=1)
-            start_date = last_day_of_prev_month.replace(day=1)
-            end_date = last_day_of_prev_month
-        else:
-            # If no specific date range is mentioned, try to get the overall data range
-            try:
-                with engine.connect() as conn:
-                    overall_min_date = conn.execute(text("SELECT MIN(DATE(timestamp)) FROM glucose_log WHERE user_id = 1")).scalar()
-                    overall_max_date = conn.execute(text("SELECT MAX(DATE(timestamp)) FROM glucose_log WHERE user_id = 1")).scalar()
-                if overall_min_date and overall_max_date:
-                    start_date = overall_min_date
-                    end_date = overall_max_date
-                else:
-                    # Fallback to last 7 days if no data exists
-                    start_date = today - timedelta(days=6)
-                    end_date = today
-            except Exception as e:
-                print(f"Error fetching overall glucose data range: {e}")
-                # Fallback to last 7 days in case of DB error
-                start_date = today - timedelta(days=6)
-                end_date = today
-        
-        return start_date, end_date
-
-    # Determine the date range based on user message
-    query_start_date, query_end_date = parse_date_range(user_message)
-    print(f"Parsed date range: Start={query_start_date}, End={query_end_date}")
-
+    # If an image is present, handle food analysis
     if image_data_b64:
         try:
-            image_bytes = base64.b64decode(image_data_b64)
-            img = Image.open(io.BytesIO(image_bytes))
-            contents.append(img)
-            print("Image decoded and added to contents.")
+            print("🖼️  CHAT ENDPOINT: Processing image in chat - attempting food analysis...")
+            
+            # Use the existing Gemini food analysis infrastructure
+            genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+            model = genai.GenerativeModel('gemini-1.5-flash')
 
-            vision_prompt_text = (
-                f"Analyze the following meal image. "
-                f"Identify the main dish(es) and key ingredients. "
-                f"Provide a detailed **estimated** nutritional breakdown for a typical serving, including calories, protein in grams, fat in grams, carbohydrates in grams, and sugar in grams. If exact values are not possible, provide a reasonable estimation based on common serving sizes and ingredients. Format the nutritional information clearly, using bullet points for each nutrient. "
-                f"Provide a concise, actionable recommendation for managing their blood sugar. "
-                f"IMPORTANT INSTRUCTION: Keep your response concise, focusing on food identification, estimated nutritional values, and personalized advice."
-            )
-            contents.insert(0, vision_prompt_text)
-            print("Sending combined text and image to gemini-1.5-flash...")
-            response = gemini_model.generate_content(contents)
-            response_text = response.text
-            print(f"Gemini Vision response: {response_text}")
+            # Decode the base64 image
+            image_data = base64.b64decode(image_data_b64)
+            image_part = {"mime_type": "image/jpeg", "data": image_data}
+
+            # Use the same structured food analysis prompt as /gemini-analyze
+            prompt_text = """
+            Analyze the image provided. Your first task is to determine if the image contains food.
+            
+            - If the image contains food, respond with 'contains_food: true' and provide the analysis.
+            - If the image does NOT contain food, respond with 'contains_food: false' and a brief 'description' explaining why it cannot be analyzed.
+
+            If food is present, provide the following details in a structured format:
+            
+            description: A short, 1-2 sentence description of the meal.
+            ingredients: A list of primary ingredients.
+            nutritional_values:
+            - calories: Estimated calories (numeric value).
+            - carbs_g: Estimated carbohydrates in grams (numeric value).
+            - sugar_g: Estimated sugar in grams (numeric value).
+            - fiber_g: Estimated fiber in grams (numeric value).
+            - protein_g: Estimated protein in grams (numeric value).
+            - fat_g: Estimated fat in grams (numeric value).
+            """
+
+            print("🔍 Analyzing image for food content...")
+            response = model.generate_content([prompt_text, image_part], stream=False)
+            response.resolve()
+
+            # Parse the response
+            analysis_result = parse_gemini_food_analysis(response.text)
+
+            if 'error' in analysis_result:
+                print("❌ Non-food image detected, providing general health guidance...")
+                response_text = f"I can see this isn't a food image. {analysis_result['error']} Feel free to ask me any questions about your diabetes management, glucose trends, or health data!"
+            else:
+                print("✅ Food detected, creating conversational analysis...")
+                
+                nutrition = analysis_result['nutritional_values']
+                description = analysis_result['description']
+                ingredients = ', '.join(analysis_result['ingredients'])
+                
+                nutrition_text = f"📊 **Nutritional Breakdown:**\n"
+                nutrition_text += f"• Calories: {nutrition['calories']:.0f}\n"
+                nutrition_text += f"• Carbs: {nutrition['carbs_g']:.0f}g\n"
+                nutrition_text += f"• Protein: {nutrition['protein_g']:.0f}g\n"
+                nutrition_text += f"• Fat: {nutrition['fat_g']:.0f}g"
+                
+                carbs = nutrition['carbs_g']
+                if carbs > 45:
+                    glucose_impact = "🔴 **High carb content** - expect significant glucose rise in 1-2 hours"
+                elif carbs > 15:
+                    glucose_impact = "🟡 **Moderate carb content** - expect moderate glucose rise"
+                else:
+                    glucose_impact = "🟢 **Low carb content** - minimal glucose impact expected"
+                
+                try:
+                    with engine.connect() as conn:
+                        recent_avg = conn.execute(text("""
+                            SELECT AVG(glucose_level) FROM glucose_log 
+                            WHERE user_id = 1 AND timestamp >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                        """)).scalar()
+                        
+                        if recent_avg and recent_avg > 180:
+                            personalized_advice = "💡 **Tip:** Your recent levels have been elevated. Consider light activity after eating."
+                        elif recent_avg and recent_avg < 100:
+                            personalized_advice = "💡 **Tip:** Your recent levels have been good. This meal may cause a spike, so monitor closely."
+                        else:
+                            personalized_advice = "💡 **Tip:** Monitor your glucose 1-2 hours after eating to see how this meal affects you."
+                except:
+                    personalized_advice = "💡 **Tip:** Monitor your glucose 1-2 hours after eating to see how this meal affects you."
+                
+                response_text = f"I can see this is **{description}** 🍽️\n\n"
+                response_text += f"**Main ingredients:** {ingredients}\n\n"
+                response_text += f"{nutrition_text}\n\n"
+                response_text += f"{glucose_impact}\n\n"
+                response_text += personalized_advice
+                
+                if collection:
+                    food_context = f"User just analyzed: {description}. Nutritional info: {nutrition['calories']} calories, {nutrition['carbs_g']}g carbs, {nutrition['protein_g']}g protein, {nutrition['fat_g']}g fat. Ingredients: {ingredients}."
+                    collection.add(
+                        documents=[food_context], 
+                        ids=[f"food_analysis_{int(datetime.now().timestamp())}"]
+                    )
+                    print("🧠 Stored food analysis in memory for follow-up questions")
+
+            return jsonify({'response': response_text})
 
         except Exception as e:
-            print(f"Error decoding image or generating Gemini response: {e}")
+            print(f"Error processing image: {e}")
             return jsonify({'response': "I had trouble processing that image. Please try again."}), 500
 
-    else:
-        if not user_message:
-            return jsonify({'response': "Please provide a text message or an image."})
+    # If no image, proceed with text-based logic
+    if not user_message:
+        return jsonify({'response': "Please provide a text message or an image."})
 
-        try:
-            # --- Database Queries ---
-            with engine.connect() as conn:
-                glucose_daily_avg = conn.execute(text("""
-                    SELECT DATE(timestamp) as log_date, ROUND(AVG(glucose_level), 1) as avg_glucose
-                    FROM glucose_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    GROUP BY log_date
-                    ORDER BY log_date
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+    try:
+        # (The existing text-based logic remains here)
+        # --- Database Queries, Health Summary, ChromaDB Retrieval, LLM Prompt ---
+        # ... (all the existing code for handling text messages) ...
+        # --- Database Queries ---
+        with engine.connect() as conn:
+            # Helper function to parse date ranges from user input
+            def parse_date_range(query: str):
+                today = date.today()
+                start_date = None
+                end_date = None
 
-                glucose_overall_avg = conn.execute(text("""
-                    SELECT ROUND(AVG(glucose_level), 1) FROM glucose_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    LIMIT 1
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).scalar()
+                query_lower = query.lower()
 
-                food = conn.execute(text("""
-                    SELECT meal_type, ROUND(AVG(carbs), 1)
-                    FROM food_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    GROUP BY meal_type
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+                # Try to parse specific week of month and year (e.g., "2nd week of May 2025")
+                week_of_month_match = re.search(r'(first|second|third|fourth|fifth|last|[1-5]st|[1-5]nd|[1-5]rd|[1-5]th)\s+week\s+of\s+(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})', query_lower)
+                if week_of_month_match:
+                    week_ordinal_str = week_of_month_match.group(1)
+                    month_name = week_of_month_match.group(2)
+                    year = int(week_of_month_match.group(3))
+                    month_num = datetime.strptime(month_name.capitalize(), '%B').month
 
-                meds = conn.execute(text("""
-                    SELECT meal_context, COUNT(*)
-                    FROM medication_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    GROUP BY meal_context
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+                    # Map ordinal words/strings to week index (0-indexed)
+                    week_map = {'first': 0, '1st': 0, 'second': 1, '2nd': 1, 'third': 2, '3rd': 2, 'fourth': 3, '4th': 3, 'fifth': 4, '5th': 4, 'last': -1}
+                    week_index = week_map.get(week_ordinal_str, 0)
+                    
+                    # Calculate start of the specified month
+                    start_of_month = date(year, month_num, 1)
+                    
+                    # Handle 'last' week separately to ensure it's the last full or partial week
+                    if week_ordinal_str == 'last':
+                        # Get number of days in the month
+                        days_in_month = calendar.monthrange(year, month_num)[1]
+                        # Find the last day of the month
+                        end_date_calc = date(year, month_num, days_in_month)
+                        # Find the first day of the last week (Monday-based)
+                        start_date_calc = end_date_calc - timedelta(days=end_date_calc.weekday()) # Monday of that week
+                        start_date = max(start_date_calc, start_of_month) # Ensure it doesn't go into previous month
+                        end_date = end_date_calc
+                    else:
+                        # Calculate start and end dates for the specific week
+                        start_date = start_of_month + timedelta(weeks=week_index)
+                        end_date = start_date + timedelta(days=6) # 7 days for the week
 
-                activity = conn.execute(text("""
-                    SELECT activity_type, ROUND(AVG(duration_minutes), 1)
-                    FROM activity_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    GROUP BY activity_type
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+                        # Ensure end_date does not exceed month end
+                        end_of_month = date(year, month_num, calendar.monthrange(year, month_num)[1])
+                        end_date = min(end_date, end_of_month)
 
-                sleep = conn.execute(text("""
-                    SELECT sleep_quality, COUNT(*), ROUND(AVG(TIMESTAMPDIFF(MINUTE, sleep_start, sleep_end))/60, 1)
-                    FROM sleep_log
-                    WHERE user_id = 1 AND DATE(sleep_end) BETWEEN :start_date AND :end_date
-                    GROUP BY sleep_quality
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+                # Try to parse specific month and year (e.g., "May 2025")
+                elif re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})', query_lower):
+                    month_year_match = re.search(r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})', query_lower)
+                    month_name = month_year_match.group(1)
+                    year = int(month_year_match.group(2))
+                    month_num = datetime.strptime(month_name.capitalize(), '%B').month
+                    start_date = date(year, month_num, 1)
+                    end_date = date(year, month_num, calendar.monthrange(year, month_num)[1])
 
-                recent_glucose = conn.execute(text("""
-                    SELECT timestamp, glucose_level FROM glucose_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    ORDER BY timestamp DESC LIMIT 10
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+                elif "yesterday" in query_lower:
+                    start_date = today - timedelta(days=1)
+                    end_date = today - timedelta(days=1)
+                elif "today" in query_lower:
+                    start_date = today
+                    end_date = today
+                elif "last 7 days" in query_lower or "past week" in query_lower or "last week" in query_lower:
+                    start_date = today - timedelta(days=6)
+                    end_date = today
+                elif "last month" in query_lower:
+                    # Calculate start and end of previous month
+                    last_day_of_prev_month = today.replace(day=1) - timedelta(days=1)
+                    start_date = last_day_of_prev_month.replace(day=1)
+                    end_date = last_day_of_prev_month
+                else:
+                    # If no specific date range is mentioned, try to get the overall data range
+                    try:
+                        with engine.connect() as conn:
+                            overall_min_date = conn.execute(text("SELECT MIN(DATE(timestamp)) FROM glucose_log WHERE user_id = 1")).scalar()
+                            overall_max_date = conn.execute(text("SELECT MAX(DATE(timestamp)) FROM glucose_log WHERE user_id = 1")).scalar()
+                        if overall_min_date and overall_max_date:
+                            start_date = overall_min_date
+                            end_date = overall_max_date
+                        else:
+                            # Fallback to last 7 days if no data exists
+                            start_date = today - timedelta(days=6)
+                            end_date = today
+                    except Exception as e:
+                        print(f"Error fetching overall glucose data range: {e}")
+                        # Fallback to last 7 days in case of DB error
+                        start_date = today - timedelta(days=6)
+                        end_date = today
+                
+                return start_date, end_date
 
-                recent_food = conn.execute(text("""
-                    SELECT timestamp, meal_type, carbs FROM food_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    ORDER BY timestamp DESC LIMIT 10
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+            query_start_date, query_end_date = parse_date_range(user_message)
 
-                recent_activity = conn.execute(text("""
-                    SELECT timestamp, activity_type, duration_minutes FROM activity_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    ORDER BY timestamp DESC LIMIT 10
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+            glucose_daily_avg = conn.execute(text("""
+                SELECT DATE(timestamp) as log_date, ROUND(AVG(glucose_level), 1) as avg_glucose
+                FROM glucose_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                GROUP BY log_date
+                ORDER BY log_date
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-                recent_sleep = conn.execute(text("""
-                    SELECT sleep_start, sleep_end, sleep_quality FROM sleep_log
-                    WHERE user_id = 1 AND DATE(sleep_end) BETWEEN :start_date AND :end_date
-                    ORDER BY sleep_end DESC LIMIT 5
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+            glucose_overall_avg = conn.execute(text("""
+                SELECT ROUND(AVG(glucose_level), 1) FROM glucose_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                LIMIT 1
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).scalar()
 
-                recent_meds = conn.execute(text("""
-                    SELECT timestamp, medication_name, dosage, meal_context FROM medication_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    ORDER BY timestamp DESC LIMIT 10
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+            food = conn.execute(text("""
+                SELECT meal_type, ROUND(AVG(carbs), 1)
+                FROM food_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                GROUP BY meal_type
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-                min_max_glucose_daily = conn.execute(text("""
-                    SELECT
-                        DATE(timestamp) as log_date,
-                        MIN(glucose_level) as min_glucose,
-                        MAX(glucose_level) as max_glucose
-                    FROM glucose_log
-                    WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
-                    GROUP BY log_date
-                    ORDER BY log_date
-                """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+            meds = conn.execute(text("""
+                SELECT meal_context, COUNT(*)
+                FROM medication_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                GROUP BY meal_context
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-            # --- Build Health Summary ---
-            health_summary = "### Health Summary\n"
-            health_summary += "Carbs per meal:\n" + "\n".join(f"- {m[0]}: {m[1]}g" for m in food)
-            health_summary += "\nMedication effects:\n" + "\n".join(f"- {m[0]}: {m[1]} times" for m in meds)
-            health_summary += "\nActivity summary:\n" + "\n".join(f"- {a[0]}: {a[1]} minutes" for a in activity)
-            health_summary += "\nSleep summary:\n" + "\n".join(f"- {s[0]}: {s[1]} nights, avg duration: {s[2]} hours" for s in sleep)
+            activity = conn.execute(text("""
+                SELECT activity_type, ROUND(AVG(duration_minutes), 1)
+                FROM activity_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                GROUP BY activity_type
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-            if glucose_overall_avg is not None:
-                health_summary += f"\nOverall Avg Glucose ({query_start_date} to {query_end_date}): {glucose_overall_avg} mg/dL"
+            sleep = conn.execute(text("""
+                SELECT sleep_quality, COUNT(*), ROUND(AVG(TIMESTAMPDIFF(MINUTE, sleep_start, sleep_end))/60, 1)
+                FROM sleep_log
+                WHERE user_id = 1 AND DATE(sleep_end) BETWEEN :start_date AND :end_date
+                GROUP BY sleep_quality
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-            health_summary += "\nDaily Avg Glucose:\n" + "\n".join(f"- {row.log_date.strftime('%Y-%m-%d')}: {row.avg_glucose} mg/dL" for row in glucose_daily_avg)
+            recent_glucose = conn.execute(text("""
+                SELECT timestamp, glucose_level FROM glucose_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                ORDER BY timestamp DESC LIMIT 10
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-            # Find the day with the largest glucose fluctuation
-            largest_fluctuation = None
-            largest_fluctuation_date = None
-            largest_fluctuation_min = None
-            largest_fluctuation_max = None
-            for row in min_max_glucose_daily:
-                fluctuation = row.max_glucose - row.min_glucose
-                if (largest_fluctuation is None) or (fluctuation > largest_fluctuation):
-                    largest_fluctuation = fluctuation
-                    largest_fluctuation_date = row.log_date
-                    largest_fluctuation_min = row.min_glucose
-                    largest_fluctuation_max = row.max_glucose
-            if largest_fluctuation_date is not None:
-                health_summary += f"\nLargest Fluctuation: {largest_fluctuation_date.strftime('%Y-%m-%d')} (Range: {largest_fluctuation_min}-{largest_fluctuation_max} mg/dL, Δ={largest_fluctuation} mg/dL)"
+            recent_food = conn.execute(text("""
+                SELECT timestamp, meal_type, carbs FROM food_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                ORDER BY timestamp DESC LIMIT 10
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-            health_summary += "\nDaily Glucose Range:\n" + "\n".join(f"- {row.log_date.strftime('%Y-%m-%d')}: {row.min_glucose} - {row.max_glucose} mg/dL" for row in min_max_glucose_daily)
+            recent_activity = conn.execute(text("""
+                SELECT timestamp, activity_type, duration_minutes FROM activity_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                ORDER BY timestamp DESC LIMIT 10
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-            health_summary += "\n### Recent Events (within selected range)\n"
-            health_summary += "Glucose:\n" + "\n".join(f"- {row.timestamp.strftime('%Y-%m-%d %H:%M')}: {row.glucose_level} mg/dL" for row in recent_glucose)
-            health_summary += "\nFood:\n" + "\n".join(f"- {row.timestamp.strftime('%Y-%m-%d %H:%M')}: {row.meal_type}, {row.carbs}g carbs" for row in recent_food)
-            health_summary += "\nActivity:\n" + "\n".join(f"- {row.timestamp.strftime('%Y-%m-%d %H:%M')}: {row.activity_type}, {row.duration_minutes} mins" for row in recent_activity)
-            health_summary += "\nSleep:\n" + "\n".join(f"- {row.sleep_start.strftime('%Y-%m-%d %H:%M')} to {row.sleep_end.strftime('%Y-%m-%d %H:%M')}: {row.sleep_quality}" for row in recent_sleep)
-            health_summary += "\nMedication:\n" + "\n".join(f"- {row.timestamp.strftime('%Y-%m-%d %H:%M')}: {row.medication_name}, {row.dosage}mg, {row.meal_context}" for row in recent_meds)
+            recent_sleep = conn.execute(text("""
+                SELECT sleep_start, sleep_end, sleep_quality FROM sleep_log
+                WHERE user_id = 1 AND DATE(sleep_end) BETWEEN :start_date AND :end_date
+                ORDER BY sleep_end DESC LIMIT 5
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-            # --- ChromaDB Retrieval ---
-            if collection:
-                retrieved = collection.query(query_texts=[user_message], n_results=2)
-                memory = "\n".join(retrieved["documents"][0])
-            else:
-                memory = "No contextual insights available."
+            recent_meds = conn.execute(text("""
+                SELECT timestamp, medication_name, dosage, meal_context FROM medication_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                ORDER BY timestamp DESC LIMIT 10
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
 
-            # --- LLM Prompt Construction ---
-            prompt = f"""You are SugarSense.ai, a personal diabetes and wellness assistant.
+            min_max_glucose_daily = conn.execute(text("""
+                SELECT
+                    DATE(timestamp) as log_date,
+                    MIN(glucose_level) as min_glucose,
+                    MAX(glucose_level) as max_glucose
+                FROM glucose_log
+                WHERE user_id = 1 AND DATE(timestamp) BETWEEN :start_date AND :end_date
+                GROUP BY log_date
+                ORDER BY log_date
+            """), {'start_date': query_start_date, 'end_date': query_end_date}).fetchall()
+
+        # --- Build Health Summary ---
+        health_summary = "### Health Summary\n"
+        health_summary += "Carbs per meal:\n" + "\n".join(f"- {m[0]}: {m[1]}g" for m in food)
+        health_summary += "\nMedication effects:\n" + "\n".join(f"- {m[0]}: {m[1]} times" for m in meds)
+        health_summary += "\nActivity summary:\n" + "\n".join(f"- {a[0]}: {a[1]} minutes" for a in activity)
+        health_summary += "\nSleep summary:\n" + "\n".join(f"- {s[0]}: {s[1]} nights, avg duration: {s[2]} hours" for s in sleep)
+
+        if glucose_overall_avg is not None:
+            health_summary += f"\nOverall Avg Glucose ({query_start_date} to {query_end_date}): {glucose_overall_avg} mg/dL"
+
+        health_summary += "\nDaily Avg Glucose:\n" + "\n".join(f"- {row.log_date.strftime('%Y-%m-%d')}: {row.avg_glucose} mg/dL" for row in glucose_daily_avg)
+
+        # Find the day with the largest glucose fluctuation
+        largest_fluctuation = None
+        largest_fluctuation_date = None
+        largest_fluctuation_min = None
+        largest_fluctuation_max = None
+        for row in min_max_glucose_daily:
+            fluctuation = row.max_glucose - row.min_glucose
+            if (largest_fluctuation is None) or (fluctuation > largest_fluctuation):
+                largest_fluctuation = fluctuation
+                largest_fluctuation_date = row.log_date
+                largest_fluctuation_min = row.min_glucose
+                largest_fluctuation_max = row.max_glucose
+        if largest_fluctuation_date is not None:
+            health_summary += f"\nLargest Fluctuation: {largest_fluctuation_date.strftime('%Y-%m-%d')} (Range: {largest_fluctuation_min}-{largest_fluctuation_max} mg/dL, Δ={largest_fluctuation} mg/dL)"
+
+        health_summary += "\nDaily Glucose Range:\n" + "\n".join(f"- {row.log_date.strftime('%Y-%m-%d')}: {row.min_glucose} - {row.max_glucose} mg/dL" for row in min_max_glucose_daily)
+
+        health_summary += "\n### Recent Events (within selected range)\n"
+        health_summary += "Glucose:\n" + "\n".join(f"- {row.timestamp.strftime('%Y-%m-%d %H:%M')}: {row.glucose_level} mg/dL" for row in recent_glucose)
+        health_summary += "\nFood:\n" + "\n".join(f"- {row.timestamp.strftime('%Y-%m-%d %H:%M')}: {row.meal_type}, {row.carbs}g carbs" for row in recent_food)
+        health_summary += "\nActivity:\n" + "\n".join(f"- {row.timestamp.strftime('%Y-%m-%d %H:%M')}: {row.activity_type}, {row.duration_minutes} mins" for row in recent_activity)
+        health_summary += "\nSleep:\n" + "\n".join(f"- {row.sleep_start.strftime('%Y-%m-%d %H:%M')} to {row.sleep_end.strftime('%Y-%m-%d %H:%M')}: {row.sleep_quality}" for row in recent_sleep)
+        health_summary += "\nMedication:\n" + "\n".join(f"- {row.timestamp.strftime('%Y-%m-%d %H:%M')}: {row.medication_name}, {row.dosage}mg, {row.meal_context}" for row in recent_meds)
+
+        # --- ChromaDB Retrieval ---
+        if collection:
+            retrieved = collection.query(query_texts=[user_message], n_results=2)
+            memory = "\n".join(retrieved["documents"][0])
+        else:
+            memory = "No contextual insights available."
+
+        # --- LLM Prompt Construction ---
+        prompt = f"""You are SugarSense.ai, a personal diabetes and wellness assistant.
 Your role is to analyze the user's health data and provide concise, helpful explanations about glucose patterns, medication timing, food/carb intake, sleep, activity, and how these factors may influence their glucose levels.
 
 If the user's message is a simple expression of gratitude (e.g., 'Thank you', 'Thanks'), respond with a warm, supportive, and concise conversational message like 'You're welcome! I'm always here to help you.' or 'Glad I could assist!' Do not provide any unrelated data insights in these instances.
@@ -522,30 +695,30 @@ Contextual Insights (only use if directly relevant to the specific question):
 
 Provide a concise response (max 70 words) that directly addresses the user's question using the data provided. If the question is not health-related, state so and ask for a relevant query."""
 
-            # Start a chat session for context-aware text responses
-            chat_history_formatted = []
-            for msg in chat_history:
-                role = "user" if msg["type"] == "user" else "model"
-                if msg.get("text"):
-                    chat_history_formatted.append({"role": role, "parts": [{"text": msg["text"]}]})
-            print(f"chat_history_formatted: {chat_history_formatted}")
+        # Start a chat session for context-aware text responses
+        chat_history_formatted = []
+        for msg in chat_history:
+            role = "user" if msg["type"] == "user" else "model"
+            if msg.get("text"):
+                chat_history_formatted.append({"role": role, "parts": [{"text": msg["text"]}]})
+        print(f"chat_history_formatted: {chat_history_formatted}")
 
-            convo = gemini_model.start_chat(history=chat_history_formatted)
-            response = convo.send_message(prompt)
-            response_text = response.text
+        convo = gemini_model.start_chat(history=chat_history_formatted)
+        response = convo.send_message(prompt)
+        response_text = response.text
 
-            # Add response to ChromaDB memory (if not an error)
-            if collection and not response_text.startswith("Error"): # Simple check to avoid storing error messages
-                collection.add(documents=[response_text], ids=[f"chat_{uuid.uuid4()}"])
-                print("Added response to ChromaDB memory.")
-            
-            print(f"Gemini text response: {response_text}")
-            return jsonify({'response': response_text})
+        # Add response to ChromaDB memory (if not an error)
+        if collection and not response_text.startswith("Error"): # Simple check to avoid storing error messages
+            collection.add(documents=[response_text], ids=[f"chat_{uuid.uuid4()}"])
+            print("Added response to ChromaDB memory.")
+        
+        print(f"Gemini text response: {response_text}")
+        return jsonify({'response': response_text})
 
-        except Exception as e:
-            print(f"Error processing text chat: {e}")
-            return jsonify({'response': "I'm sorry, I couldn't process your request at the moment. Please try again."}), 500
-
+    except Exception as e:
+        print(f"Error processing text chat: {e}")
+        return jsonify({'response': "I'm sorry, I couldn't process your request at the moment. Please try again."}), 500
+    
 def parse_gemini_food_analysis(response_text: str) -> Dict[str, Any]:
     """
     Parses the raw text response from Gemini's food analysis prompt into a structured dictionary.
@@ -672,10 +845,73 @@ def gemini_analyze():
 
         # If the parser returned an error (e.g., not food), return that error.
         if 'error' in analysis_result:
-            return jsonify({'success': False, 'error': analysis_result['error']}), 400
+            chat_response = f"I can see this isn't a food image. {analysis_result['error']} Feel free to ask me any questions about your diabetes management, glucose trends, or health data!"
+            return jsonify({
+                'success': False, 
+                'error': analysis_result['error'],
+                'response': chat_response  # Add chat-compatible response
+            }), 400
 
-        # Return the successful analysis
-        return jsonify({'success': True, 'analysis': analysis_result})
+        # Create conversational response for chat UI
+        nutrition = analysis_result['nutritional_values']
+        description = analysis_result['description']
+        ingredients = ', '.join(analysis_result['ingredients'])
+        
+        # Format nutritional information conversationally
+        nutrition_text = f"📊 **Nutritional Breakdown:**\n"
+        nutrition_text += f"• Calories: {nutrition['calories']:.0f}\n"
+        nutrition_text += f"• Carbs: {nutrition['carbs_g']:.0f}g\n"
+        nutrition_text += f"• Protein: {nutrition['protein_g']:.0f}g\n"
+        nutrition_text += f"• Fat: {nutrition['fat_g']:.0f}g"
+        
+        # Determine glucose impact based on carbs
+        carbs = nutrition['carbs_g']
+        if carbs > 45:
+            glucose_impact = "🔴 **High carb content** - expect significant glucose rise in 1-2 hours"
+        elif carbs > 15:
+            glucose_impact = "🟡 **Moderate carb content** - expect moderate glucose rise"
+        else:
+            glucose_impact = "🟢 **Low carb content** - minimal glucose impact expected"
+        
+        # Get recent glucose pattern for personalized advice
+        try:
+            with engine.connect() as conn:
+                recent_avg = conn.execute(text("""
+                    SELECT AVG(glucose_level) FROM glucose_log 
+                    WHERE user_id = 1 AND timestamp >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                """)).scalar()
+                
+                if recent_avg and recent_avg > 180:
+                    personalized_advice = "💡 **Tip:** Your recent levels have been elevated. Consider light activity after eating or consult your doctor about meal-time insulin."
+                elif recent_avg and recent_avg < 100:
+                    personalized_advice = "💡 **Tip:** Your recent levels have been good. This meal may cause a spike, so monitor closely."
+                else:
+                    personalized_advice = "💡 **Tip:** Monitor your glucose 1-2 hours after eating to see how this meal affects you."
+        except:
+            personalized_advice = "💡 **Tip:** Monitor your glucose 1-2 hours after eating to see how this meal affects you."
+        
+        # Create conversational response for chat UI
+        chat_response = f"I can see this is **{description}** 🍽️\n\n"
+        chat_response += f"**Main ingredients:** {ingredients}\n\n"
+        chat_response += f"{nutrition_text}\n\n"
+        chat_response += f"{glucose_impact}\n\n"
+        chat_response += personalized_advice
+        
+        # Store nutritional context in ChromaDB for follow-up questions
+        if collection:
+            food_context = f"User just analyzed: {description}. Nutritional info: {nutrition['calories']} calories, {nutrition['carbs_g']}g carbs, {nutrition['protein_g']}g protein, {nutrition['fat_g']}g fat. Ingredients: {ingredients}."
+            collection.add(
+                documents=[food_context], 
+                ids=[f"food_analysis_{int(datetime.now().timestamp())}"]
+            )
+            print("🧠 Stored food analysis in memory for follow-up questions")
+
+        # Return both structured analysis AND chat response
+        return jsonify({
+            'success': True, 
+            'analysis': analysis_result,
+            'response': chat_response  # Add chat-compatible response
+        })
 
     except Exception as e:
         print(f"💥 Error during Gemini analysis: {e}")
@@ -687,6 +923,9 @@ def gemini_analyze():
 # New endpoint for logging glucose data
 @app.route('/api/log-glucose', methods=['POST'])
 def log_glucose():
+    # Ensure the glucose_log table exists
+    create_glucose_log_table()
+    
     data = request.json
     user_id = 1 # Assuming user_id 1 for now
     glucose_level = data.get('glucoseLevel')
@@ -714,6 +953,9 @@ def log_glucose():
 # New endpoint for logging meal data
 @app.route('/api/log-meal', methods=['POST'])
 def log_meal():
+    # Ensure the food_log table exists
+    create_food_log_table()
+    
     data = request.json
     user_id = 1 # Hardcoded for now
     
@@ -1379,6 +1621,9 @@ def insert_health_data_display(conn, record: Dict[str, Any]):
 # New endpoint for logging medication data
 @app.route('/api/log-medication', methods=['POST'])
 def log_medication():
+    # Ensure the medication_log table exists
+    create_medication_log_table()
+    
     data = request.json
     user_id = 1 # Assuming user_id 1 for now
     medication_type = data.get('medication_type')

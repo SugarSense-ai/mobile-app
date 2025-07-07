@@ -224,7 +224,7 @@ export default function ChatScreen() {
         }, 100);
 
         try {
-          const geminiResponse = await sendImageToGemini(attachedImage);
+          const geminiResponse = await sendImageToGemini(attachedImage, inputText.trim());
           const newAiMessage: ChatMessage = {
             type: 'system',
             icon: 'message-circle',
