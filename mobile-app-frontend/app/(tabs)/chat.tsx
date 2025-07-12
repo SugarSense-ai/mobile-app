@@ -17,8 +17,8 @@ import {
 import { FontAwesome5, Feather } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import { styles } from '@/styles/chat.styles';
-import { sendMessageToLlama, ChatMessage } from '@/services/chatService';
-import { sendImageToGemini } from '@/services/geminiService';
+import { sendMessage, ChatMessage, HealthSnapshot } from '@/services/chatService';
+import { fetchDashboardData, DashboardData } from '@/services/dashboardService';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { COLORS } from '@/constants/theme';
 import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
@@ -32,6 +32,8 @@ export default function ChatScreen() {
   const animValue3 = useRef(new Animated.Value(0.4)).current;
   const keyboardHeight = useRef(new Animated.Value(0)).current;
   const [keyboardOffset, setKeyboardOffset] = useState(0);
+  const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
+  const isMounted = useRef(true);
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
@@ -45,6 +47,13 @@ export default function ChatScreen() {
   const [galleryPermission, setGalleryPermission] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [attachedImage, setAttachedImage] = useState<string | null>(null);
+
+  useEffect(() => {
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     const keyboardWillShowListener = Keyboard.addListener(
@@ -76,6 +85,18 @@ export default function ChatScreen() {
   }, []);
 
   useEffect(() => {
+    // Fetch dashboard data on component mount
+    const fetchDashboardDataAsync = async () => {
+      try {
+        const data = await fetchDashboardData();
+        if (isMounted.current) {
+          setDashboardData(data);
+        }
+      } catch (error) {
+        console.error("Failed to fetch dashboard data for chat snapshot:", error);
+      }
+    };
+
     (async () => {
       const cameraStatus = await ImagePicker.requestCameraPermissionsAsync();
       setCameraPermission(cameraStatus.status === 'granted');
@@ -83,6 +104,8 @@ export default function ChatScreen() {
       const galleryStatus = await ImagePicker.requestMediaLibraryPermissionsAsync();
       setGalleryPermission(galleryStatus.status === 'granted');
     })();
+
+    fetchDashboardDataAsync();
   }, []);
 
   useEffect(() => {
@@ -120,6 +143,45 @@ export default function ChatScreen() {
       };
     }
   }, [isLoading]);
+
+  // Helper to build the health snapshot from dashboard data
+  const buildHealthSnapshot = (): HealthSnapshot | null => {
+    if (!dashboardData) return null;
+
+    const today = new Date().toISOString().split('T')[0];
+    const todaysGlucose = dashboardData.glucose.data.find((d: { date: string }) => d.date === today);
+    const todaysActivity = dashboardData.activity.data.find((d: { date: string }) => d.date === today);
+
+    // Get the last 7 days of glucose readings for context
+    const recentGlucoseReadings = dashboardData.glucose.data.slice(0, 7).map(d => ({
+      date: d.date,
+      value: d.avg_glucose,
+    }));
+
+    const snapshot: HealthSnapshot = {
+      glucoseSummary: {
+        averageToday: todaysGlucose ? todaysGlucose.avg_glucose : (dashboardData.glucose.summary.avg_glucose_7_days || 0),
+        spikes: [], // Placeholder
+        drops: [], // Placeholder
+        recentReadings: recentGlucoseReadings, // Populate with recent daily averages
+      },
+      mealHistory: {
+        lastMeal: "Not tracked", // Placeholder
+        typicalDinner: "Not tracked", // Placeholder
+        recentHighCarb: false, // Placeholder
+      },
+      sleepSummary: {
+        hours: dashboardData.sleep.summary.avg_sleep_hours || 0,
+        quality: dashboardData.sleep.summary.avg_sleep_hours > 7 ? 'good' : dashboardData.sleep.summary.avg_sleep_hours > 5 ? 'average' : 'poor',
+      },
+      activitySummary: {
+        stepsToday: todaysActivity ? todaysActivity.steps : 0,
+        activeMinutes: 0, // Placeholder
+        sedentary: (todaysActivity ? todaysActivity.steps : 0) < 3000,
+      },
+    };
+    return snapshot;
+  };
 
   useEffect(() => {
     const showSub = Keyboard.addListener(
@@ -200,85 +262,71 @@ export default function ChatScreen() {
   };
 
   const handleSendMessage = async () => {
-    if (inputText.trim() || attachedImage) {
-      const currentTime = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+    // Ensure there's either text or an image to send
+    if (!inputText.trim() && !attachedImage) {
+      return;
+    }
+
+    const currentTime = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+    
+    // Create the user's message object for the UI
+    const userMessage: ChatMessage = {
+      type: 'user',
+      avatar: require('../../assets/images/avatar.png'),
+      text: inputText.trim() || undefined,
+      image: attachedImage || undefined,
+      time: currentTime,
+    };
+
+    // Optimistically update the UI with the user's message
+    // and store the state *before* the send action
+    const currentChatMessages = [...chatMessages, userMessage];
+    setChatMessages(currentChatMessages);
+    
+    // Clear inputs and set loading state
+    const textToSend = inputText.trim();
+    const imageToSend = attachedImage;
+    setInputText('');
+    setAttachedImage(null);
+    setIsLoading(true);
+
+    setTimeout(() => {
+      scrollViewRef.current?.scrollToEnd({ animated: true });
+    }, 100);
+
+    try {
+      // Build the health snapshot
+      const healthSnapshot = buildHealthSnapshot();
       
-      // Handle image message with optional caption
-      if (attachedImage) {
-        const newImageMessage: ChatMessage = {
-          type: 'user',
-          avatar: require('../../assets/images/avatar.png'),
-          image: attachedImage,
-          text: inputText.trim() || undefined, // Add caption if provided
-          time: currentTime,
-        };
-        setChatMessages(prev => [...prev, newImageMessage]);
-        
-        // Clear input and attached image
-        setInputText('');
-        setAttachedImage(null);
-        setIsLoading(true);
+      // Call the unified sendMessage service function
+      const aiResponse = await sendMessage(textToSend, healthSnapshot, currentChatMessages, imageToSend);
+      
+      // Create the AI's response message
+      const newAiMessage: ChatMessage = {
+        type: 'system',
+        icon: 'message-circle',
+        iconName: 'message-circle',
+        text: aiResponse,
+        time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
+      };
 
-        setTimeout(() => {
-          scrollViewRef.current?.scrollToEnd({ animated: true });
-        }, 100);
+      // Update the UI with the AI's response
+      setChatMessages(prev => [...prev, newAiMessage]);
 
-        try {
-          const geminiResponse = await sendImageToGemini(attachedImage, inputText.trim());
-          const newAiMessage: ChatMessage = {
-            type: 'system',
-            icon: 'message-circle',
-            iconName: 'message-circle',
-            text: geminiResponse,
-            time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
-          };
-          setChatMessages(prev => [...prev, newAiMessage]);
-        } catch (error) {
-          Alert.alert(
-            'Error',
-            'Failed to analyze image with AI. Please try again.',
-            [{ text: 'OK' }]
-          );
-        } finally {
-          setIsLoading(false);
-        }
-      } 
-      // Handle text-only message
-      else if (inputText.trim()) {
-        const newUserMessage: ChatMessage = {
-          type: 'user',
-          avatar: require('../../assets/images/avatar.png'),
-          text: inputText,
-          time: currentTime,
-        };
-        setChatMessages(prev => [...prev, newUserMessage]);
-        setInputText('');
-        setIsLoading(true);
-
-        setTimeout(() => {
-          scrollViewRef.current?.scrollToEnd({ animated: true });
-        }, 100);
-
-        try {
-          const aiResponse = await sendMessageToLlama(inputText, chatMessages);
-          const newAiMessage: ChatMessage = {
-            type: 'system',
-            icon: 'message-circle',
-            iconName: 'message-circle',
-            text: aiResponse,
-            time: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
-          };
-          setChatMessages(prev => [...prev, newAiMessage]);
-        } catch (error) {
-          Alert.alert(
-            'Error',
-            'Failed to get response from AI. Please try again.',
-            [{ text: 'OK' }]
-          );
-        } finally {
-          setIsLoading(false);
-        }
-      }
+    } catch (error) {
+      // If the API call fails, show an alert
+      Alert.alert(
+        'Error',
+        'Failed to get response from AI. Please try again.',
+        [{ text: 'OK' }]
+      );
+      // Optional: Revert optimistic UI updates or add a failure indicator
+    } finally {
+      // Stop the loading indicator
+      setIsLoading(false);
+      setTimeout(() => {
+        scrollViewRef.current?.scrollToEnd({ animated: true });
+      }, 100);
     }
   };
 

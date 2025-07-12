@@ -20,8 +20,10 @@ import { LineChart } from 'react-native-chart-kit';
 import { FontAwesome5, MaterialCommunityIcons } from '@expo/vector-icons';
 import { styles } from '@/styles/prediction.styles';
 import { API_ENDPOINTS } from '@/constants/config';
+import { getBaseUrl } from '@/services/api';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import * as ImagePicker from 'expo-image-picker';
+import { fetchTodaysInsights, clearInsightsCache, InsightsResponse, GeneratedInsight } from '@/services/insightsService';
 
 const { width } = Dimensions.get('window');
 
@@ -109,7 +111,9 @@ const chartConfig = {
 
 const sendLogData = async (endpoint: string, data: any) => {
   try {
-    const response = await fetch(`${API_ENDPOINTS.BASE_URL}${endpoint}`, {
+    // Use dynamic URL resolution instead of static BASE_URL
+    const baseUrl = await getBaseUrl();
+    const response = await fetch(`${baseUrl}${endpoint}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -265,6 +269,16 @@ export default function PredictionDashboard(){
   const [isMedicationTypeDropdownOpen, setIsMedicationTypeDropdownOpen] = useState(false);
   const [isInsulinTypeDropdownOpen, setIsInsulinTypeDropdownOpen] = useState(false);
   const [showInsulinDosageInput, setShowInsulinDosageInput] = useState(false);
+  const [isInjectionSiteDropdownOpen, setIsInjectionSiteDropdownOpen] = useState(false);
+  
+  // New state for injection site recommendation
+  const [injectionRecommendation, setInjectionRecommendation] = useState<{
+    site: string;
+    reason: string;
+    fallback?: boolean;
+  } | null>(null);
+  const [isLoadingRecommendation, setIsLoadingRecommendation] = useState<boolean>(false);
+  const [showRecommendation, setShowRecommendation] = useState<boolean>(true);
 
   // New state for chart granularity
   const [granularity, setGranularity] = useState<'hourly' | '15min' | '5min'>('hourly');
@@ -272,6 +286,25 @@ export default function PredictionDashboard(){
   // New state for tooltip and selected point
   const [tooltip, setTooltip] = useState<{ x: number; y: number; value: number; label: string; datasetIndex: number; pointIndex: number } | null>(null);
   const [selectedPoint, setSelectedPoint] = useState<{ datasetIndex: number; pointIndex: number } | null>(null);
+  
+  // New state for today's stats
+  const [todaysStats, setTodaysStats] = useState<{
+    averageGlucose: number | null;
+    timeInRange: number | null;
+    highestReading: number | null;
+    lowestReading: number | null;
+  }>({
+    averageGlucose: null,
+    timeInRange: null,
+    highestReading: null,
+    lowestReading: null,
+  });
+
+  // New state for dynamic insights
+  const [insights, setInsights] = useState<GeneratedInsight[]>([]);
+  const [insightsLoading, setInsightsLoading] = useState<boolean>(true);
+  const [insightsError, setInsightsError] = useState<string | null>(null);
+  const [lastInsightsRefresh, setLastInsightsRefresh] = useState<Date | null>(null);
   const chartWidth = width - 40;
   const chartHeight = 200;
 
@@ -368,6 +401,63 @@ export default function PredictionDashboard(){
     };
   };
 
+  // Function to compute today's stats from glucose history
+  const computeTodaysStats = () => {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+    const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+    
+    // Filter glucose history for today's readings only
+    const todaysReadings = glucoseHistory.filter(reading => {
+      const readingTime = new Date(reading.timestamp);
+      return readingTime >= startOfToday && readingTime <= endOfToday;
+    });
+    
+    console.log('📊 Computing today\'s stats from', todaysReadings.length, 'readings');
+    
+    if (todaysReadings.length === 0) {
+      console.log('⚠️ No readings available for today');
+      setTodaysStats({
+        averageGlucose: null,
+        timeInRange: null,
+        highestReading: null,
+        lowestReading: null,
+      });
+      return;
+    }
+    
+    // Extract glucose values
+    const glucoseValues = todaysReadings.map(reading => reading.value);
+    
+    // Calculate average glucose
+    const averageGlucose = parseFloat((
+      glucoseValues.reduce((sum, value) => sum + value, 0) / glucoseValues.length
+    ).toFixed(1));
+    
+    // Calculate time in range (70-180 mg/dL)
+    const readingsInRange = glucoseValues.filter(value => value >= 70 && value <= 180);
+    const timeInRange = parseFloat(((readingsInRange.length / glucoseValues.length) * 100).toFixed(1));
+    
+    // Calculate highest and lowest readings
+    const highestReading = Math.max(...glucoseValues);
+    const lowestReading = Math.min(...glucoseValues);
+    
+    console.log('📈 Computed stats:', {
+      averageGlucose,
+      timeInRange: `${timeInRange}%`,
+      highestReading,
+      lowestReading,
+      totalReadings: glucoseValues.length
+    });
+    
+    setTodaysStats({
+      averageGlucose,
+      timeInRange,
+      highestReading,
+      lowestReading,
+    });
+  };
+
   // Cleaned chart data for current granularity with dynamic updates
   const cleanedChartData = cleanChartData(generateDynamicChartData(granularity));
 
@@ -384,9 +474,8 @@ export default function PredictionDashboard(){
     // Launch image picker
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [4, 3],
-      quality: 0.6, // Compress image for faster upload
+      allowsEditing: false,
+      quality: 0.8, // Compress image for faster upload
       base64: true, // We need base64 for the API
     });
 
@@ -460,7 +549,9 @@ export default function PredictionDashboard(){
       console.log('🔍 Starting glucose history fetch...');
       setIsLoadingHistory(true);
       
-      const url = `${API_ENDPOINTS.BASE_URL}/api/glucose-history`;
+      // Use dynamic URL resolution instead of static BASE_URL
+      const baseUrl = await getBaseUrl();
+      const url = `${baseUrl}/api/glucose-history`;
       console.log('🌐 Fetching from URL:', url);
       
       const response = await fetch(url, {
@@ -526,7 +617,9 @@ export default function PredictionDashboard(){
   const fetchGlucosePrediction = async (glucose: number | null, carbs: number, activity: number, sleep: string) => {
     if (glucose === null) return; // Cannot predict without current glucose
     try {
-      const response = await fetch(`${API_ENDPOINTS.BASE_URL}/api/predict-glucose`, {
+      // Use dynamic URL resolution instead of static BASE_URL
+      const baseUrl = await getBaseUrl();
+      const response = await fetch(`${baseUrl}/api/predict-glucose`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -571,6 +664,144 @@ export default function PredictionDashboard(){
     setSelectedPoint(null);
   }, [currentGlucose, predictedLevels, granularity, glucoseHistory]);
 
+  // Compute today's stats whenever glucose history changes
+  useEffect(() => {
+    console.log('🔄 Glucose history updated, recomputing today\'s stats...');
+    computeTodaysStats();
+  }, [glucoseHistory]);
+
+  // Function to fetch insights
+  const fetchInsights = async (forceRefresh: boolean = false) => {
+    try {
+      setInsightsLoading(true);
+      setInsightsError(null);
+      
+      console.log('🔍 Fetching today\'s insights...');
+      const response = await fetchTodaysInsights(forceRefresh);
+      
+      if (response.success) {
+        setInsights(response.insights);
+        setLastInsightsRefresh(new Date());
+        console.log('✅ Insights loaded successfully:', response.insights.length, 'insights');
+        
+        // Log LLM usage for debugging
+        if (response.llmUsed) {
+          console.log('🤖 Insights generated using LLM');
+        } else {
+          console.log('📊 Insights generated using rule-based logic');
+          if (response.fallbackReason) {
+            console.log('🔄 Fallback reason:', response.fallbackReason);
+          }
+        }
+      } else {
+        setInsightsError(response.error || 'Failed to generate insights');
+        // Set fallback insights if none exist
+        if (insights.length === 0) {
+          setInsights([{
+            id: 'fallback-default',
+            type: 'positive',
+            icon: '🎯',
+            title: 'Keep Going Strong',
+            description: 'Continue monitoring your health consistently. Your dedication to tracking will help us provide better insights.',
+            priority: 1,
+            isAIGenerated: false,
+            fallbackUsed: true
+          }]);
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error fetching insights:', error);
+      setInsightsError('Unable to load insights. Please try again.');
+      
+      // Set error fallback insights
+      if (insights.length === 0) {
+        setInsights([{
+          id: 'error-fallback',
+          type: 'neutral',
+          icon: '📱',
+          title: 'Insights Temporarily Unavailable',
+          description: 'We\'re working to restore insight generation. Keep logging your data for better analysis.',
+          priority: 1,
+          isAIGenerated: false,
+          fallbackUsed: true
+        }]);
+      }
+    } finally {
+      setInsightsLoading(false);
+    }
+  };
+
+  // Fetch insights when component mounts
+  useEffect(() => {
+    console.log('🔄 Component mounted, fetching insights...');
+    fetchInsights();
+  }, []);
+
+  // Refresh insights when important data changes
+  useEffect(() => {
+    if (!isLoadingHistory && glucoseHistory.length > 0) {
+      console.log('🔄 Glucose data updated, refreshing insights...');
+      // Delay to allow other operations to complete
+      setTimeout(() => {
+        fetchInsights(true); // Force refresh with new data
+      }, 2000);
+    }
+  }, [glucoseHistory.length, isLoadingHistory]);
+
+  // Handle refresh for insights
+  const handleRefreshInsights = async () => {
+    console.log('🔄 Manual insights refresh triggered');
+    await fetchInsights(true);
+  };
+
+  // Clear insights cache when logging new data
+  const clearInsightsCacheAndRefresh = async () => {
+    clearInsightsCache();
+    await fetchInsights(true);
+  };
+
+  // Function to fetch injection site recommendation
+  const fetchInjectionSiteRecommendation = async () => {
+    try {
+      setIsLoadingRecommendation(true);
+      setInjectionRecommendation(null);
+      
+      const baseUrl = await getBaseUrl();
+      const response = await fetch(`${baseUrl}/api/injection-site-recommendation?user_id=1`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      const data = await response.json();
+      
+      if (response.ok && data.success) {
+        console.log('✅ Injection site recommendation received:', data.recommendation);
+        setInjectionRecommendation(data.recommendation);
+      } else {
+        console.log('⚠️ No recommendation available:', data.message);
+        // Don't show error for no history - this is expected for new users
+      }
+    } catch (error) {
+      console.error('❌ Error fetching injection site recommendation:', error);
+      // Don't show error alert - recommendation is optional
+    } finally {
+      setIsLoadingRecommendation(false);
+    }
+  };
+
+  // Function to use recommended injection site
+  const useRecommendedSite = () => {
+    if (injectionRecommendation) {
+      setMedicationDetails({
+        ...medicationDetails,
+        injection_site: injectionRecommendation.site
+      });
+      setIsInjectionSiteDropdownOpen(false);
+    }
+  };
+
   const handleLogMeal = () => {
     console.log('Log Meal button pressed');
     setLoggingType('meal');
@@ -613,13 +844,19 @@ export default function PredictionDashboard(){
       dosage: '',
       time: formatToMySQLDateTime(now),
       meal_context: '',
+      injection_site: '',
     });
     setLoggingType('medication');
     setIsModalVisible(true);
     setIsMedicationTypeDropdownOpen(false);
     setIsInsulinTypeDropdownOpen(false);
     setShowInsulinDosageInput(false);
+    setIsInjectionSiteDropdownOpen(false);
     setShowDatePicker(false);
+    // Reset recommendation when opening medication modal
+    setInjectionRecommendation(null);
+    setIsLoadingRecommendation(false);
+    setShowRecommendation(true);
   };
 
   const closeModal = () => {
@@ -650,6 +887,8 @@ export default function PredictionDashboard(){
                     console.log('✅ Glucose logged successfully, refreshing history...');
                     // Refresh glucose history from backend to ensure consistency
                     await fetchGlucoseHistory();
+                    // Refresh insights with new data
+                    await clearInsightsCacheAndRefresh();
                     closeModal();
                 }
             } else {
@@ -685,6 +924,8 @@ export default function PredictionDashboard(){
                     setRecentCarbs(carbsValue);
                     // Trigger prediction after logging meal
                     fetchGlucosePrediction(currentGlucose, carbsValue, recentActivityMinutes, recentSleepQuality);
+                    // Refresh insights with new meal data
+                    await clearInsightsCacheAndRefresh();
                     closeModal();
                 }
             } else {
@@ -713,6 +954,8 @@ export default function PredictionDashboard(){
                       setRecentActivityMinutes(durationValue);
                       // Trigger prediction after logging activity
                       fetchGlucosePrediction(currentGlucose, recentCarbs, durationValue, recentSleepQuality);
+                      // Refresh insights with new activity data
+                      await clearInsightsCacheAndRefresh();
                       closeModal();
                   }
               } else {
@@ -723,7 +966,10 @@ export default function PredictionDashboard(){
           }
      }
      else if (loggingType === 'medication') {
-         if (medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time) {
+         // Check if injection site is required for insulin
+         const requiresInjectionSite = medicationDetails.medication_type === 'Insulin' && !medicationDetails.injection_site?.trim();
+         
+         if (medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time && !requiresInjectionSite) {
              const dosageValue = parseFloat(medicationDetails.dosage);
              if (!isNaN(dosageValue)) {
                  const success = await sendLogData('/api/log-medication', {
@@ -732,6 +978,7 @@ export default function PredictionDashboard(){
                      dosage: dosageValue,
                      time: medicationDetails.time,
                      meal_context: medicationDetails.meal_context || null, // Optional
+                     injection_site: medicationDetails.injection_site || null, // Optional, but required for insulin
                  });
                  if (success) {
                      closeModal();
@@ -740,7 +987,11 @@ export default function PredictionDashboard(){
                  Alert.alert("Invalid Input", "Please enter a valid number for dosage.");
              }
          } else {
-             Alert.alert("Missing Information", "Please fill in all medication details.");
+             if (requiresInjectionSite) {
+                 Alert.alert("Missing Information", "Please select an injection site for insulin.");
+             } else {
+                 Alert.alert("Missing Information", "Please fill in all medication details.");
+             }
          }
      }
   };
@@ -764,7 +1015,7 @@ export default function PredictionDashboard(){
               </TouchableOpacity>
             ) : (
               <View style={{ width: '100%', alignItems: 'center' }}>
-                <Image source={{ uri: mealImage }} style={modalStyles.mealImage} />
+                <Image source={{ uri: mealImage }} style={modalStyles.mealImage} resizeMode="contain" />
                 
                 {isAnalyzing ? (
                   <View style={modalStyles.loadingContainer}>
@@ -1023,6 +1274,7 @@ export default function PredictionDashboard(){
       case 'medication':
         const medicationTypes = ['Insulin', 'Oral Medication', 'Other'];
         const insulinTypes = ['Bolus', 'Basal'];
+        const injectionSites = ['Left Arm', 'Right Arm', 'Left Thigh', 'Right Thigh', 'Abdomen', 'Buttock'];
         const mealContexts = ['Before Meal', 'With Meal', 'After Meal', 'No Meal Relation'];
 
         const onMedicationDateChange = (event: any, selectedDate: Date | undefined) => {
@@ -1036,8 +1288,67 @@ export default function PredictionDashboard(){
         };
 
         return (
-            <View style={modalStyles.contentContainer}>
+            <ScrollView style={{width:'100%'}} contentContainerStyle={modalStyles.contentContainer}>
                 <Text style={modalStyles.modalTitle}>Log Your Medication</Text>
+                
+                {medicationDetails.medication_type === 'Insulin' && showRecommendation && (
+                    <View style={modalStyles.recommendationWrapper}>
+                        {/* Close Button - positioned outside and top-right of the blue box */}
+                        <TouchableOpacity 
+                            style={modalStyles.closeButton} 
+                            onPress={() => setShowRecommendation(false)}
+                            activeOpacity={0.7}
+                        >
+                            <MaterialCommunityIcons name="close" size={16} color="#6b7280" />
+                        </TouchableOpacity>
+                        
+                        <View style={modalStyles.recommendationContainer}>
+                            {isLoadingRecommendation ? (
+                                <View style={modalStyles.recommendationLoading}>
+                                    <ActivityIndicator size="small" color="#4A90E2" />
+                                    <Text style={modalStyles.recommendationLoadingText}>Getting personalized recommendation...</Text>
+                                </View>
+                            ) : injectionRecommendation ? (
+                                <View style={modalStyles.recommendationCard}>
+                                    <View style={modalStyles.recommendationHeader}>
+                                        <Text style={modalStyles.recommendationIcon}>💡</Text>
+                                        <Text style={modalStyles.recommendationTitle}>Recommended Site: {injectionRecommendation.site}</Text>
+                                    </View>
+                                    <Text style={modalStyles.recommendationReason}>{injectionRecommendation.reason}</Text>
+                                    {injectionRecommendation.fallback && (
+                                        <Text style={modalStyles.fallbackNote}>* Using rule-based recommendation</Text>
+                                    )}
+                                    <TouchableOpacity 
+                                        style={modalStyles.useRecommendationButton}
+                                        onPress={useRecommendedSite}
+                                    >
+                                        <Text style={modalStyles.useRecommendationButtonText}>Use This Site</Text>
+                                    </TouchableOpacity>
+                                </View>
+                            ) : (
+                                <TouchableOpacity 
+                                    style={modalStyles.getRecommendationButton}
+                                    onPress={fetchInjectionSiteRecommendation}
+                                >
+                                    <Text style={modalStyles.getRecommendationButtonText}>Get Site Recommendation</Text>
+                                </TouchableOpacity>
+                            )}
+                        </View>
+                    </View>
+                )}
+                
+                {/* Show Recommendation button when hidden */}
+                {medicationDetails.medication_type === 'Insulin' && !showRecommendation && (
+                    <TouchableOpacity 
+                        style={modalStyles.showRecommendationButton}
+                        onPress={() => setShowRecommendation(true)}
+                        activeOpacity={0.7}
+                    >
+                        <MaterialCommunityIcons name="lightbulb-outline" size={16} color="#0ea5e9" style={{ marginRight: 8 }} />
+                        <Text style={modalStyles.showRecommendationButtonText}>Show Site Recommendation</Text>
+                    </TouchableOpacity>
+                )}
+                
                 {/* Medication Type Dropdown */}
                 <TouchableOpacity
                     style={modalStyles.modernDropdownButton}
@@ -1067,6 +1378,13 @@ export default function PredictionDashboard(){
                                       setMedicationDetails({ ...medicationDetails, medication_type: type, insulin_type: '' });
                                       setShowInsulinDosageInput(type === 'Insulin');
                                       setIsMedicationTypeDropdownOpen(false);
+                                      
+                                      // Auto-fetch injection site recommendation when insulin is selected
+                                      if (type === 'Insulin') {
+                                          setTimeout(() => {
+                                              fetchInjectionSiteRecommendation();
+                                          }, 500); // Small delay to ensure state is updated
+                                      }
                                   }}
                               >
                                   <Text style={modalStyles.modernDropdownOptionText}>{type}</Text>
@@ -1109,6 +1427,45 @@ export default function PredictionDashboard(){
                                   }}
                               >
                                   <Text style={modalStyles.modernDropdownOptionText}>{type}</Text>
+                              </TouchableOpacity>
+                          ))}
+                        </ScrollView>
+                    </View>
+                )}
+
+                {/* Injection Site Dropdown (Conditional for Insulin) */}
+                {medicationDetails.medication_type === 'Insulin' && (
+                    <TouchableOpacity
+                        style={modalStyles.modernDropdownButton}
+                        onPress={() => setIsInjectionSiteDropdownOpen(!isInjectionSiteDropdownOpen)}
+                    >
+                        <Text style={modalStyles.modernDropdownButtonText}>
+                            {medicationDetails.injection_site || "Select Injection Site"}
+                        </Text>
+                        <MaterialCommunityIcons
+                            name={isInjectionSiteDropdownOpen ? "chevron-up" : "chevron-down"}
+                            size={20}
+                            color="#666"
+                        />
+                    </TouchableOpacity>
+                )}
+                {medicationDetails.medication_type === 'Insulin' && isInjectionSiteDropdownOpen && (
+                    <View style={modalStyles.modernDropdownOptionsContainer}>
+                        <ScrollView 
+                          style={{ maxHeight: 180 }}
+                          showsVerticalScrollIndicator={true}
+                          nestedScrollEnabled={true}
+                        >
+                          {injectionSites.map((site) => (
+                              <TouchableOpacity
+                                  key={site}
+                                  style={modalStyles.modernDropdownOption}
+                                  onPress={() => {
+                                      setMedicationDetails({ ...medicationDetails, injection_site: site });
+                                      setIsInjectionSiteDropdownOpen(false);
+                                  }}
+                              >
+                                  <Text style={modalStyles.modernDropdownOptionText}>{site}</Text>
                               </TouchableOpacity>
                           ))}
                         </ScrollView>
@@ -1185,7 +1542,7 @@ export default function PredictionDashboard(){
                         </ScrollView>
                     </View>
                 )}
-            </View>
+            </ScrollView>
         );
       default:
         return null;
@@ -1204,17 +1561,6 @@ export default function PredictionDashboard(){
           <Text style={styles.predictedGlucoseLabel}>Predicted ({predictedLevels.length > 0 ? predictedLevels.length : '0'}h)</Text>
           <Text style={styles.predictedGlucoseValue}>{predictedLevels.length > 0 ? predictedLevels[0] : '--'} <Text style={styles.unit}>mg/dL</Text></Text>
           <Text style={styles.lastMeal}>Last meal: sandwich</Text>
-        </View>
-      </View>
-
-      <View style={styles.alertContainer}>
-        <FontAwesome5 name="exclamation-triangle" size={22} color="#ffc107" style={styles.alertIcon} />
-        <View style={styles.alertTextContainer}>
-          <Text style={styles.alertTitle}>Glucose spike predicted in 2 hours</Text>
-          <Text style={styles.alertMessage}>Try a 15-minute walk now to avoid reaching {predictedLevels.length > 2 ? predictedLevels[2] : '196'} mg/dL</Text>
-          <TouchableOpacity style={styles.alertButton}>
-            <Text style={styles.alertButtonText}>Got it</Text>
-          </TouchableOpacity>
         </View>
       </View>
 
@@ -1441,67 +1787,34 @@ export default function PredictionDashboard(){
         </TouchableOpacity>
       </View>
 
-      <View style={styles.recommendationsCard}>
-        <Text style={styles.recommendationsTitle}>SugarSense.ai Recommendations</Text>
-        <View style={styles.recommendationItem}>
-          <FontAwesome5 name="check-circle" size={18} color="#28a745" style={styles.recommendationIcon} />
-          <Text style={styles.recommendationText}>Take a 15-minute walk to stabilize your glucose levels</Text>
-        </View>
-        <View style={styles.recommendationItem}>
-          <FontAwesome5 name="check-circle" size={18} color="#28a745" style={styles.recommendationIcon} />
-          <Text style={styles.recommendationText}>Drink a glass of water before your next meal</Text>
-        </View>
-        <View style={styles.recommendationItem}>
-          <FontAwesome5 name="check-circle" size={18} color="#28a745" style={styles.recommendationIcon} />
-          <Text style={styles.recommendationText}>Consider lower-carb options for dinner tonight</Text>
-        </View>
-      </View>
-
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Today's Stats</Text>
         <View style={styles.statsRow}>
           <View style={styles.statsItem}>
             <Text style={styles.statsLabel}>Average Glucose</Text>
-            <Text style={styles.statsValue}>132 <Text style={styles.unit}>mg/dL</Text></Text>
+            <Text style={styles.statsValue}>
+              {todaysStats.averageGlucose !== null ? todaysStats.averageGlucose : '--'} <Text style={styles.unit}>mg/dL</Text>
+            </Text>
           </View>
           <View style={styles.statsItem}>
             <Text style={styles.statsLabel}>Time In Range</Text>
-            <Text style={styles.statsValue}>82%</Text>
+            <Text style={styles.statsValue}>
+              {todaysStats.timeInRange !== null ? `${todaysStats.timeInRange}%` : '--'}
+            </Text>
           </View>
         </View>
         <View style={styles.statsRow}>
           <View style={styles.statsItem}>
             <Text style={styles.statsLabel}>Highest Reading</Text>
-            <Text style={styles.statsValue}>187 <Text style={styles.unit}>mg/dL</Text></Text>
+            <Text style={styles.statsValue}>
+              {todaysStats.highestReading !== null ? todaysStats.highestReading : '--'} <Text style={styles.unit}>mg/dL</Text>
+            </Text>
           </View>
           <View style={styles.statsItem}>
             <Text style={styles.statsLabel}>Lowest Reading</Text>
-            <Text style={styles.statsValue}>78 <Text style={styles.unit}>mg/dL</Text></Text>
-          </View>
-        </View>
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Coming Up</Text>
-        <View style={styles.comingUpItem}>
-          <Text style={styles.comingUpTime}>12:30 PM</Text>
-          <View>
-            <Text style={styles.comingUpEvent}>Lunch Time</Text>
-            <Text style={styles.comingUpDetails}>Recommended pre-bolus: 4 units</Text>
-          </View>
-        </View>
-        <View style={styles.comingUpItem}>
-          <Text style={styles.comingUpTime}>3:00 PM</Text>
-          <View>
-            <Text style={styles.comingUpEvent}>Walking</Text>
-            <Text style={styles.comingUpDetails}>Scheduled 30-min afternoon walk</Text>
-          </View>
-        </View>
-        <View style={styles.comingUpItem}>
-          <Text style={styles.comingUpTime}>6:30 PM</Text>
-          <View>
-            <Text style={styles.comingUpEvent}>Dinner</Text>
-            <Text style={styles.comingUpDetails}>Remember to log your evening meal</Text>
+            <Text style={styles.statsValue}>
+              {todaysStats.lowestReading !== null ? todaysStats.lowestReading : '--'} <Text style={styles.unit}>mg/dL</Text>
+            </Text>
           </View>
         </View>
       </View>
@@ -1509,31 +1822,82 @@ export default function PredictionDashboard(){
       <View style={styles.card}>
         <View style={styles.cardHeader}>
           <Text style={styles.cardTitle}>Today's Insights</Text>
-          <TouchableOpacity>
-            <Text style={styles.viewAllLink}>View All</Text>
+          <TouchableOpacity onPress={handleRefreshInsights} disabled={insightsLoading}>
+            <Text style={[styles.viewAllLink, insightsLoading && { color: '#ccc' }]}>
+              {insightsLoading ? 'Refreshing...' : 'Refresh'}
+            </Text>
           </TouchableOpacity>
         </View>
-        <View style={styles.insightItem}>
-          <FontAwesome5 name="arrow-up" size={16} color="#ffc107" style={styles.insightIcon} />
-          <View style={styles.insightTextContainer}>
-            <Text style={styles.insightTitle}>Morning Rise Detected</Text>
-            <Text style={styles.insightDetails}>Your glucose rose 35 mg/dL between 6am and 7am. This pattern has occurred 3 days in a row.</Text>
+        
+        {insightsLoading && insights.length === 0 ? (
+          <View style={styles.insightLoadingContainer}>
+            <ActivityIndicator size="small" color="#4A90E2" />
+            <Text style={styles.insightLoadingText}>Generating personalized insights...</Text>
           </View>
-        </View>
-        <View style={styles.insightItem}>
-          <FontAwesome5 name="check-circle" size={16} color="#28a745" style={styles.insightIcon} />
-          <View style={styles.insightTextContainer}>
-            <Text style={styles.insightTitle}>Great Post-Lunch Response</Text>
-            <Text style={styles.insightDetails}>Your post-meal glucose spike was only 18 mg/dL after lunch today, lower than your average of 34 mg/dL.</Text>
+        ) : insightsError && insights.length === 0 ? (
+          <View style={styles.insightErrorContainer}>
+            <Text style={styles.insightErrorText}>Unable to generate insights</Text>
+            <TouchableOpacity onPress={handleRefreshInsights} style={styles.retryButton}>
+              <Text style={styles.retryButtonText}>Try Again</Text>
+            </TouchableOpacity>
           </View>
-        </View>
-        <View style={styles.insightItem}>
-          <FontAwesome5 name="chart-line" size={16} color="#007bff" style={styles.insightIcon} />
-          <View style={styles.insightTextContainer}>
-            <Text style={styles.insightTitle}>Time In Range Update</Text>
-            <Text style={styles.insightDetails}>You've spent 82% of today in your target range (70-180 mg/dL), better than yesterday's 75%.</Text>
-          </View>
-        </View>
+        ) : (
+          <>
+            {insights.map((insight, index) => {
+              // Map insight types to colors
+              const getInsightColor = (type: string) => {
+                switch (type) {
+                  case 'positive': return '#28a745';
+                  case 'warning': return '#ffc107';
+                  case 'tip': return '#007bff';
+                  default: return '#6c757d';
+                }
+              };
+              
+              // Map insight types to FontAwesome icons
+              const getInsightIconName = (type: string) => {
+                switch (type) {
+                  case 'positive': return 'check-circle';
+                  case 'warning': return 'exclamation-triangle';
+                  case 'tip': return 'lightbulb';
+                  default: return 'info-circle';
+                }
+              };
+
+              return (
+                <View key={insight.id} style={styles.insightItem}>
+                  <View style={styles.insightIconContainer}>
+                    {insight.icon && insight.icon.length === 2 ? (
+                      // Show emoji icon if provided
+                      <Text style={styles.insightEmoji}>{insight.icon}</Text>
+                    ) : (
+                      // Fallback to FontAwesome icon
+                      <FontAwesome5 
+                        name={getInsightIconName(insight.type)} 
+                        size={16} 
+                        color={getInsightColor(insight.type)} 
+                        style={styles.insightIcon} 
+                      />
+                    )}
+                  </View>
+                  <View style={styles.insightTextContainer}>
+                    <Text style={styles.insightTitle}>{insight.title}</Text>
+                    <Text style={styles.insightDetails}>{insight.description}</Text>
+                  </View>
+                </View>
+              );
+            })}
+            
+            {lastInsightsRefresh && (
+              <Text style={styles.insightsTimestamp}>
+                Last updated: {lastInsightsRefresh.toLocaleTimeString([], { 
+                  hour: '2-digit', 
+                  minute: '2-digit' 
+                })}
+              </Text>
+            )}
+          </>
+        )}
       </View>
 
       <Modal
@@ -1558,7 +1922,7 @@ export default function PredictionDashboard(){
                        (loggingType === 'glucose' ? !(logDetails.glucoseLevel?.trim() && logDetails.time?.trim()) :
                         loggingType === 'meal' ? !(logDetails.meal_type?.trim() && logDetails.food_description?.trim() && logDetails.carbs?.trim() && logDetails.calories?.trim() && logDetails.protein?.trim() && logDetails.fat?.trim() && logDetails.sugar?.trim() && logDetails.fiber?.trim()) :
                         loggingType === 'activity' ? !(logDetails.activity_type?.trim() && logDetails.duration_minutes?.trim() && (logDetails.activity_type === 'Other' ? logDetails.other_activity_type?.trim() : true)) :
-                        loggingType === 'medication' ? !(medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time) :
+                        loggingType === 'medication' ? !(medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time && (medicationDetails.medication_type !== 'Insulin' || medicationDetails.injection_site?.trim())) :
                         true) && modalStyles.disabledButton
                      ]}
                      onPress={handleSaveLog}
@@ -1566,7 +1930,7 @@ export default function PredictionDashboard(){
                          loggingType === 'glucose' ? !(logDetails.glucoseLevel?.trim() && logDetails.time?.trim()) :
                          loggingType === 'meal' ? !(logDetails.meal_type?.trim() && logDetails.food_description?.trim() && logDetails.carbs?.trim() && logDetails.calories?.trim() && logDetails.protein?.trim() && logDetails.fat?.trim() && logDetails.sugar?.trim() && logDetails.fiber?.trim()) :
                          loggingType === 'activity' ? !(logDetails.activity_type?.trim() && logDetails.duration_minutes?.trim() && (logDetails.activity_type === 'Other' ? logDetails.other_activity_type?.trim() : true)) :
-                         loggingType === 'medication' ? !(medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time) :
+                         loggingType === 'medication' ? !(medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time && (medicationDetails.medication_type !== 'Insulin' || medicationDetails.injection_site?.trim())) :
                          true
                      }
                  >
@@ -1770,9 +2134,10 @@ export const modalStyles = StyleSheet.create({
   },
   mealImage: {
     width: '100%',
-    height: 200,
+    height: 250, // Increased height for better visibility
     borderRadius: 12,
     marginBottom: 20,
+    backgroundColor: '#f8f9fa', // Light background for better contrast
   },
   loadingContainer: {
     alignItems: 'center',
@@ -1832,5 +2197,135 @@ export const modalStyles = StyleSheet.create({
     backgroundColor: '#f8f9fa',
     borderRadius: 8,
     width: '100%',
-  }
+  },
+  // Injection site recommendation styles
+  recommendationWrapper: {
+    width: '100%',
+    marginBottom: 16,
+    position: 'relative',
+  },
+  closeButton: {
+    position: 'absolute',
+    top: -8,
+    right: -8,
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#e1e8ed',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  recommendationContainer: {
+    width: '100%',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E1E8ED',
+    backgroundColor: '#FAFBFC',
+    padding: 16,
+  },
+  recommendationLoading: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 16,
+    backgroundColor: '#f8f9fa',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e1e8ed',
+  },
+  recommendationLoadingText: {
+    marginLeft: 8,
+    fontSize: 14,
+    color: '#6b7280',
+    fontWeight: '500',
+  },
+  recommendationCard: {
+    backgroundColor: '#f0f9ff',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#0ea5e9',
+  },
+  recommendationHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  recommendationIcon: {
+    fontSize: 18,
+    marginRight: 8,
+  },
+  recommendationTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#0c4a6e',
+    flex: 1,
+  },
+  recommendationReason: {
+    fontSize: 14,
+    color: '#0369a1',
+    lineHeight: 20,
+    marginBottom: 8,
+  },
+  fallbackNote: {
+    fontSize: 12,
+    color: '#64748b',
+    fontStyle: 'italic',
+    marginBottom: 12,
+  },
+  useRecommendationButton: {
+    backgroundColor: '#0ea5e9',
+    borderRadius: 8,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+  },
+  useRecommendationButtonText: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  getRecommendationButton: {
+    backgroundColor: '#f1f5f9',
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    alignItems: 'center',
+  },
+  getRecommendationButtonText: {
+    color: '#475569',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+
+  showRecommendationButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#f0f9ff',
+    borderRadius: 12,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#0ea5e9',
+    marginBottom: 16,
+    shadowColor: '#0ea5e9',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
+    elevation: 2,
+  },
+  showRecommendationButtonText: {
+    color: '#0ea5e9',
+    fontSize: 14,
+    fontWeight: '600',
+  },
 });

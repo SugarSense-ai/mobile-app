@@ -1,43 +1,87 @@
-import axios from 'axios';
-import { API_ENDPOINTS } from '@/constants/config';
-import { getApiEndpoint } from './api';
-
-// Use centralized API configuration
+import { getBaseUrl } from './api';
+import * as FileSystem from 'expo-file-system';
 
 export interface ChatMessage {
-  type: 'user' | 'system' | 'info' | 'badge';
-  text?: string; // Made text optional
+  type: 'user' | 'system' | 'info';
+  text?: string;
   time: string;
   avatar?: any;
-  image?: string; // Made image optional
-  icon?: 'message-circle' | 'thumbs-up'; // Made icon type specific
-  iconName?: 'message-circle'; // Made iconName type specific
-  highlighted?: boolean;
+  image?: string;
+  icon?: string;
+  iconName?: string;
 }
 
-export const sendMessageToLlama = async (message: string, chatHistory: ChatMessage[]): Promise<string> => {
+export interface HealthSnapshot {
+  glucoseSummary: {
+    averageToday: number;
+    spikes: any[];
+    drops: any[];
+    recentReadings: any[];
+  };
+  mealHistory: {
+    lastMeal: string;
+    typicalDinner: string;
+    recentHighCarb: boolean;
+  };
+  sleepSummary: {
+    hours: number;
+    quality: string;
+  };
+  activitySummary: {
+    stepsToday: number;
+    activeMinutes: number;
+    sedentary: boolean;
+  };
+}
+
+const convertImageToBase64 = async (imageUri: string) => {
   try {
-    const chatEndpoint = await getApiEndpoint('CHAT');
-    const response = await fetch(chatEndpoint, {
+    const base64 = await FileSystem.readAsStringAsync(imageUri, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    return base64;
+  } catch (e) {
+    console.error("Failed to convert image to base64", e);
+    throw e;
+  }
+};
+
+export const sendMessage = async (
+  message: string,
+  healthSnapshot: HealthSnapshot | null,
+  chatHistory: ChatMessage[],
+  imageUri?: string | null
+): Promise<string> => {
+  try {
+    const baseUrl = await getBaseUrl();
+    let imageBase64: string | null = null;
+    if (imageUri) {
+      imageBase64 = await convertImageToBase64(imageUri);
+    }
+
+    const response = await fetch(`${baseUrl}/api/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ user_message: message, chat_history: chatHistory }),
+      body: JSON.stringify({
+        message: message,
+        image: imageBase64,
+        health_snapshot: healthSnapshot,
+        chat_history: chatHistory, // Send the whole chat message object
+      }),
     });
 
     if (!response.ok) {
       const errorData = await response.json();
-      throw new Error(errorData.response || 'Failed to get AI response');
+      console.error('API Error Response:', errorData);
+      throw new Error(errorData.error || 'Failed to get chat response from API');
     }
 
     const data = await response.json();
     return data.response;
   } catch (error) {
-    console.error('Error sending message to AI API:', error);
+    console.error('Error sending message to API:', error);
     throw error;
   }
 };
-
-// Test the endpoint with curl or Postman
-// curl -X POST http://localhost:3000/api/chat -H "Content-Type: application/json" -d '{"message":"Hello"}'

@@ -54,9 +54,9 @@
     <key>NSFaceIDUsageDescription</key>
     <string>Allow $(PRODUCT_NAME) to access your Face ID biometric data.</string>
     <key>NSHealthShareUsageDescription</key>
-    <string>This app uses HealthKit to read your glucose data to provide insights and predictions.</string>
+    <string>To provide personalized insights and predictions, SugarSense AI needs to read your health data, including glucose, sleep, and activity levels from the Health app.</string>
     <key>NSHealthUpdateUsageDescription</key>
-    <string>This app uses HealthKit to write glucose data from manual entries.</string>
+    <string>To keep your health data synchronized, SugarSense AI needs to write data you log manually (like meals or glucose readings) to the Health app.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Allow $(PRODUCT_NAME) to access your microphone</string>
     <key>NSPhotoLibraryUsageDescription</key>

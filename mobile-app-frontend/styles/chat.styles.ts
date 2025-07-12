@@ -126,6 +126,7 @@ export const styles = StyleSheet.create({
     width: 200,
     height: 200,
     borderRadius: 12,
+    backgroundColor: '#f8f9fa', // Light background for better contrast
   },
   imageCaptionContainer: {
     position: 'absolute',
@@ -246,6 +247,7 @@ export const styles = StyleSheet.create({
     width: 80,
     height: 80,
     borderRadius: 8,
+    backgroundColor: '#f8f9fa', // Light background for better contrast
   },
   removeImageButton: {
     position: 'absolute',

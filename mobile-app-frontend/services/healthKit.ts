@@ -2,6 +2,7 @@
 // Enhanced with backend sync capabilities
 
 import { NativeModules } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { API_ENDPOINTS } from '@/constants/config';
 import {
   isHealthDataAvailable,
@@ -12,7 +13,10 @@ import {
   type QuantityTypeIdentifier,
   type CategoryTypeIdentifier,
   AuthorizationRequestStatus,
-  AuthorizationStatus
+  AuthorizationStatus,
+  type ObjectTypeIdentifier,
+  type SampleTypeIdentifier,
+  type SampleTypeIdentifierWriteable,
 } from '@kingstinct/react-native-healthkit';
 
 interface HealthValue {
@@ -30,8 +34,8 @@ interface HealthInputOptions {
 
 interface HealthKitPermissions {
   permissions: {
-    read: string[];
-    write: string[];
+    read: SampleTypeIdentifierWriteable[];
+    write: SampleTypeIdentifierWriteable[];
   };
 }
 
@@ -45,20 +49,38 @@ interface SyncResult {
 const DEFAULT_HEALTHKIT_PERMISSIONS = {
   permissions: {
     read: [
+      'HKQuantityTypeIdentifierActiveEnergyBurned',
       'HKCategoryTypeIdentifierSleepAnalysis',
       'HKQuantityTypeIdentifierStepCount',
-      'HKQuantityTypeIdentifierActiveEnergyBurned',
       'HKQuantityTypeIdentifierDistanceWalkingRunning',
-      'HKQuantityTypeIdentifierHeartRate',
-      'HKQuantityTypeIdentifierRestingHeartRate',
-      'HKQuantityTypeIdentifierBodyMass'
+      'HKQuantityTypeIdentifierBodyMass',
     ],
-    write: []
-  }
+    write: [
+      'HKQuantityTypeIdentifierActiveEnergyBurned',
+      'HKCategoryTypeIdentifierSleepAnalysis',
+      'HKQuantityTypeIdentifierStepCount',
+      'HKQuantityTypeIdentifierDistanceWalkingRunning',
+      'HKQuantityTypeIdentifierBodyMass',
+    ],
+  },
 } as HealthKitPermissions;
+
+// Key for storing the sync preference
+const APPLE_HEALTH_SYNC_ENABLED_KEY = 'appleHealthSyncEnabled';
 
 // Apple Health sync state
 let isAppleHealthSyncEnabled = false;
+
+// Load the sync state from AsyncStorage when the module is initialized
+(async () => {
+  try {
+    const storedState = await AsyncStorage.getItem(APPLE_HEALTH_SYNC_ENABLED_KEY);
+    isAppleHealthSyncEnabled = storedState === 'true';
+    console.log(`✅ Loaded initial Apple Health sync state: ${isAppleHealthSyncEnabled}`);
+  } catch (error) {
+    console.error('❌ Failed to load Apple Health sync state:', error);
+  }
+})();
 
 export const initializeHealthKit = async (): Promise<boolean> => {
   try {
@@ -127,11 +149,20 @@ export const getAllHealthData = async (date: Date) => {
 
 export const hasHealthKitPermissions = async (): Promise<boolean> => {
   try {
-    // Check if we have permissions for sleep analysis
-    const hasPermission = await requestAuthorization([], ['HKCategoryTypeIdentifierSleepAnalysis' as CategoryTypeIdentifier]);
-    return hasPermission;
+    const { read, write } = DEFAULT_HEALTHKIT_PERMISSIONS.permissions;
+
+    // Request authorization for all default healthkit permissions
+    const status: boolean = await requestAuthorization(read, write);
+
+    if (status) {
+      console.log('✅ HealthKit permissions granted for all requested types.');
+      return true;
+    } else {
+      console.warn('⚠️ HealthKit permissions not granted.');
+      return false;
+    }
   } catch (error) {
-    console.error('❌ Error checking HealthKit permissions:', error);
+    console.error('❌ Error requesting HealthKit permissions:', error);
     return false;
   }
 };
@@ -140,9 +171,14 @@ export const hasHealthKitPermissions = async (): Promise<boolean> => {
 let lastSyncTime = 0;
 const SYNC_COOLDOWN_MS = 5000; // 5 second cooldown between syncs
 
-export const setAppleHealthSyncEnabled = (enabled: boolean): void => {
-  isAppleHealthSyncEnabled = enabled;
-  console.log(`🔄 Apple Health sync ${enabled ? 'ENABLED' : 'DISABLED'}`);
+export const setAppleHealthSyncEnabled = async (enabled: boolean): Promise<void> => {
+  try {
+    isAppleHealthSyncEnabled = enabled;
+    await AsyncStorage.setItem(APPLE_HEALTH_SYNC_ENABLED_KEY, JSON.stringify(enabled));
+    console.log(`🔄 Apple Health sync ${enabled ? 'ENABLED' : 'DISABLED'}`);
+  } catch (error) {
+    console.error('❌ Failed to save Apple Health sync state:', error);
+  }
 };
 
 export const isAppleHealthSyncEnabledState = (): boolean => {

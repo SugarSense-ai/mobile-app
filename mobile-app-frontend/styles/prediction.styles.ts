@@ -292,25 +292,7 @@ export const styles = StyleSheet.create({
       fontWeight: 'bold',
       color: '#333',
     },
-    comingUpItem: {
-      flexDirection: 'row',
-      marginBottom: 12,
-      alignItems: 'center',
-    },
-    comingUpTime: {
-      width: 80,
-      fontSize: 14,
-      color: '#666',
-    },
-    comingUpEvent: {
-      fontSize: 16,
-      fontWeight: 'bold',
-      color: '#333',
-    },
-    comingUpDetails: {
-      fontSize: 14,
-      color: '#666',
-    },
+
     quickActionsContainer: {
       flexDirection: 'row',
       justifyContent: 'space-around',
@@ -501,5 +483,59 @@ export const styles = StyleSheet.create({
       shadowOpacity: 0.3,
       shadowRadius: 4,
       elevation: 6,
+    },
+    // New insights styles
+    insightLoadingContainer: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingVertical: 24,
+    },
+    insightLoadingText: {
+      marginLeft: 12,
+      fontSize: 16,
+      color: '#6b7280',
+      fontWeight: '500',
+    },
+    insightErrorContainer: {
+      alignItems: 'center',
+      paddingVertical: 24,
+    },
+    insightErrorText: {
+      fontSize: 16,
+      color: '#ef4444',
+      marginBottom: 12,
+      textAlign: 'center',
+    },
+    retryButton: {
+      backgroundColor: '#4A90E2',
+      borderRadius: 12,
+      paddingVertical: 10,
+      paddingHorizontal: 16,
+    },
+    retryButtonText: {
+      color: '#ffffff',
+      fontSize: 14,
+      fontWeight: '600',
+    },
+    insightIconContainer: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      width: 32,
+      height: 32,
+      marginRight: 12,
+      marginTop: 2,
+    },
+    insightEmoji: {
+      fontSize: 20,
+      lineHeight: 24,
+    },
+
+    insightsTimestamp: {
+      fontSize: 12,
+      color: '#9ca3af',
+      textAlign: 'center',
+      marginTop: 12,
+      fontStyle: 'italic',
     },
   });

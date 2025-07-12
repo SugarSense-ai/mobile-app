@@ -1,5 +1,20 @@
 import { API_ENDPOINTS } from '@/constants/config';
 import { performFullHealthSync } from './healthKit';
+import { getBaseUrl } from './api';
+
+export interface ActivityLogEntry {
+  id: string;
+  date: string;
+  time: string;
+  type: 'manual' | 'apple_health';
+  activity_type: string;
+  description: string;
+  duration_minutes?: number;
+  steps?: number;
+  calories_burned?: number;
+  distance_km?: number;
+  source: string;
+}
 
 export interface DashboardData {
   date_range: {
@@ -18,6 +33,7 @@ export interface DashboardData {
     }>;
     summary: {
       avg_glucose_15_days: number;
+      avg_glucose_7_days: number;
       avg_time_in_range: number;
       total_readings: number;
     };
@@ -48,6 +64,19 @@ export interface DashboardData {
       total_distance_km: number;
     };
   };
+  walking_running: {
+    data: Array<{
+      date: string;
+      distance_km: number;
+      distance_miles: number;
+    }>;
+    summary: {
+      avg_daily_distance_km: number;
+      avg_daily_distance_miles: number;
+      total_distance_km: number;
+      total_distance_miles: number;
+    };
+  };
   health_metrics: {
     weight: Array<{ date: string; value: number; unit: string }>;
     heart_rate: Array<{ date: string; avg_value: number; unit: string }>;
@@ -65,6 +94,7 @@ export interface DashboardData {
       medication_count: number;
     }>;
   };
+  activity_logs?: ActivityLogEntry[];
 }
 
 /**
@@ -72,7 +102,9 @@ export interface DashboardData {
  */
 export const fetchDashboardData = async (days: number = 15, userId: number = 1): Promise<DashboardData> => {
   try {
-    const response = await fetch(`${API_ENDPOINTS.BASE_URL}/diabetes-dashboard?days=${days}&user_id=${userId}`);
+    // Use dynamic URL resolution instead of static BASE_URL
+    const baseUrl = await getBaseUrl();
+    const response = await fetch(`${baseUrl}/api/diabetes-dashboard?days=${days}&user_id=${userId}`);
     
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);

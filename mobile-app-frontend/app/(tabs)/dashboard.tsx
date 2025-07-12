@@ -12,97 +12,27 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 // import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
-import { API_ENDPOINTS } from '@/constants/config';
-import { 
-  syncLatestHealthDataForDashboard, 
-  hasHealthKitPermissions, 
-  isAppleHealthSyncEnabledState 
+import { API_ENDPOINTS, FALLBACK_URLS } from '@/constants/config';
+
+// Immediate debug logging to see what config is loaded
+console.log('🚨 DASHBOARD DEBUG - API_ENDPOINTS loaded:');
+console.log('  BASE_URL:', API_ENDPOINTS.BASE_URL);
+console.log('  FALLBACK_URLS:', API_ENDPOINTS.FALLBACK_URLS);
+console.log('  Full API_ENDPOINTS:', JSON.stringify(API_ENDPOINTS, null, 2));
+
+import {
+  fetchDashboardData as fetchDashboardDataFromService,
+  syncAndRefreshDashboard,
+  DashboardData,
+  ActivityLogEntry,
+} from '@/services/dashboardService';
+import {
+  syncLatestHealthDataForDashboard,
+  hasHealthKitPermissions,
+  isAppleHealthSyncEnabledState,
 } from '@/services/healthKit';
 
 const { width } = Dimensions.get('window');
-
-interface ActivityLogEntry {
-  id: string;
-  date: string;
-  time: string;
-  type: 'manual' | 'apple_health';
-  activity_type: string;
-  description: string;
-  duration_minutes?: number;
-  steps?: number;
-  calories_burned?: number;
-  distance_km?: number;
-  source: string;
-}
-
-interface DashboardData {
-  date_range: {
-    start_date: string;
-    end_date: string;
-    days: number;
-  };
-  glucose: {
-    data: Array<{
-      date: string;
-      avg_glucose: number;
-      min_glucose: number;
-      max_glucose: number;
-      reading_count: number;
-      time_in_range_percent: number;
-    }>;
-    summary: {
-      avg_glucose_15_days: number;
-      avg_glucose_7_days: number;
-      avg_time_in_range: number;
-      total_readings: number;
-    };
-  };
-  sleep: {
-    data: Array<{
-      date: string;
-      sleep_hours: number;
-      formatted_sleep: string;
-      bedtime: string;
-      wake_time: string;
-    }>;
-    summary: {
-      avg_sleep_hours: number;
-      sleep_quality_trend: string;
-    };
-  };
-  activity: {
-    data: Array<{
-      date: string;
-      steps: number;
-      calories_burned: number;
-      distance_km: number;
-    }>;
-    summary: {
-      avg_daily_steps: number;
-      avg_daily_calories: number;
-      total_distance_km: number;
-    };
-  };
-  walking_running: {
-    data: Array<{
-      date: string;
-      distance_km: number;
-      distance_miles: number;
-    }>;
-    summary: {
-      avg_daily_distance_km: number;
-      avg_daily_distance_miles: number;
-      total_distance_km: number;
-      total_distance_miles: number;
-    };
-  };
-  health_metrics: {
-    weight: Array<{ date: string; value: number; unit: string }>;
-    heart_rate: Array<{ date: string; avg_value: number; unit: string }>;
-    resting_heart_rate: Array<{ date: string; value: number; unit: string }>;
-  };
-  activity_logs?: ActivityLogEntry[];
-}
 
 const Dashboard = () => {
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
@@ -113,80 +43,36 @@ const Dashboard = () => {
   const [loadingActivityLogs, setLoadingActivityLogs] = useState(false);
   const [sleepDataQualityIssue, setSleepDataQualityIssue] = useState<any>(null);
   const [sleepWarningVisible, setSleepWarningVisible] = useState(true);
-
-  const testNetworkConnectivity = async (): Promise<string | null> => {
-    // Try each URL until one works
-    for (const url of API_ENDPOINTS.FALLBACK_URLS) {
-      try {
-        console.log(`🔍 Testing network connectivity to: ${url}`);
-        const response = await fetch(`${url}/api/health`, {
-          method: 'GET',
-          headers: { 'Accept': 'application/json' },
-        });
-        
-        if (response.ok) {
-          const data = await response.json();
-          console.log(`✅ Network connectivity test passed for: ${url}`, data);
-          return url; // Return the working URL
-        } else {
-          console.log(`❌ Network connectivity test failed for ${url}:`, response.status);
-        }
-      } catch (error) {
-        console.log(`❌ Network connectivity test error for ${url}:`, error);
-      }
-    }
-    
-    console.log('❌ All network connectivity tests failed');
-    return null;
-  };
+  const [errorInfo, setErrorInfo] = useState<{ message: string; urls: string[] } | null>(null);
 
   const fetchDashboardData = async () => {
     try {
-      console.log('🔄 Starting dashboard data fetch...');
-      
-      // First test connectivity and get working URL
-      const workingUrl = await testNetworkConnectivity();
-      if (!workingUrl) {
-        throw new Error('Network connectivity test failed - unable to reach backend server on any URL');
-      }
-      
-      const fetchUrl = `${workingUrl}/api/diabetes-dashboard?days=7`;
+      // setLoading(true) is called in onRefresh or useEffect
+      setErrorInfo(null);
+      console.log('🔄 Starting dashboard data fetch using dashboardService...');
 
-      console.log(`🔄 Fetching dashboard data from working URL: ${fetchUrl}`);
-      
-      const response = await fetch(fetchUrl, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
+      const data = await fetchDashboardDataFromService(7); // Fetch for 7 days
+
+      console.log('✅ Dashboard data received successfully via service:', {
+        glucose_entries: data.glucose?.data?.length || 0,
+        sleep_entries: data.sleep?.data?.length || 0,
+        activity_entries: data.activity?.data?.length || 0,
       });
-      
-      console.log('📡 Response status:', response.status);
-      console.log('📡 Response headers:', response.headers);
-      
-      if (response.ok) {
-        const data = await response.json();
-        console.log('✅ Dashboard data received successfully:', {
-          glucose_entries: data.glucose?.data?.length || 0,
-          sleep_entries: data.sleep?.data?.length || 0,
-          activity_entries: data.activity?.data?.length || 0
-        });
-        setDashboardData(data);
-      } else {
-        const errorText = await response.text();
-        console.error('❌ Failed to fetch dashboard data:', response.status, errorText);
-        throw new Error(`HTTP ${response.status}: ${errorText}`);
-      }
+      setDashboardData(data);
     } catch (error) {
-      console.error('❌ Error fetching dashboard data:', error);
-      
+      console.error('❌ Error fetching dashboard data from service:', error);
+
+      setErrorInfo({
+        message: (error as Error).message || 'An unknown error occurred.',
+        urls: FALLBACK_URLS,
+      });
+
       // Log network details for debugging
-      console.log('🔍 Attempted URLs:', API_ENDPOINTS.FALLBACK_URLS);
+      console.log('🔍 Attempted URLs from config:', FALLBACK_URLS);
       console.log('🔍 Error details:', {
         name: (error as Error).name,
         message: (error as Error).message,
-        stack: (error as Error).stack
+        stack: (error as Error).stack,
       });
     } finally {
       setLoading(false);
@@ -199,11 +85,7 @@ const Dashboard = () => {
       setLoadingActivityLogs(true);
       console.log('🔄 Fetching comprehensive activity logs...');
       
-      // First test connectivity and get working URL
-      const workingUrl = await testNetworkConnectivity();
-      if (!workingUrl) {
-        throw new Error('Network connectivity test failed - unable to reach backend server on any URL');
-      }
+      const workingUrl = API_ENDPOINTS.BASE_URL; // Assume config is now reliable
       
       console.log(`🔄 Fetching activity logs from: ${workingUrl}/api/activity-logs?days=30`);
       
@@ -260,12 +142,12 @@ const Dashboard = () => {
       setLoadingActivityLogs(false);
     }
   };
-
+  
   const checkSleepDataQuality = async () => {
     try {
       console.log('🔍 Checking sleep data quality for truncation issues...');
       
-      const workingUrl = await testNetworkConnectivity();
+      const workingUrl = API_ENDPOINTS.BASE_URL; // Assume config is now reliable
       if (!workingUrl) return;
       
       const response = await fetch(`${workingUrl}/api/enhanced-sleep-analysis?days=7`, {
@@ -299,6 +181,7 @@ const Dashboard = () => {
   };
 
   useEffect(() => {
+    setLoading(true);
     fetchDashboardData();
     fetchActivityLogs();
     checkSleepDataQuality();
@@ -340,7 +223,8 @@ const Dashboard = () => {
       // Step 2: Fetch latest dashboard data (now includes any synced data)
       await Promise.all([
         fetchDashboardData(),
-        fetchActivityLogs()
+        fetchActivityLogs(),
+        checkSleepDataQuality(),
       ]);
       
     } catch (error) {
@@ -348,10 +232,11 @@ const Dashboard = () => {
       // Continue with normal refresh even if Apple Health sync fails
       await Promise.all([
         fetchDashboardData(),
-        fetchActivityLogs()
+        fetchActivityLogs(),
+        checkSleepDataQuality(),
       ]);
     } finally {
-      setRefreshing(false);
+      // setRefreshing(false) is handled in fetchDashboardData
     }
   };
 
@@ -740,7 +625,7 @@ const Dashboard = () => {
     );
   }
 
-  if (!dashboardData) {
+  if (!dashboardData || errorInfo) {
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.errorContainer}>
@@ -758,11 +643,11 @@ const Dashboard = () => {
             Attempted URLs:
           </Text>
           <View style={styles.urlList}>
-            {API_ENDPOINTS.FALLBACK_URLS.map((url, index) => (
+            {(errorInfo?.urls || FALLBACK_URLS).map((url, index) => (
               <Text key={index} style={styles.urlItem}>• {url}</Text>
             ))}
           </View>
-          <TouchableOpacity onPress={fetchDashboardData} style={styles.retryButton}>
+          <TouchableOpacity onPress={onRefresh} style={styles.retryButton}>
             <Ionicons name="refresh" size={20} color="#FFFFFF" style={styles.retryIcon} />
             <Text style={styles.retryButtonText}>Retry Connection</Text>
           </TouchableOpacity>
