@@ -150,7 +150,7 @@ export default function ChatScreen() {
 
     const today = new Date().toISOString().split('T')[0];
     const todaysGlucose = dashboardData.glucose.data.find((d: { date: string }) => d.date === today);
-    const todaysActivity = dashboardData.activity.data.find((d: { date: string }) => d.date === today);
+    const todaysActivity = dashboardData.activity.data.find((d: any) => d.date === today);
 
     // Get the last 7 days of glucose readings for context
     const recentGlucoseReadings = dashboardData.glucose.data.slice(0, 7).map(d => ({
@@ -175,9 +175,10 @@ export default function ChatScreen() {
         quality: dashboardData.sleep.summary.avg_sleep_hours > 7 ? 'good' : dashboardData.sleep.summary.avg_sleep_hours > 5 ? 'average' : 'poor',
       },
       activitySummary: {
-        stepsToday: todaysActivity ? todaysActivity.steps : 0,
-        activeMinutes: 0, // Placeholder
-        sedentary: (todaysActivity ? todaysActivity.steps : 0) < 3000,
+        stepsToday: todaysActivity ? (todaysActivity as any).steps : 0,
+        activeMinutes: todaysActivity ? ((todaysActivity as any).active_minutes || 0) : 0,
+        activityLevel: todaysActivity ? ((todaysActivity as any).activity_level || 'Unknown') : 'Unknown',
+        sedentary: todaysActivity ? (((todaysActivity as any).activity_level === 'Sedentary')) : true,
       },
     };
     return snapshot;
@@ -218,9 +219,9 @@ export default function ChatScreen() {
 
     let result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
-      allowsEditing: true,
-      aspect: [4, 3],
-      quality: 1,
+      allowsEditing: false,
+      quality: 0.8,
+      base64: true,
     });
 
     handleImageSelection(result);
@@ -237,9 +238,10 @@ export default function ChatScreen() {
     }
 
     let result = await ImagePicker.launchCameraAsync({
-      allowsEditing: true,
+      allowsEditing: false,
       aspect: [4, 3],
-      quality: 1,
+      quality: 0.8,
+      base64: true,
     });
 
     handleImageSelection(result);
@@ -339,7 +341,7 @@ export default function ChatScreen() {
           <FontAwesome5 name="arrow-left" size={18} color={COLORS.white} />
         </TouchableOpacity>
         <View style={styles.userInfo}>
-          <Text style={styles.userName}>SugarSense.ai Bot</Text>
+          <Text style={styles.userName}>SugarSense.ai Assistant</Text>
           <View style={styles.userStatus}>
             <View style={styles.onlineIndicator} />
             <Text style={styles.userStatusText}>Online</Text>

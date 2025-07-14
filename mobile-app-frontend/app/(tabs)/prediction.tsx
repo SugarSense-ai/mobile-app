@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   ScrollView,
   View,
@@ -15,6 +15,7 @@ import {
   TouchableWithoutFeedback,
   Image,
   ActivityIndicator,
+  Animated,
 } from 'react-native';
 import { LineChart } from 'react-native-chart-kit';
 import { FontAwesome5, MaterialCommunityIcons } from '@expo/vector-icons';
@@ -125,7 +126,7 @@ const sendLogData = async (endpoint: string, data: any) => {
     if (!response.ok) {
       throw new Error(result.error || `Failed to log data to ${endpoint}`);
     }
-    Alert.alert("Success", result.message || "Data logged successfully!");
+    // Success handled by toast inside component
     return true;
   } catch (error: any) {
     console.error(`Error logging data to ${endpoint}:`, error);
@@ -248,6 +249,9 @@ export default function PredictionDashboard(){
   // New state for AI analysis error message
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
+  // New state for meal logging method selection
+  const [mealLoggingMethod, setMealLoggingMethod] = useState<'photo' | 'manual' | null>(null);
+
   // New state variables for prediction and glucose history
   const [currentGlucose, setCurrentGlucose] = useState<number | null>(null);
   const [predictedLevels, setPredictedLevels] = useState<number[]>([]);
@@ -307,6 +311,34 @@ export default function PredictionDashboard(){
   const [lastInsightsRefresh, setLastInsightsRefresh] = useState<Date | null>(null);
   const chartWidth = width - 40;
   const chartHeight = 200;
+
+  // --- Toast State ---
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const toastOpacity = useRef(new Animated.Value(0)).current;
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+  };
+
+  useEffect(() => {
+    if (toastMessage) {
+      Animated.timing(toastOpacity, {
+        toValue: 1,
+        duration: 300,
+        useNativeDriver: true,
+      }).start(() => {
+        setTimeout(() => {
+          Animated.timing(toastOpacity, {
+            toValue: 0,
+            duration: 300,
+            useNativeDriver: true,
+          }).start(() => {
+            setToastMessage(null);
+          });
+        }, 2500);
+      });
+    }
+  }, [toastMessage]);
 
   // Function to generate dynamic chart data based on glucose history and predictions
   const generateDynamicChartData = (granularityType: 'hourly' | '15min' | '5min') => {
@@ -809,6 +841,7 @@ export default function PredictionDashboard(){
     setMealAnalysis(null); // Reset analysis state
     setAnalysisError(null); // Reset error state
     setIsAnalyzing(false);
+    setMealLoggingMethod(null); // Reset method selection
     setLogDetails({}); // Reset details
     setIsModalVisible(true);
   };
@@ -868,6 +901,7 @@ export default function PredictionDashboard(){
     setMealAnalysis(null);
     setAnalysisError(null);
     setIsAnalyzing(false);
+    setMealLoggingMethod(null);
   };
 
   const handleSaveLog = async () => {
@@ -884,12 +918,14 @@ export default function PredictionDashboard(){
                     time: logDetails.time,
                 });
                 if (success) {
-                    console.log('✅ Glucose logged successfully, refreshing history...');
-                    // Refresh glucose history from backend to ensure consistency
-                    await fetchGlucoseHistory();
-                    // Refresh insights with new data
-                    await clearInsightsCacheAndRefresh();
+                    showToast(`✅ Glucose logged! You're staying on track 💪`);
+                    // Close modal immediately for a smoother UX
                     closeModal();
+
+                    console.log('✅ Glucose logged successfully, refreshing history...');
+                    // Fire-and-forget background refreshes
+                    fetchGlucoseHistory();
+                    clearInsightsCacheAndRefresh();
                 }
             } else {
                 Alert.alert("Invalid Input", "Please enter a valid glucose level.");
@@ -898,41 +934,41 @@ export default function PredictionDashboard(){
             Alert.alert("Missing Information", "Please enter both glucose level and time.");
         }
     } else if (loggingType === 'meal') {
-        const mealTypes = ['Breakfast', 'Brunch', 'Lunch', 'Evening Snack', 'Dinner', 'Other'];
+        // Only require meal type and food description - nutritional info is optional
+        const isValidMeal = logDetails.meal_type?.trim() && 
+                           logDetails.food_description?.trim();
 
-        if (logDetails.meal_type?.trim() && logDetails.food_description?.trim() && logDetails.carbs?.trim() && logDetails.calories?.trim()) {
-            const carbsValue = parseFloat(logDetails.carbs);
-            const caloriesValue = parseFloat(logDetails.calories);
+        if (isValidMeal) {
+            const carbsValue = parseFloat(logDetails.carbs || '0');
+            const caloriesValue = parseFloat(logDetails.calories || '0');
             const proteinValue = parseFloat(logDetails.protein || '0');
             const fatValue = parseFloat(logDetails.fat || '0');
             const sugarValue = parseFloat(logDetails.sugar || '0');
             const fiberValue = parseFloat(logDetails.fiber || '0');
 
-            if (!isNaN(carbsValue) && !isNaN(caloriesValue)) {
-                // Send meal data to backend
-                const success = await sendLogData('/api/log-meal', {
-                    meal_type: logDetails.meal_type,
-                    food_description: logDetails.food_description,
-                    calories: caloriesValue,
-                    carbs: carbsValue,
-                    protein_g: proteinValue,
-                    fat_g: fatValue,
-                    sugar_g: sugarValue,
-                    fiber_g: fiberValue,
-                });
-                if (success) {
-                    setRecentCarbs(carbsValue);
-                    // Trigger prediction after logging meal
-                    fetchGlucosePrediction(currentGlucose, carbsValue, recentActivityMinutes, recentSleepQuality);
-                    // Refresh insights with new meal data
-                    await clearInsightsCacheAndRefresh();
-                    closeModal();
-                }
-            } else {
-                Alert.alert("Invalid Input", "Please enter valid numbers for carbs and calories.");
+            // Send meal data to backend
+            const success = await sendLogData('/api/log-meal', {
+                meal_type: logDetails.meal_type,
+                food_description: logDetails.food_description,
+                calories: caloriesValue,
+                carbs: carbsValue,
+                protein_g: proteinValue,
+                fat_g: fatValue,
+                sugar_g: sugarValue,
+                fiber_g: fiberValue,
+            });
+            if (success) {
+                setRecentCarbs(carbsValue);
+                showToast(`🎉 Great job! Your health journey just got stronger.`);
+                // Close modal first
+                closeModal();
+
+                // Background updates
+                fetchGlucosePrediction(currentGlucose, carbsValue, recentActivityMinutes, recentSleepQuality);
+                clearInsightsCacheAndRefresh();
             }
         } else {
-            Alert.alert("Missing Information", "Please fill in all meal details.");
+            Alert.alert("Missing Information", "Please fill in meal type and food description.");
         }
     }
     else if (loggingType === 'activity') {
@@ -952,11 +988,13 @@ export default function PredictionDashboard(){
                   });
                   if (success) {
                       setRecentActivityMinutes(durationValue);
-                      // Trigger prediction after logging activity
-                      fetchGlucosePrediction(currentGlucose, recentCarbs, durationValue, recentSleepQuality);
-                      // Refresh insights with new activity data
-                      await clearInsightsCacheAndRefresh();
+                      showToast(`👏 Entry saved. You're taking control!`);
+                      // Close modal for immediate feedback
                       closeModal();
+
+                      // Background updates
+                      fetchGlucosePrediction(currentGlucose, recentCarbs, durationValue, recentSleepQuality);
+                      clearInsightsCacheAndRefresh();
                   }
               } else {
                   Alert.alert("Invalid Input", "Please enter valid numbers for duration, steps, and calories burned.");
@@ -981,6 +1019,7 @@ export default function PredictionDashboard(){
                      injection_site: medicationDetails.injection_site || null, // Optional, but required for insulin
                  });
                  if (success) {
+                     showToast(`💊 Medication logged! Consistency is key!`);
                      closeModal();
                  }
              } else {
@@ -1003,151 +1042,358 @@ export default function PredictionDashboard(){
       case 'meal':
         const mealTypes = ['Breakfast', 'Brunch', 'Lunch', 'Evening Snack', 'Dinner', 'Other'];
 
-        // New AI-Powered Meal Logging UI
         return (
           <View style={modalStyles.contentContainer}>
             <Text style={modalStyles.modalTitle}>Log Your Meal</Text>
 
-            {!mealImage ? (
-              <TouchableOpacity style={modalStyles.aiButton} onPress={handleImagePicker}>
-                <FontAwesome5 name="camera" size={20} color="#fff" style={{ marginRight: 12 }} />
-                <Text style={modalStyles.aiButtonText}>Analyze Meal from Photo</Text>
-              </TouchableOpacity>
-            ) : (
-              <View style={{ width: '100%', alignItems: 'center' }}>
-                <Image source={{ uri: mealImage }} style={modalStyles.mealImage} resizeMode="contain" />
+            {/* Method Selection - Show if no method is selected */}
+            {!mealLoggingMethod && (
+              <View style={modalStyles.methodSelectionContainer}>
+                <TouchableOpacity 
+                  style={modalStyles.methodButton} 
+                  onPress={() => setMealLoggingMethod('photo')}
+                >
+                  <FontAwesome5 name="camera" size={20} color="#fff" style={{ marginRight: 12 }} />
+                  <Text style={modalStyles.methodButtonText}>Analyze Meal from Photo</Text>
+                </TouchableOpacity>
                 
-                {isAnalyzing ? (
-                  <View style={modalStyles.loadingContainer}>
-                    <ActivityIndicator size="large" color="#4A90E2" />
-                    <Text style={modalStyles.loadingText}>Analyzing your meal...</Text>
-                  </View>
-                ) : mealAnalysis ? (
-                  <ScrollView style={{ width: '100%', maxHeight: 350 }}>
-                    <Text style={modalStyles.analysisTitle}>AI Analysis Results</Text>
-                    {/* Editable Meal Type */}
-                    <Text style={modalStyles.label}>Meal Type</Text>
-                    <TouchableOpacity
-                      style={modalStyles.modernDropdownButton}
-                      onPress={() => setIsMealTypeDropdownOpen(!isMealTypeDropdownOpen)}
-                    >
-                      <Text style={modalStyles.modernDropdownButtonText}>
-                        {logDetails.meal_type || "Select Meal Type"}
-                      </Text>
-                      <MaterialCommunityIcons
-                        name={isMealTypeDropdownOpen ? "chevron-up" : "chevron-down"}
-                        size={20}
-                        color="#666"
-                      />
-                    </TouchableOpacity>
+                <TouchableOpacity 
+                  style={modalStyles.methodButtonSecondary} 
+                  onPress={() => {
+                    setMealLoggingMethod('manual');
+                    // Initialize manual entry with default values
+                    setLogDetails({
+                      meal_type: '',
+                      food_description: '',
+                      carbs: '',
+                      sugar: '',
+                      fiber: '',
+                      protein: '',
+                      fat: '',
+                      calories: '',
+                    });
+                  }}
+                >
+                  <FontAwesome5 name="edit" size={20} color="#4A90E2" style={{ marginRight: 12 }} />
+                  <Text style={modalStyles.methodButtonSecondaryText}>Enter Meal Manually</Text>
+                </TouchableOpacity>
+              </View>
+            )}
 
-                    {isMealTypeDropdownOpen && (
-                      <View style={modalStyles.modernDropdownOptionsContainer}>
-                        <ScrollView
-                          style={{ maxHeight: 220 }}
-                          showsVerticalScrollIndicator={true}
-                          nestedScrollEnabled={true}
+            {/* Photo Analysis Method */}
+            {mealLoggingMethod === 'photo' && (
+              <View style={{ width: '100%', alignItems: 'center' }}>
+                {/* Switch Method Button */}
+                <TouchableOpacity 
+                  style={modalStyles.switchMethodButton} 
+                  onPress={() => {
+                    setMealLoggingMethod('manual');
+                    setMealImage(null);
+                    setMealAnalysis(null);
+                    setAnalysisError(null);
+                    setIsAnalyzing(false);
+                    setLogDetails({
+                      meal_type: '',
+                      food_description: '',
+                      carbs: '',
+                      sugar: '',
+                      fiber: '',
+                      protein: '',
+                      fat: '',
+                      calories: '',
+                    });
+                  }}
+                >
+                  <Text style={modalStyles.switchMethodButtonText}>Switch to Manual Entry</Text>
+                </TouchableOpacity>
+
+                {!mealImage ? (
+                  <TouchableOpacity style={modalStyles.aiButton} onPress={handleImagePicker}>
+                    <FontAwesome5 name="camera" size={20} color="#fff" style={{ marginRight: 12 }} />
+                    <Text style={modalStyles.aiButtonText}>Take or Choose Photo</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <View style={{ width: '100%', alignItems: 'center' }}>
+                    <Image source={{ uri: mealImage }} style={modalStyles.mealImage} resizeMode="contain" />
+                    
+                    {isAnalyzing ? (
+                      <View style={modalStyles.loadingContainer}>
+                        <ActivityIndicator size="large" color="#4A90E2" />
+                        <Text style={modalStyles.loadingText}>Analyzing your meal...</Text>
+                      </View>
+                    ) : mealAnalysis ? (
+                      <ScrollView style={{ width: '100%', maxHeight: 350 }}>
+                        <Text style={modalStyles.analysisTitle}>AI Analysis Results</Text>
+                        {/* Editable Meal Type */}
+                        <Text style={modalStyles.label}>Meal Type</Text>
+                        <TouchableOpacity
+                          style={modalStyles.modernDropdownButton}
+                          onPress={() => setIsMealTypeDropdownOpen(!isMealTypeDropdownOpen)}
                         >
-                          {mealTypes.map((type) => (
-                            <TouchableOpacity
-                              key={type}
-                              style={modalStyles.modernDropdownOption}
-                              onPress={() => {
-                                setLogDetails({ ...logDetails, meal_type: type });
-                                setIsMealTypeDropdownOpen(false);
-                              }}
+                          <Text style={modalStyles.modernDropdownButtonText}>
+                            {logDetails.meal_type || "Select Meal Type"}
+                          </Text>
+                          <MaterialCommunityIcons
+                            name={isMealTypeDropdownOpen ? "chevron-up" : "chevron-down"}
+                            size={20}
+                            color="#666"
+                          />
+                        </TouchableOpacity>
+
+                        {isMealTypeDropdownOpen && (
+                          <View style={modalStyles.modernDropdownOptionsContainer}>
+                            <ScrollView
+                              style={{ maxHeight: 220 }}
+                              showsVerticalScrollIndicator={true}
+                              nestedScrollEnabled={true}
                             >
-                              <Text style={modalStyles.modernDropdownOptionText}>{type}</Text>
-                            </TouchableOpacity>
-                          ))}
-                        </ScrollView>
+                              {mealTypes.map((type) => (
+                                <TouchableOpacity
+                                  key={type}
+                                  style={modalStyles.modernDropdownOption}
+                                  onPress={() => {
+                                    setLogDetails({ ...logDetails, meal_type: type });
+                                    setIsMealTypeDropdownOpen(false);
+                                  }}
+                                >
+                                  <Text style={modalStyles.modernDropdownOptionText}>{type}</Text>
+                                </TouchableOpacity>
+                              ))}
+                            </ScrollView>
+                          </View>
+                        )}
+
+                        {/* Editable Food Description */}
+                        <Text style={modalStyles.label}>Food Description</Text>
+                        <TextInput
+                          style={[modalStyles.modernInput, { height: 80 }]}
+                          value={logDetails.food_description}
+                          onChangeText={(text) => setLogDetails({ ...logDetails, food_description: text })}
+                          multiline
+                        />
+                        
+                        {/* Editable Nutritional Info in a 3x2 grid */}
+                        <View style={modalStyles.nutritionGrid}>
+                          <View style={modalStyles.nutritionInputContainer}>
+                            <Text style={modalStyles.label}>Carbs (g)</Text>
+                            <TextInput
+                              style={modalStyles.modernInput}
+                              value={logDetails.carbs}
+                              onChangeText={(text) => setLogDetails({ ...logDetails, carbs: text })}
+                              keyboardType="numeric"
+                            />
+                          </View>
+                          <View style={modalStyles.nutritionInputContainer}>
+                            <Text style={modalStyles.label}>Sugar (g)</Text>
+                            <TextInput
+                              style={modalStyles.modernInput}
+                              value={logDetails.sugar}
+                              onChangeText={(text) => setLogDetails({ ...logDetails, sugar: text })}
+                              keyboardType="numeric"
+                            />
+                          </View>
+                          <View style={modalStyles.nutritionInputContainer}>
+                            <Text style={modalStyles.label}>Fiber (g)</Text>
+                            <TextInput
+                              style={modalStyles.modernInput}
+                              value={logDetails.fiber}
+                              onChangeText={(text) => setLogDetails({ ...logDetails, fiber: text })}
+                              keyboardType="numeric"
+                            />
+                          </View>
+                          <View style={modalStyles.nutritionInputContainer}>
+                            <Text style={modalStyles.label}>Protein (g)</Text>
+                            <TextInput
+                              style={modalStyles.modernInput}
+                              value={logDetails.protein}
+                              onChangeText={(text) => setLogDetails({ ...logDetails, protein: text })}
+                              keyboardType="numeric"
+                            />
+                          </View>
+                          <View style={modalStyles.nutritionInputContainer}>
+                            <Text style={modalStyles.label}>Fat (g)</Text>
+                            <TextInput
+                              style={modalStyles.modernInput}
+                              value={logDetails.fat}
+                              onChangeText={(text) => setLogDetails({ ...logDetails, fat: text })}
+                              keyboardType="numeric"
+                            />
+                          </View>
+                          <View style={modalStyles.nutritionInputContainer}>
+                            <Text style={modalStyles.label}>Calories</Text>
+                            <TextInput
+                              style={modalStyles.modernInput}
+                              value={logDetails.calories}
+                              onChangeText={(text) => setLogDetails({ ...logDetails, calories: text })}
+                              keyboardType="numeric"
+                            />
+                          </View>
+                        </View>
+                        
+                        {/* Display other nutritional info if available */}
+                        <Text style={modalStyles.label}>Ingredients</Text>
+                        <Text style={modalStyles.ingredientsText}>
+                          {logDetails.ingredients?.join(', ') || 'Not available'}
+                        </Text>
+
+                      </ScrollView>
+                    ) : (
+                      <View style={modalStyles.loadingContainer}>
+                         <Text style={modalStyles.errorText}>
+                           {analysisError || "Analysis failed. Please try another image."}
+                         </Text>
+                         <TouchableOpacity style={modalStyles.aiButton} onPress={handleImagePicker}>
+                           <Text style={modalStyles.aiButtonText}>Try Again</Text>
+                         </TouchableOpacity>
                       </View>
                     )}
-
-                    {/* Editable Food Description */}
-                    <Text style={modalStyles.label}>Food Description</Text>
-                    <TextInput
-                      style={[modalStyles.modernInput, { height: 80 }]}
-                      value={logDetails.food_description}
-                      onChangeText={(text) => setLogDetails({ ...logDetails, food_description: text })}
-                      multiline
-                    />
-                    
-                    {/* Editable Nutritional Info in a 3x2 grid */}
-                    <View style={modalStyles.nutritionGrid}>
-                      <View style={modalStyles.nutritionInputContainer}>
-                        <Text style={modalStyles.label}>Carbs (g)</Text>
-                        <TextInput
-                          style={modalStyles.modernInput}
-                          value={logDetails.carbs}
-                          onChangeText={(text) => setLogDetails({ ...logDetails, carbs: text })}
-                          keyboardType="numeric"
-                        />
-                      </View>
-                      <View style={modalStyles.nutritionInputContainer}>
-                        <Text style={modalStyles.label}>Sugar (g)</Text>
-                        <TextInput
-                          style={modalStyles.modernInput}
-                          value={logDetails.sugar}
-                          onChangeText={(text) => setLogDetails({ ...logDetails, sugar: text })}
-                          keyboardType="numeric"
-                        />
-                      </View>
-                      <View style={modalStyles.nutritionInputContainer}>
-                        <Text style={modalStyles.label}>Fiber (g)</Text>
-                        <TextInput
-                          style={modalStyles.modernInput}
-                          value={logDetails.fiber}
-                          onChangeText={(text) => setLogDetails({ ...logDetails, fiber: text })}
-                          keyboardType="numeric"
-                        />
-                      </View>
-                      <View style={modalStyles.nutritionInputContainer}>
-                        <Text style={modalStyles.label}>Protein (g)</Text>
-                        <TextInput
-                          style={modalStyles.modernInput}
-                          value={logDetails.protein}
-                          onChangeText={(text) => setLogDetails({ ...logDetails, protein: text })}
-                          keyboardType="numeric"
-                        />
-                      </View>
-                      <View style={modalStyles.nutritionInputContainer}>
-                        <Text style={modalStyles.label}>Fat (g)</Text>
-                        <TextInput
-                          style={modalStyles.modernInput}
-                          value={logDetails.fat}
-                          onChangeText={(text) => setLogDetails({ ...logDetails, fat: text })}
-                          keyboardType="numeric"
-                        />
-                      </View>
-                      <View style={modalStyles.nutritionInputContainer}>
-                        <Text style={modalStyles.label}>Calories</Text>
-                        <TextInput
-                          style={modalStyles.modernInput}
-                          value={logDetails.calories}
-                          onChangeText={(text) => setLogDetails({ ...logDetails, calories: text })}
-                          keyboardType="numeric"
-                        />
-                      </View>
-                    </View>
-                    
-                    {/* Display other nutritional info if available */}
-                    <Text style={modalStyles.label}>Ingredients</Text>
-                    <Text style={modalStyles.ingredientsText}>
-                      {logDetails.ingredients?.join(', ') || 'Not available'}
-                    </Text>
-
-                  </ScrollView>
-                ) : (
-                  <View style={modalStyles.loadingContainer}>
-                     <Text style={modalStyles.errorText}>
-                       {analysisError || "Analysis failed. Please try another image."}
-                     </Text>
-                     <TouchableOpacity style={modalStyles.aiButton} onPress={handleImagePicker}>
-                       <Text style={modalStyles.aiButtonText}>Try Again</Text>
-                     </TouchableOpacity>
                   </View>
                 )}
+              </View>
+            )}
+
+            {/* Manual Entry Method */}
+            {mealLoggingMethod === 'manual' && (
+              <View style={{ width: '100%' }}>
+                {/* Switch Method Button */}
+                <TouchableOpacity 
+                  style={modalStyles.switchMethodButton} 
+                  onPress={() => {
+                    setMealLoggingMethod('photo');
+                    setLogDetails({});
+                  }}
+                >
+                  <Text style={modalStyles.switchMethodButtonText}>Switch to Photo Analysis</Text>
+                </TouchableOpacity>
+
+                <ScrollView style={{ width: '100%', maxHeight: 400 }} showsVerticalScrollIndicator={true}>
+                  {/* Meal Type Dropdown */}
+                  <Text style={modalStyles.label}>Meal Type *</Text>
+                  <TouchableOpacity
+                    style={modalStyles.modernDropdownButton}
+                    onPress={() => setIsMealTypeDropdownOpen(!isMealTypeDropdownOpen)}
+                  >
+                    <Text style={modalStyles.modernDropdownButtonText}>
+                      {logDetails.meal_type || "Select Meal Type"}
+                    </Text>
+                    <MaterialCommunityIcons
+                      name={isMealTypeDropdownOpen ? "chevron-up" : "chevron-down"}
+                      size={20}
+                      color="#666"
+                    />
+                  </TouchableOpacity>
+
+                  {isMealTypeDropdownOpen && (
+                    <View style={modalStyles.modernDropdownOptionsContainer}>
+                      <ScrollView
+                        style={{ maxHeight: 220 }}
+                        showsVerticalScrollIndicator={true}
+                        nestedScrollEnabled={true}
+                      >
+                        {mealTypes.map((type) => (
+                          <TouchableOpacity
+                            key={type}
+                            style={modalStyles.modernDropdownOption}
+                            onPress={() => {
+                              setLogDetails({ ...logDetails, meal_type: type });
+                              setIsMealTypeDropdownOpen(false);
+                            }}
+                          >
+                            <Text style={modalStyles.modernDropdownOptionText}>{type}</Text>
+                          </TouchableOpacity>
+                        ))}
+                      </ScrollView>
+                    </View>
+                  )}
+
+                  {/* Food Description */}
+                  <Text style={modalStyles.label}>Food Description *</Text>
+                  <TextInput
+                    style={[modalStyles.modernInput, { height: 80 }]}
+                    placeholder="Describe your meal..."
+                    placeholderTextColor="#888"
+                    value={logDetails.food_description}
+                    onChangeText={(text) => setLogDetails({ ...logDetails, food_description: text })}
+                    multiline
+                  />
+                  
+                  {/* Nutritional Information - All Optional */}
+                  <Text style={modalStyles.sectionTitle}>Nutritional Information (Optional)</Text>
+                  <Text style={modalStyles.sectionSubtitle}>Enter nutritional values if known - all fields are optional</Text>
+                  <View style={modalStyles.nutritionGrid}>
+                    <View style={modalStyles.nutritionInputContainer}>
+                      <Text style={modalStyles.label}>Carbs (g)</Text>
+                      <TextInput
+                        style={modalStyles.modernInput}
+                        placeholder="0"
+                        placeholderTextColor="#888"
+                        value={logDetails.carbs}
+                        onChangeText={(text) => setLogDetails({ ...logDetails, carbs: text.replace(/[^0-9.]/g, '') })}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                    <View style={modalStyles.nutritionInputContainer}>
+                      <Text style={modalStyles.label}>Calories</Text>
+                      <TextInput
+                        style={modalStyles.modernInput}
+                        placeholder="0"
+                        placeholderTextColor="#888"
+                        value={logDetails.calories}
+                        onChangeText={(text) => setLogDetails({ ...logDetails, calories: text.replace(/[^0-9.]/g, '') })}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                  </View>
+
+                  {/* Additional Nutritional Fields */}
+                  <Text style={modalStyles.sectionTitle}>Additional Information (Optional)</Text>
+                  <View style={modalStyles.nutritionGrid}>
+                    <View style={modalStyles.nutritionInputContainer}>
+                      <Text style={modalStyles.label}>Sugar (g)</Text>
+                      <TextInput
+                        style={modalStyles.modernInput}
+                        placeholder="0"
+                        placeholderTextColor="#888"
+                        value={logDetails.sugar}
+                        onChangeText={(text) => setLogDetails({ ...logDetails, sugar: text.replace(/[^0-9.]/g, '') })}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                    <View style={modalStyles.nutritionInputContainer}>
+                      <Text style={modalStyles.label}>Fiber (g)</Text>
+                      <TextInput
+                        style={modalStyles.modernInput}
+                        placeholder="0"
+                        placeholderTextColor="#888"
+                        value={logDetails.fiber}
+                        onChangeText={(text) => setLogDetails({ ...logDetails, fiber: text.replace(/[^0-9.]/g, '') })}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                    <View style={modalStyles.nutritionInputContainer}>
+                      <Text style={modalStyles.label}>Protein (g)</Text>
+                      <TextInput
+                        style={modalStyles.modernInput}
+                        placeholder="0"
+                        placeholderTextColor="#888"
+                        value={logDetails.protein}
+                        onChangeText={(text) => setLogDetails({ ...logDetails, protein: text.replace(/[^0-9.]/g, '') })}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                    <View style={modalStyles.nutritionInputContainer}>
+                      <Text style={modalStyles.label}>Fat (g)</Text>
+                      <TextInput
+                        style={modalStyles.modernInput}
+                        placeholder="0"
+                        placeholderTextColor="#888"
+                        value={logDetails.fat}
+                        onChangeText={(text) => setLogDetails({ ...logDetails, fat: text.replace(/[^0-9.]/g, '') })}
+                        keyboardType="numeric"
+                      />
+                    </View>
+                  </View>
+                </ScrollView>
               </View>
             )}
           </View>
@@ -1550,397 +1796,404 @@ export default function PredictionDashboard(){
   };
 
   return (
-    <ScrollView style={styles.container}>
-      <View style={styles.topInfoContainer}>
-        <View style={styles.currentGlucoseSection}>
-          <Text style={styles.currentGlucoseLabel}>Current Glucose</Text>
-          <Text style={styles.currentGlucoseValue}>{currentGlucose !== null ? currentGlucose : '--'} <Text style={styles.unit}>mg/dL</Text></Text>
-          <Text style={styles.lastUpdated}>Last updated: Just now</Text>
+    <>
+      {toastMessage && (
+        <Animated.View style={[toastStyles.container, { opacity: toastOpacity }]}> 
+          <Text style={toastStyles.text}>{toastMessage}</Text>
+        </Animated.View>
+      )}
+      <ScrollView style={styles.container}>
+        <View style={styles.topInfoContainer}>
+          <View style={styles.currentGlucoseSection}>
+            <Text style={styles.currentGlucoseLabel}>Current Glucose</Text>
+            <Text style={styles.currentGlucoseValue}>{currentGlucose !== null ? currentGlucose : '--'} <Text style={styles.unit}>mg/dL</Text></Text>
+            <Text style={styles.lastUpdated}>Last updated: Just now</Text>
+          </View>
+          <View style={styles.predictedGlucoseSection}>
+            <Text style={styles.predictedGlucoseLabel}>Predicted ({predictedLevels.length > 0 ? predictedLevels.length : '0'}h)</Text>
+            <Text style={styles.predictedGlucoseValue}>{predictedLevels.length > 0 ? predictedLevels[0] : '--'} <Text style={styles.unit}>mg/dL</Text></Text>
+            <Text style={styles.lastMeal}>Last meal: sandwich</Text>
+          </View>
         </View>
-        <View style={styles.predictedGlucoseSection}>
-          <Text style={styles.predictedGlucoseLabel}>Predicted ({predictedLevels.length > 0 ? predictedLevels.length : '0'}h)</Text>
-          <Text style={styles.predictedGlucoseValue}>{predictedLevels.length > 0 ? predictedLevels[0] : '--'} <Text style={styles.unit}>mg/dL</Text></Text>
-          <Text style={styles.lastMeal}>Last meal: sandwich</Text>
-        </View>
-      </View>
 
-      <View style={styles.chartCard}>
-        {/* Modern granularity controls */}
-        <View style={styles.granularityContainer}>
-          <TouchableOpacity
-            style={[
-              styles.granularityButton,
-              granularity === 'hourly' && styles.granularityButtonActive
-            ]}
-            onPress={() => setGranularity('hourly')}
-          >
-            <Text style={[
-              styles.granularityButtonText,
-              granularity === 'hourly' && styles.granularityButtonTextActive
-            ]}>Hourly</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[
-              styles.granularityButton,
-              granularity === '15min' && styles.granularityButtonActive
-            ]}
-            onPress={() => setGranularity('15min')}
-          >
-            <Text style={[
-              styles.granularityButtonText,
-              granularity === '15min' && styles.granularityButtonTextActive
-            ]}>15 min</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[
-              styles.granularityButton,
-              granularity === '5min' && styles.granularityButtonActive
-            ]}
-            onPress={() => setGranularity('5min')}
-          >
-            <Text style={[
-              styles.granularityButtonText,
-              granularity === '5min' && styles.granularityButtonTextActive
-            ]}>5 min</Text>
-          </TouchableOpacity>
-        </View>
-        
-        <TouchableWithoutFeedback onPress={() => {
-          setTooltip(null);
-          setSelectedPoint(null);
-        }}>
-          <View style={styles.chartContainer}>
-            {isLoadingHistory ? (
-              <View style={[styles.chartContainer, { justifyContent: 'center', alignItems: 'center', height: chartHeight }]}>
-                <Text style={{ color: '#6b7280', fontSize: 16 }}>Loading glucose history...</Text>
-              </View>
-            ) : (
-          <LineChart
-            data={cleanedChartData}
-            width={chartWidth}
-            height={chartHeight}
-            chartConfig={chartConfig}
-            bezier
-                style={styles.modernChart}
-            onDataPointClick={({ value, dataset, getColor, x, y, index }) => {
-              const datasetIndex = cleanedChartData.datasets.findIndex(ds => ds === dataset);
-                
-                // Set selected point for highlighting
-                setSelectedPoint({ datasetIndex, pointIndex: index });
-                
-              setTooltip({
-                x,
-                y,
-                value,
-                label: cleanedChartData.legend[datasetIndex],
-                datasetIndex,
-                pointIndex: index,
-              });
-                
-                // Auto-hide tooltip and selection after 4 seconds
-                setTimeout(() => {
-                  setTooltip(null);
-                  setSelectedPoint(null);
-                }, 4000);
-              }}
-              withHorizontalLabels={true}
-              withVerticalLabels={true}
-              withInnerLines={false}
-              withOuterLines={false}
-              withHorizontalLines={true}
-              withVerticalLines={false}
-              decorator={(props: any) => {
-                // Custom decorator for highlighting selected points
-                if (!selectedPoint) return null;
-                
-                const { data, paddingTop, paddingLeft, width: chartInnerWidth, height: chartInnerHeight } = props;
-                const { datasetIndex, pointIndex } = selectedPoint;
-                
-                if (!data || !data.datasets || !data.datasets[datasetIndex]) return null;
-                
-                const dataset = data.datasets[datasetIndex];
-                const dataValue = dataset.data[pointIndex];
-                
-                if (typeof dataValue !== 'number' || isNaN(dataValue)) return null;
-                
-                // Calculate position
-                const maxValue = Math.max(...data.datasets.flatMap((d: any) => d.data.filter((v: any) => typeof v === 'number' && !isNaN(v))));
-                const minValue = Math.min(...data.datasets.flatMap((d: any) => d.data.filter((v: any) => typeof v === 'number' && !isNaN(v))));
-                
-                const xStep = chartInnerWidth / (data.labels.length - 1);
-                const yRatio = (dataValue - minValue) / (maxValue - minValue);
-                
-                const x = paddingLeft + (pointIndex * xStep);
-                const y = paddingTop + chartInnerHeight - (yRatio * chartInnerHeight);
-                
-                return (
-                  <View key={`highlight-${datasetIndex}-${pointIndex}`}>
-                    {/* Pulsing halo effect */}
-                    <View
-                      style={[
-                        styles.selectedPointHalo,
-                        {
-                          position: 'absolute',
-                          left: x - 12,
-                          top: y - 12,
-                          backgroundColor: datasetIndex === 0 ? 'rgba(59, 130, 246, 0.2)' : 'rgba(251, 113, 133, 0.2)',
-                        }
-                      ]}
-                    />
-                    {/* Enhanced dot */}
-            <View
-                      style={[
-                        styles.selectedPointDot,
-                        {
-                position: 'absolute',
-                          left: x - 8,
-                          top: y - 8,
-                          backgroundColor: datasetIndex === 0 ? '#3b82f6' : '#fb7185',
-                          borderColor: '#ffffff',
-                        }
-                      ]}
-                    />
-                  </View>
-                );
-              }}
-            />
-            )}
-            
-            {/* Enhanced tooltip */}
-            {tooltip && (
-              <View
-                pointerEvents="none"
-                style={[
-                  styles.tooltipContainer,
-                  {
-                    left: Math.max(10, Math.min(chartWidth - 140, tooltip.x - 70)),
-                    top: Math.max(10, tooltip.y - 70),
-                  }
-                ]}
-              >
-                <View style={[
-                  styles.modernTooltip,
-                  { borderLeftColor: tooltip.datasetIndex === 0 ? '#3b82f6' : '#fb7185' }
-                ]}>
-                  <Text style={styles.tooltipValue}>{tooltip.value} mg/dL</Text>
-                  <Text style={styles.tooltipLabel}>{tooltip.label}</Text>
-                  <Text style={styles.tooltipTime}>
-                    {cleanedChartData.labels[tooltip.pointIndex]}
-                  </Text>
-              </View>
-                {/* Tooltip arrow */}
-                <View style={[
-                  styles.tooltipArrow,
-                  { borderTopColor: tooltip.datasetIndex === 0 ? 'rgba(59, 130, 246, 0.05)' : 'rgba(251, 113, 133, 0.05)' }
-                ]} />
-            </View>
-          )}
-        </View>
-        </TouchableWithoutFeedback>
-        
-        {/* Modern legend with icons */}
-        <View style={styles.modernLegendContainer}>
-          {cleanedChartData.legend.map((legend: any, index: any) => (
-            <View key={index} style={styles.modernLegendItem}>
-              <View style={styles.legendIndicator}>
-                <View style={[
-                  styles.legendLine,
-                  { 
-                    backgroundColor: cleanedChartData.datasets[index].color(),
-                    ...(index === 1 && { borderStyle: 'dashed', borderWidth: 1, borderColor: cleanedChartData.datasets[index].color(), backgroundColor: 'transparent' })
-                  }
-                ]} />
-                <View style={[
-                  styles.legendDot,
-                  { backgroundColor: cleanedChartData.datasets[index].color() }
-                ]} />
-              </View>
-              <Text style={styles.modernLegendText}>{legend}</Text>
-            </View>
-          ))}
-        </View>
-      </View>
-      <View style={styles.logActionsContainer}>
-        <TouchableOpacity style={[styles.modernLogButton, styles.logMealButton]} onPress={handleLogMeal}>
-          <View style={styles.buttonIconContainer}>
-            <FontAwesome5 name="utensils" size={20} color="#fff" />
-          </View>
-          <Text style={styles.modernLogButtonText}>Log Meal</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={[styles.modernLogButton, styles.logActivityButton]} onPress={handleLogActivity}>
-          <View style={styles.buttonIconContainer}>
-            <FontAwesome5 name="running" size={20} color="#fff" />
-          </View>
-          <Text style={styles.modernLogButtonText}>Log Activity</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={[styles.modernLogButton, styles.logGlucoseButton]} onPress={handleLogGlucose}>
-          <View style={styles.buttonIconContainer}>
-            <FontAwesome5 name="tint" size={20} color="#fff" />
-          </View>
-          <Text style={styles.modernLogButtonText}>Log Glucose</Text>
-        </TouchableOpacity>
-        <TouchableOpacity style={[styles.modernLogButton, styles.logMedicationButton]} onPress={handleLogMedication}>
-          <View style={styles.buttonIconContainer}>
-            <FontAwesome5 name="pills" size={20} color="#fff" />
-          </View>
-          <Text style={styles.modernLogButtonText}>Log Medication</Text>
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Today's Stats</Text>
-        <View style={styles.statsRow}>
-          <View style={styles.statsItem}>
-            <Text style={styles.statsLabel}>Average Glucose</Text>
-            <Text style={styles.statsValue}>
-              {todaysStats.averageGlucose !== null ? todaysStats.averageGlucose : '--'} <Text style={styles.unit}>mg/dL</Text>
-            </Text>
-          </View>
-          <View style={styles.statsItem}>
-            <Text style={styles.statsLabel}>Time In Range</Text>
-            <Text style={styles.statsValue}>
-              {todaysStats.timeInRange !== null ? `${todaysStats.timeInRange}%` : '--'}
-            </Text>
-          </View>
-        </View>
-        <View style={styles.statsRow}>
-          <View style={styles.statsItem}>
-            <Text style={styles.statsLabel}>Highest Reading</Text>
-            <Text style={styles.statsValue}>
-              {todaysStats.highestReading !== null ? todaysStats.highestReading : '--'} <Text style={styles.unit}>mg/dL</Text>
-            </Text>
-          </View>
-          <View style={styles.statsItem}>
-            <Text style={styles.statsLabel}>Lowest Reading</Text>
-            <Text style={styles.statsValue}>
-              {todaysStats.lowestReading !== null ? todaysStats.lowestReading : '--'} <Text style={styles.unit}>mg/dL</Text>
-            </Text>
-          </View>
-        </View>
-      </View>
-
-      <View style={styles.card}>
-        <View style={styles.cardHeader}>
-          <Text style={styles.cardTitle}>Today's Insights</Text>
-          <TouchableOpacity onPress={handleRefreshInsights} disabled={insightsLoading}>
-            <Text style={[styles.viewAllLink, insightsLoading && { color: '#ccc' }]}>
-              {insightsLoading ? 'Refreshing...' : 'Refresh'}
-            </Text>
-          </TouchableOpacity>
-        </View>
-        
-        {insightsLoading && insights.length === 0 ? (
-          <View style={styles.insightLoadingContainer}>
-            <ActivityIndicator size="small" color="#4A90E2" />
-            <Text style={styles.insightLoadingText}>Generating personalized insights...</Text>
-          </View>
-        ) : insightsError && insights.length === 0 ? (
-          <View style={styles.insightErrorContainer}>
-            <Text style={styles.insightErrorText}>Unable to generate insights</Text>
-            <TouchableOpacity onPress={handleRefreshInsights} style={styles.retryButton}>
-              <Text style={styles.retryButtonText}>Try Again</Text>
+        <View style={styles.chartCard}>
+          {/* Modern granularity controls */}
+          <View style={styles.granularityContainer}>
+            <TouchableOpacity
+              style={[
+                styles.granularityButton,
+                granularity === 'hourly' && styles.granularityButtonActive
+              ]}
+              onPress={() => setGranularity('hourly')}
+            >
+              <Text style={[
+                styles.granularityButtonText,
+                granularity === 'hourly' && styles.granularityButtonTextActive
+              ]}>Hourly</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.granularityButton,
+                granularity === '15min' && styles.granularityButtonActive
+              ]}
+              onPress={() => setGranularity('15min')}
+            >
+              <Text style={[
+                styles.granularityButtonText,
+                granularity === '15min' && styles.granularityButtonTextActive
+              ]}>15 min</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.granularityButton,
+                granularity === '5min' && styles.granularityButtonActive
+              ]}
+              onPress={() => setGranularity('5min')}
+            >
+              <Text style={[
+                styles.granularityButtonText,
+                granularity === '5min' && styles.granularityButtonTextActive
+              ]}>5 min</Text>
             </TouchableOpacity>
           </View>
-        ) : (
-          <>
-            {insights.map((insight, index) => {
-              // Map insight types to colors
-              const getInsightColor = (type: string) => {
-                switch (type) {
-                  case 'positive': return '#28a745';
-                  case 'warning': return '#ffc107';
-                  case 'tip': return '#007bff';
-                  default: return '#6c757d';
-                }
-              };
-              
-              // Map insight types to FontAwesome icons
-              const getInsightIconName = (type: string) => {
-                switch (type) {
-                  case 'positive': return 'check-circle';
-                  case 'warning': return 'exclamation-triangle';
-                  case 'tip': return 'lightbulb';
-                  default: return 'info-circle';
-                }
-              };
-
-              return (
-                <View key={insight.id} style={styles.insightItem}>
-                  <View style={styles.insightIconContainer}>
-                    {insight.icon && insight.icon.length === 2 ? (
-                      // Show emoji icon if provided
-                      <Text style={styles.insightEmoji}>{insight.icon}</Text>
-                    ) : (
-                      // Fallback to FontAwesome icon
-                      <FontAwesome5 
-                        name={getInsightIconName(insight.type)} 
-                        size={16} 
-                        color={getInsightColor(insight.type)} 
-                        style={styles.insightIcon} 
-                      />
-                    )}
-                  </View>
-                  <View style={styles.insightTextContainer}>
-                    <Text style={styles.insightTitle}>{insight.title}</Text>
-                    <Text style={styles.insightDetails}>{insight.description}</Text>
-                  </View>
+          
+          <TouchableWithoutFeedback onPress={() => {
+            setTooltip(null);
+            setSelectedPoint(null);
+          }}>
+            <View style={styles.chartContainer}>
+              {isLoadingHistory ? (
+                <View style={[styles.chartContainer, { justifyContent: 'center', alignItems: 'center', height: chartHeight }]}>
+                  <Text style={{ color: '#6b7280', fontSize: 16 }}>Loading glucose history...</Text>
                 </View>
-              );
-            })}
-            
-            {lastInsightsRefresh && (
-              <Text style={styles.insightsTimestamp}>
-                Last updated: {lastInsightsRefresh.toLocaleTimeString([], { 
-                  hour: '2-digit', 
-                  minute: '2-digit' 
-                })}
-              </Text>
+              ) : (
+            <LineChart
+              data={cleanedChartData}
+              width={chartWidth}
+              height={chartHeight}
+              chartConfig={chartConfig}
+              bezier
+                  style={styles.modernChart}
+              onDataPointClick={({ value, dataset, getColor, x, y, index }) => {
+                const datasetIndex = cleanedChartData.datasets.findIndex(ds => ds === dataset);
+                  
+                  // Set selected point for highlighting
+                  setSelectedPoint({ datasetIndex, pointIndex: index });
+                  
+                setTooltip({
+                  x,
+                  y,
+                  value,
+                  label: cleanedChartData.legend[datasetIndex],
+                  datasetIndex,
+                  pointIndex: index,
+                });
+                  
+                  // Auto-hide tooltip and selection after 4 seconds
+                  setTimeout(() => {
+                    setTooltip(null);
+                    setSelectedPoint(null);
+                  }, 4000);
+                }}
+                withHorizontalLabels={true}
+                withVerticalLabels={true}
+                withInnerLines={false}
+                withOuterLines={false}
+                withHorizontalLines={true}
+                withVerticalLines={false}
+                decorator={(props: any) => {
+                  // Custom decorator for highlighting selected points
+                  if (!selectedPoint) return null;
+                  
+                  const { data, paddingTop, paddingLeft, width: chartInnerWidth, height: chartInnerHeight } = props;
+                  const { datasetIndex, pointIndex } = selectedPoint;
+                  
+                  if (!data || !data.datasets || !data.datasets[datasetIndex]) return null;
+                  
+                  const dataset = data.datasets[datasetIndex];
+                  const dataValue = dataset.data[pointIndex];
+                  
+                  if (typeof dataValue !== 'number' || isNaN(dataValue)) return null;
+                  
+                  // Calculate position
+                  const maxValue = Math.max(...data.datasets.flatMap((d: any) => d.data.filter((v: any) => typeof v === 'number' && !isNaN(v))));
+                  const minValue = Math.min(...data.datasets.flatMap((d: any) => d.data.filter((v: any) => typeof v === 'number' && !isNaN(v))));
+                  
+                  const xStep = chartInnerWidth / (data.labels.length - 1);
+                  const yRatio = (dataValue - minValue) / (maxValue - minValue);
+                  
+                  const x = paddingLeft + (pointIndex * xStep);
+                  const y = paddingTop + chartInnerHeight - (yRatio * chartInnerHeight);
+                  
+                  return (
+                    <View key={`highlight-${datasetIndex}-${pointIndex}`}>
+                      {/* Pulsing halo effect */}
+                      <View
+                        style={[
+                          styles.selectedPointHalo,
+                          {
+                            position: 'absolute',
+                            left: x - 12,
+                            top: y - 12,
+                            backgroundColor: datasetIndex === 0 ? 'rgba(59, 130, 246, 0.2)' : 'rgba(251, 113, 133, 0.2)',
+                          }
+                        ]}
+                      />
+                      {/* Enhanced dot */}
+              <View
+                        style={[
+                          styles.selectedPointDot,
+                          {
+                  position: 'absolute',
+                            left: x - 8,
+                            top: y - 8,
+                            backgroundColor: datasetIndex === 0 ? '#3b82f6' : '#fb7185',
+                            borderColor: '#ffffff',
+                          }
+                        ]}
+                      />
+                    </View>
+                  );
+                }}
+              />
+              )}
+              
+              {/* Enhanced tooltip */}
+              {tooltip && (
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.tooltipContainer,
+                    {
+                      left: Math.max(10, Math.min(chartWidth - 140, tooltip.x - 70)),
+                      top: Math.max(10, tooltip.y - 70),
+                    }
+                  ]}
+                >
+                  <View style={[
+                    styles.modernTooltip,
+                    { borderLeftColor: tooltip.datasetIndex === 0 ? '#3b82f6' : '#fb7185' }
+                  ]}>
+                    <Text style={styles.tooltipValue}>{tooltip.value} mg/dL</Text>
+                    <Text style={styles.tooltipLabel}>{tooltip.label}</Text>
+                    <Text style={styles.tooltipTime}>
+                      {cleanedChartData.labels[tooltip.pointIndex]}
+                    </Text>
+                </View>
+                  {/* Tooltip arrow */}
+                  <View style={[
+                    styles.tooltipArrow,
+                    { borderTopColor: tooltip.datasetIndex === 0 ? 'rgba(59, 130, 246, 0.05)' : 'rgba(251, 113, 133, 0.05)' }
+                  ]} />
+              </View>
             )}
-          </>
-        )}
-      </View>
-
-      <Modal
-        animationType="slide"
-        transparent={true}
-        visible={isModalVisible}
-        onRequestClose={closeModal}
-      >
-        <KeyboardAvoidingView
-           behavior={Platform.OS === "ios" ? "padding" : "height"}
-           style={modalStyles.centeredView}
-        >
-          <View style={modalStyles.modalView}>
-            {renderModalContent()}
-            <View style={modalStyles.buttonContainer}>
-                 <TouchableOpacity style={modalStyles.cancelButton} onPress={closeModal}>
-                   <Text style={modalStyles.cancelButtonText}>Cancel</Text>
-                 </TouchableOpacity>
-                 <TouchableOpacity 
-                     style={[
-                       modalStyles.saveButton, 
-                       (loggingType === 'glucose' ? !(logDetails.glucoseLevel?.trim() && logDetails.time?.trim()) :
-                        loggingType === 'meal' ? !(logDetails.meal_type?.trim() && logDetails.food_description?.trim() && logDetails.carbs?.trim() && logDetails.calories?.trim() && logDetails.protein?.trim() && logDetails.fat?.trim() && logDetails.sugar?.trim() && logDetails.fiber?.trim()) :
-                        loggingType === 'activity' ? !(logDetails.activity_type?.trim() && logDetails.duration_minutes?.trim() && (logDetails.activity_type === 'Other' ? logDetails.other_activity_type?.trim() : true)) :
-                        loggingType === 'medication' ? !(medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time && (medicationDetails.medication_type !== 'Insulin' || medicationDetails.injection_site?.trim())) :
-                        true) && modalStyles.disabledButton
-                     ]}
-                     onPress={handleSaveLog}
-                     disabled={
-                         loggingType === 'glucose' ? !(logDetails.glucoseLevel?.trim() && logDetails.time?.trim()) :
-                         loggingType === 'meal' ? !(logDetails.meal_type?.trim() && logDetails.food_description?.trim() && logDetails.carbs?.trim() && logDetails.calories?.trim() && logDetails.protein?.trim() && logDetails.fat?.trim() && logDetails.sugar?.trim() && logDetails.fiber?.trim()) :
-                         loggingType === 'activity' ? !(logDetails.activity_type?.trim() && logDetails.duration_minutes?.trim() && (logDetails.activity_type === 'Other' ? logDetails.other_activity_type?.trim() : true)) :
-                         loggingType === 'medication' ? !(medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time && (medicationDetails.medication_type !== 'Insulin' || medicationDetails.injection_site?.trim())) :
-                         true
-                     }
-                 >
-                   <Text style={modalStyles.saveButtonText}>Save Log</Text>
-                 </TouchableOpacity>
-             </View>
           </View>
-        </KeyboardAvoidingView>
-      </Modal>
-    </ScrollView>
+          </TouchableWithoutFeedback>
+          
+          {/* Modern legend with icons */}
+          <View style={styles.modernLegendContainer}>
+            {cleanedChartData.legend.map((legend: any, index: any) => (
+              <View key={index} style={styles.modernLegendItem}>
+                <View style={styles.legendIndicator}>
+                  <View style={[
+                    styles.legendLine,
+                    { 
+                      backgroundColor: cleanedChartData.datasets[index].color(),
+                      ...(index === 1 && { borderStyle: 'dashed', borderWidth: 1, borderColor: cleanedChartData.datasets[index].color(), backgroundColor: 'transparent' })
+                    }
+                  ]} />
+                  <View style={[
+                    styles.legendDot,
+                    { backgroundColor: cleanedChartData.datasets[index].color() }
+                  ]} />
+                </View>
+                <Text style={styles.modernLegendText}>{legend}</Text>
+              </View>
+            ))}
+          </View>
+        </View>
+        <View style={styles.logActionsContainer}>
+          <TouchableOpacity style={[styles.modernLogButton, styles.logMealButton]} onPress={handleLogMeal}>
+            <View style={styles.buttonIconContainer}>
+              <FontAwesome5 name="utensils" size={20} color="#fff" />
+            </View>
+            <Text style={styles.modernLogButtonText}>Log Meal</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.modernLogButton, styles.logActivityButton]} onPress={handleLogActivity}>
+            <View style={styles.buttonIconContainer}>
+              <FontAwesome5 name="running" size={20} color="#fff" />
+            </View>
+            <Text style={styles.modernLogButtonText}>Log Activity</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.modernLogButton, styles.logGlucoseButton]} onPress={handleLogGlucose}>
+            <View style={styles.buttonIconContainer}>
+              <FontAwesome5 name="tint" size={20} color="#fff" />
+            </View>
+            <Text style={styles.modernLogButtonText}>Log Glucose</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.modernLogButton, styles.logMedicationButton]} onPress={handleLogMedication}>
+            <View style={styles.buttonIconContainer}>
+              <FontAwesome5 name="pills" size={20} color="#fff" />
+            </View>
+            <Text style={styles.modernLogButtonText}>Log Medication</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Today's Stats</Text>
+          <View style={styles.statsRow}>
+            <View style={styles.statsItem}>
+              <Text style={styles.statsLabel}>Average Glucose</Text>
+              <Text style={styles.statsValue}>
+                {todaysStats.averageGlucose !== null ? todaysStats.averageGlucose : '--'} <Text style={styles.unit}>mg/dL</Text>
+              </Text>
+            </View>
+            <View style={styles.statsItem}>
+              <Text style={styles.statsLabel}>Time In Range</Text>
+              <Text style={styles.statsValue}>
+                {todaysStats.timeInRange !== null ? `${todaysStats.timeInRange}%` : '--'}
+              </Text>
+            </View>
+          </View>
+          <View style={styles.statsRow}>
+            <View style={styles.statsItem}>
+              <Text style={styles.statsLabel}>Highest Reading</Text>
+              <Text style={styles.statsValue}>
+                {todaysStats.highestReading !== null ? todaysStats.highestReading : '--'} <Text style={styles.unit}>mg/dL</Text>
+              </Text>
+            </View>
+            <View style={styles.statsItem}>
+              <Text style={styles.statsLabel}>Lowest Reading</Text>
+              <Text style={styles.statsValue}>
+                {todaysStats.lowestReading !== null ? todaysStats.lowestReading : '--'} <Text style={styles.unit}>mg/dL</Text>
+              </Text>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.card}>
+          <View style={styles.cardHeader}>
+            <Text style={styles.cardTitle}>Today's Insights</Text>
+            <TouchableOpacity onPress={handleRefreshInsights} disabled={insightsLoading}>
+              <Text style={[styles.viewAllLink, insightsLoading && { color: '#ccc' }]}>
+                {insightsLoading ? 'Refreshing...' : 'Refresh'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+          
+          {insightsLoading && insights.length === 0 ? (
+            <View style={styles.insightLoadingContainer}>
+              <ActivityIndicator size="small" color="#4A90E2" />
+              <Text style={styles.insightLoadingText}>Generating personalized insights...</Text>
+            </View>
+          ) : insightsError && insights.length === 0 ? (
+            <View style={styles.insightErrorContainer}>
+              <Text style={styles.insightErrorText}>Unable to generate insights</Text>
+              <TouchableOpacity onPress={handleRefreshInsights} style={styles.retryButton}>
+                <Text style={styles.retryButtonText}>Try Again</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <>
+              {insights.map((insight, index) => {
+                // Map insight types to colors
+                const getInsightColor = (type: string) => {
+                  switch (type) {
+                    case 'positive': return '#28a745';
+                    case 'warning': return '#ffc107';
+                    case 'tip': return '#007bff';
+                    default: return '#6c757d';
+                  }
+                };
+                
+                // Map insight types to FontAwesome icons
+                const getInsightIconName = (type: string) => {
+                  switch (type) {
+                    case 'positive': return 'check-circle';
+                    case 'warning': return 'exclamation-triangle';
+                    case 'tip': return 'lightbulb';
+                    default: return 'info-circle';
+                  }
+                };
+
+                return (
+                  <View key={insight.id} style={styles.insightItem}>
+                    <View style={styles.insightIconContainer}>
+                      {insight.icon && insight.icon.length === 2 ? (
+                        // Show emoji icon if provided
+                        <Text style={styles.insightEmoji}>{insight.icon}</Text>
+                      ) : (
+                        // Fallback to FontAwesome icon
+                        <FontAwesome5 
+                          name={getInsightIconName(insight.type)} 
+                          size={16} 
+                          color={getInsightColor(insight.type)} 
+                          style={styles.insightIcon} 
+                        />
+                      )}
+                    </View>
+                    <View style={styles.insightTextContainer}>
+                      <Text style={styles.insightTitle}>{insight.title}</Text>
+                      <Text style={styles.insightDetails}>{insight.description}</Text>
+                    </View>
+                  </View>
+                );
+              })}
+              
+              {lastInsightsRefresh && (
+                <Text style={styles.insightsTimestamp}>
+                  Last updated: {lastInsightsRefresh.toLocaleTimeString([], { 
+                    hour: '2-digit', 
+                    minute: '2-digit' 
+                  })}
+                </Text>
+              )}
+            </>
+          )}
+        </View>
+
+        <Modal
+          animationType="slide"
+          transparent={true}
+          visible={isModalVisible}
+          onRequestClose={closeModal}
+        >
+          <KeyboardAvoidingView
+             behavior={Platform.OS === "ios" ? "padding" : "height"}
+             style={modalStyles.centeredView}
+          >
+            <View style={modalStyles.modalView}>
+              {renderModalContent()}
+              <View style={modalStyles.buttonContainer}>
+                   <TouchableOpacity style={modalStyles.cancelButton} onPress={closeModal}>
+                     <Text style={modalStyles.cancelButtonText}>Cancel</Text>
+                   </TouchableOpacity>
+                   <TouchableOpacity 
+                       style={[
+                         modalStyles.saveButton, 
+                         (loggingType === 'glucose' ? !(logDetails.glucoseLevel?.trim() && logDetails.time?.trim()) :
+                          loggingType === 'meal' ? !(logDetails.meal_type?.trim() && logDetails.food_description?.trim()) :
+                          loggingType === 'activity' ? !(logDetails.activity_type?.trim() && logDetails.duration_minutes?.trim() && (logDetails.activity_type === 'Other' ? logDetails.other_activity_type?.trim() : true)) :
+                          loggingType === 'medication' ? !(medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time && (medicationDetails.medication_type !== 'Insulin' || medicationDetails.injection_site?.trim())) :
+                          true) && modalStyles.disabledButton
+                       ]}
+                       onPress={handleSaveLog}
+                       disabled={
+                           loggingType === 'glucose' ? !(logDetails.glucoseLevel?.trim() && logDetails.time?.trim()) :
+                           loggingType === 'meal' ? !(logDetails.meal_type?.trim() && logDetails.food_description?.trim()) :
+                           loggingType === 'activity' ? !(logDetails.activity_type?.trim() && logDetails.duration_minutes?.trim() && (logDetails.activity_type === 'Other' ? logDetails.other_activity_type?.trim() : true)) :
+                           loggingType === 'medication' ? !(medicationDetails.medication_type?.trim() && medicationDetails.medication_name?.trim() && medicationDetails.dosage?.trim() && medicationDetails.time && (medicationDetails.medication_type !== 'Insulin' || medicationDetails.injection_site?.trim())) :
+                           true
+                       }
+                   >
+                     <Text style={modalStyles.saveButtonText}>Save Log</Text>
+                   </TouchableOpacity>
+               </View>
+            </View>
+          </KeyboardAvoidingView>
+        </Modal>
+      </ScrollView>
+    </>
   );
 };
 
@@ -2327,5 +2580,103 @@ export const modalStyles = StyleSheet.create({
     color: '#0ea5e9',
     fontSize: 14,
     fontWeight: '600',
+  },
+  
+  // Method selection styles
+  methodSelectionContainer: {
+    width: '100%',
+    gap: 12,
+    marginBottom: 20,
+  },
+  methodButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#4A90E2',
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 20,
+    width: '100%',
+    shadowColor: '#4A90E2',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  methodButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  methodButtonSecondary: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#f8f9fa',
+    borderRadius: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 20,
+    width: '100%',
+    borderWidth: 2,
+    borderColor: '#4A90E2',
+  },
+  methodButtonSecondaryText: {
+    color: '#4A90E2',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  switchMethodButton: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#f1f5f9',
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  switchMethodButtonText: {
+    color: '#475569',
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#2c3e50',
+    marginBottom: 12,
+    marginTop: 8,
+  },
+  sectionSubtitle: {
+    fontSize: 14,
+    color: '#6b7280',
+    marginBottom: 16,
+    marginTop: -8,
+    fontStyle: 'italic',
+  },
+});
+
+// Toast styles
+const toastStyles = StyleSheet.create({
+  container: {
+    position: 'absolute',
+    top: Platform.OS === 'ios' ? 60 : 40,
+    alignSelf: 'center',
+    backgroundColor: '#323232',
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 24,
+    zIndex: 9999,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 6,
+  },
+  text: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
   },
 });

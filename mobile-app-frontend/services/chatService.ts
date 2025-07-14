@@ -30,6 +30,7 @@ export interface HealthSnapshot {
   activitySummary: {
     stepsToday: number;
     activeMinutes: number;
+    activityLevel?: string;
     sedentary: boolean;
   };
 }

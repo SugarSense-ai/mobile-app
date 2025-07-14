@@ -29,11 +29,11 @@ export default function OnboardingScreens() {
       });
       setCurrentIndex(nextIndex);
     } else {
-      router.replace("/(auth)/login");
+      router.replace("/(auth)/user-info");
     }
   };
   const handleSkip = () => {
-    router.replace("/(auth)/login");
+    router.replace("/(auth)/user-info");
   };
 
   const handleBack = () => {
