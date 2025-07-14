@@ -50,7 +50,7 @@ else:
 # Configure Gemini API
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 else:
     print("GEMINI_API_KEY not found in .env. Gemini functionality will be disabled.")
     gemini_model = None
@@ -516,7 +516,7 @@ You are an expert AI assistant specializing in diabetes management, nutrition, a
 
     # 5. Initialize chat with history and send the new comprehensive message
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         chat_session = model.start_chat(history=chat_history_formatted)
         response = chat_session.send_message(prompt_content)
         gemini_response_text = response.text
@@ -613,7 +613,7 @@ def gemini_analyze():
     try:
         # Initialize the Gemini client
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.5-flash')
 
         # Decode the base64 image
         image_data = base64.b64decode(image_data_b64)
@@ -2159,51 +2159,84 @@ def get_diabetes_dashboard():
             """)
             apple_calories_records = conn.execute(apple_calories_query, {'user_id': user_id, 'start_date': start_of_range_dt}).fetchall()
             
-            # Get manual activity data from activity_log table
+            # Get manual activity data from activity_log table (include duration)
             manual_activity_query = text("""
-                SELECT DATE(timestamp) as date, SUM(COALESCE(steps, 0)) as total_steps, SUM(COALESCE(calories_burned, 0)) as total_calories
+                SELECT DATE(timestamp) as date,
+                       SUM(duration_minutes) as total_minutes,
+                       SUM(COALESCE(steps, 0)) as total_steps,
+                       SUM(COALESCE(calories_burned, 0)) as total_calories
                 FROM activity_log
                 WHERE user_id = :user_id AND DATE(timestamp) >= :start_date
-                  AND (steps > 0 OR calories_burned > 0)
                 GROUP BY DATE(timestamp)
             """)
             manual_activity_records = conn.execute(manual_activity_query, {'user_id': user_id, 'start_date': start_date}).fetchall()
             
-            # Combine Apple Health and manual activity data
+            # Get Apple Health workout durations (in minutes)
+            apple_workout_query = text("""
+                SELECT DATE(start_date) as date,
+                       SUM(TIMESTAMPDIFF(MINUTE, start_date, end_date)) as total_minutes
+                FROM health_data_archive
+                WHERE user_id = :user_id AND data_type = 'Workout'
+                  AND start_date >= :start_date
+                GROUP BY DATE(start_date)
+            """)
+            apple_workout_records = conn.execute(apple_workout_query, {'user_id': user_id, 'start_date': start_of_range_dt}).fetchall()
+            
+            # Combine Apple Health, manual logs, and workouts into daily activity dict
             daily_activity = {}
             
             # Add Apple Health steps
             for r in apple_step_records:
                 day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
                 if day_key not in daily_activity:
-                    daily_activity[day_key] = {'steps': 0, 'calories': 0}
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0}
                 daily_activity[day_key]['steps'] = int(r.total_steps)
             
             # Add Apple Health calories
             for r in apple_calories_records:
                 day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
                 if day_key not in daily_activity:
-                    daily_activity[day_key] = {'steps': 0, 'calories': 0}
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0}
                 daily_activity[day_key]['calories'] = int(r.total_calories)
             
             # Add manual activity data (combine with Apple Health for same day)
             for r in manual_activity_records:
                 day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
                 if day_key not in daily_activity:
-                    daily_activity[day_key] = {'steps': 0, 'calories': 0}
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0}
                 
                 # Add manual steps to existing Apple Health steps
                 daily_activity[day_key]['steps'] += int(r.total_steps) if r.total_steps else 0
                 # Add manual calories to existing Apple Health calories
                 daily_activity[day_key]['calories'] += int(r.total_calories) if r.total_calories else 0
+                # Add manual active minutes
+                daily_activity[day_key]['active_minutes'] += int(r.total_minutes) if r.total_minutes else 0
+            
+            # Add Apple Health workout durations
+            for r in apple_workout_records:
+                day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
+                if day_key not in daily_activity:
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0}
+                daily_activity[day_key]['active_minutes'] += int(r.total_minutes) if r.total_minutes else 0
             
             # Create activity data structure
             activity_data = []
             for date_key, activity in daily_activity.items():
+                # Determine activity level
+                mins = activity['active_minutes']
+                if mins >= 60:
+                    level = 'Active'
+                elif mins >= 30:
+                    level = 'Moderately Active'
+                else:
+                    level = 'Sedentary'
+
                 activity_data.append({
-                    'date': date_key, 
-                    'steps': activity['steps'], 
+                    'date': date_key,
+                    'steps': activity['steps'],
                     'calories_burned': activity['calories'],
+                    'active_minutes': mins,
+                    'activity_level': level,
                     'distance_km': 0
                 })
             activity_data.sort(key=lambda x: x['date'], reverse=True)
@@ -2213,6 +2246,7 @@ def get_diabetes_dashboard():
             total_calories = sum(a['calories_burned'] for a in activity_data)
             avg_daily_steps = total_steps / len(activity_data) if activity_data else 0
             avg_daily_calories = total_calories / len(activity_data) if activity_data else 0
+            avg_daily_active_minutes = sum(a['active_minutes'] for a in activity_data) / len(activity_data) if activity_data else 0
             
             print(f"📊 ACTIVITY SUMMARY: {len(activity_data)} days, {total_steps} total steps, {int(avg_daily_steps)} avg daily")
             print(f"🔥 CALORIES SUMMARY: {len(activity_data)} days, {total_calories} total calories, {int(avg_daily_calories)} avg daily")
@@ -2258,7 +2292,7 @@ def get_diabetes_dashboard():
                 },
                 "activity": {
                     "data": activity_data,
-                    "summary": {"avg_daily_steps": int(avg_daily_steps), "avg_daily_calories": int(avg_daily_calories), "total_distance_km": 0.0}
+                    "summary": {"avg_daily_steps": int(avg_daily_steps), "avg_daily_calories": int(avg_daily_calories), "avg_daily_active_minutes": int(avg_daily_active_minutes), "total_distance_km": 0.0}
                 },
                 "walking_running": {
                     "data": walking_running_data,
@@ -4565,40 +4599,126 @@ def calculate_post_meal_response(conn, user_id: int, today: date) -> dict:
 def analyze_activity_data(conn, user_id: int, today: date) -> dict:
     """Analyze activity data for insights"""
     try:
-        # Get today's activity logs
+        # -------------------------
+        # 1. Manual activity logs
+        # -------------------------
         activities = conn.execute(text("""
             SELECT activity_type, duration_minutes, steps, calories_burned, timestamp
-            FROM activity_log 
-            WHERE user_id = :user_id 
-            AND DATE(timestamp) = :today
+            FROM activity_log
+            WHERE user_id = :user_id
+              AND DATE(timestamp) = :today
             ORDER BY timestamp DESC
         """), {'user_id': user_id, 'today': today}).fetchall()
-        
-        # Get steps from health data if available
+
+        # Intensity weight mapping (simple heuristic)
+        intensity_weights = {
+            'run': 1.25,
+            'jog': 1.2,
+            'gym': 1.25,
+            'cycle': 1.25,
+            'bike': 1.25,
+            'swim': 1.3,
+            'row': 1.25,
+            'walk': 1.0,
+            'yoga': 0.8,
+            'stretch': 0.8,
+        }
+
+        total_manual_minutes = 0.0
+        weighted_manual_minutes = 0.0
+        total_manual_steps = 0
+        total_manual_calories = 0.0
+
+        for a in activities:
+            mins = float(a.duration_minutes or 0)
+            total_manual_minutes += mins
+
+            # Determine weight
+            weight = 1.0
+            if a.activity_type:
+                lower = a.activity_type.lower()
+                for key, w in intensity_weights.items():
+                    if key in lower:
+                        weight = w
+                        break
+            weighted_manual_minutes += mins * weight
+
+            total_manual_steps += int(a.steps or 0)
+            total_manual_calories += float(a.calories_burned or 0)
+
+        # -------------------------
+        # 2. Apple Health data
+        # -------------------------
+        # Step data
         steps_data = conn.execute(text("""
             SELECT SUM(value) as total_steps
-            FROM health_data_display 
-            WHERE user_id = :user_id 
-            AND data_type = 'StepCount' 
-            AND DATE(start_date) = :today
+            FROM health_data_display
+            WHERE user_id = :user_id
+              AND data_type = 'StepCount'
+              AND DATE(start_date) = :today
         """), {'user_id': user_id, 'today': today}).fetchone()
-        
-        total_steps = int(steps_data.total_steps or 0) if steps_data else 0
-        total_minutes = sum(float(a.duration_minutes or 0) for a in activities)
-        total_calories = sum(float(a.calories_burned or 0) for a in activities)
-        
+        apple_steps = int(steps_data.total_steps or 0) if steps_data else 0
+
+        # Workout durations (in minutes)
+        workouts = conn.execute(text("""
+            SELECT workout_activity_type, start_date, end_date
+            FROM health_data_archive
+            WHERE user_id = :user_id
+              AND data_type = 'Workout'
+              AND DATE(start_date) = :today
+        """), {'user_id': user_id, 'today': today}).fetchall()
+
+        total_workout_minutes = 0.0
+        weighted_workout_minutes = 0.0
+
+        for w in workouts:
+            # Duration in minutes
+            if w.end_date and w.start_date:
+                mins = (w.end_date - w.start_date).total_seconds() / 60
+                total_workout_minutes += mins
+
+                # Determine weight based on activity type
+                weight = 1.0
+                if w.workout_activity_type:
+                    lower = w.workout_activity_type.lower()
+                    for key, wt in intensity_weights.items():
+                        if key in lower:
+                            weight = wt
+                            break
+                weighted_workout_minutes += mins * weight
+
+        # -------------------------
+        # 3. Aggregate metrics
+        # -------------------------
+        total_steps = apple_steps + total_manual_steps
+        total_minutes = total_manual_minutes + total_workout_minutes
+        total_calories = total_manual_calories  # Apple Health calories already captured in dashboard elsewhere
+
+        weighted_minutes = weighted_manual_minutes + weighted_workout_minutes
+
+        # Determine activity level
+        if weighted_minutes >= 60:
+            activity_level = 'Active'
+        elif weighted_minutes >= 30:
+            activity_level = 'Moderately Active'
+        else:
+            activity_level = 'Sedentary'
+
         return {
             'totalSteps': total_steps,
             'totalMinutes': round(total_minutes, 1),
-            'activitiesLogged': len(activities),
+            'activeMinutes': round(total_minutes, 1),
+            'weightedMinutes': round(weighted_minutes, 1),
+            'activityLevel': activity_level,
+            'activitiesLogged': len(activities) + len(workouts),
             'caloriesBurned': round(total_calories, 1),
             'lastActivity': {
-                'type': activities[0].activity_type,
-                'duration': float(activities[0].duration_minutes or 0),
-                'timestamp': activities[0].timestamp.isoformat()
-            } if activities else None
+                'type': activities[0].activity_type if activities else (workouts[0].workout_activity_type if workouts else None),
+                'duration': float(activities[0].duration_minutes or 0) if activities else ( ( (workouts[0].end_date - workouts[0].start_date).total_seconds() / 60 ) if workouts else 0),
+                'timestamp': activities[0].timestamp.isoformat() if activities else (workouts[0].start_date.isoformat() if workouts else None)
+            } if (activities or workouts) else None
         }
-        
+ 
     except Exception as e:
         print(f"❌ Error analyzing activity data: {e}")
         return {}

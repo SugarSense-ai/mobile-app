@@ -15,7 +15,8 @@ export default function login() {
             const { createdSessionId, setActive } = await startSSOFlow({ strategy: "oauth_google" });
             if (setActive && createdSessionId) {
                 setActive({ session: createdSessionId });
-                router.replace("/(tabs)")
+                // Let InitialLayout handle the routing based on onboarding status
+                console.log("✅ Successfully signed in with Google");
             }
 
         } catch (error) {
