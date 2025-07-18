@@ -81,6 +81,9 @@ export const API_ENDPOINTS = {
   ACTIVITY_LOGS: `${BACKEND_URL}/api/activity-logs`,
   HEALTH_CHECK: `${BACKEND_URL}/api/health`,
   INSIGHTS: `${BACKEND_URL}/api/insights`,
+  REGISTER_USER: `${BACKEND_URL}/api/register-user`,
+  SAVE_ONBOARDING_DATA: `${BACKEND_URL}/api/save-onboarding-data`,
+  RECENT_MEAL: `${BACKEND_URL}/api/recent-meal`,
 };
 
 export default currentConfig; 

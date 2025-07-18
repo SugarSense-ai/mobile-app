@@ -100,7 +100,11 @@ export interface DashboardData {
 /**
  * Fetch comprehensive dashboard data for diabetes management
  */
-export const fetchDashboardData = async (days: number = 15, userId: number = 1): Promise<DashboardData> => {
+export const fetchDashboardData = async (days: number = 15, userId?: number): Promise<DashboardData> => {
+  if (!userId) {
+    throw new Error('User ID is required to fetch dashboard data');
+  }
+  
   try {
     // Use dynamic URL resolution instead of static BASE_URL
     const baseUrl = await getBaseUrl();
@@ -121,7 +125,11 @@ export const fetchDashboardData = async (days: number = 15, userId: number = 1):
 /**
  * Sync latest health data from Apple Health and refresh dashboard
  */
-export const syncAndRefreshDashboard = async (days: number = 15, userId: number = 1): Promise<DashboardData> => {
+export const syncAndRefreshDashboard = async (days: number = 15, userId?: number): Promise<DashboardData> => {
+  if (!userId) {
+    throw new Error('User ID is required to sync dashboard data');
+  }
+  
   try {
     console.log('🔄 Starting health data sync and dashboard refresh...');
     

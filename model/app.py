@@ -298,14 +298,94 @@ def create_sleep_log_table():
         print(f"Error creating sleep_log table: {e}")
         raise
 
+def create_users_table():
+    """Create the central users table for user management and onboarding data"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    clerk_user_id VARCHAR(255) UNIQUE NOT NULL,
+                    email VARCHAR(255) NOT NULL,
+                    full_name VARCHAR(255),
+                    profile_image_url TEXT,
+                    
+                    -- Basic Demographics (from onboarding)
+                    date_of_birth DATE,
+                    gender ENUM('Male', 'Female', 'Other', 'Prefer not to say'),
+                    height_value DECIMAL(5,2),
+                    height_unit ENUM('cm', 'ft'),
+                    weight_value DECIMAL(5,2),
+                    weight_unit ENUM('kg', 'lbs'),
+                    
+                    -- Diabetes Profile (from onboarding)
+                    has_diabetes ENUM('Yes', 'No', 'Not sure'),
+                    diabetes_type ENUM('Type 1', 'Type 2', 'Gestational', 'Pre-diabetes', 'Not sure'),
+                    year_of_diagnosis YEAR,
+                    uses_insulin ENUM('Yes', 'No'),
+                    insulin_type ENUM('Basal', 'Bolus', 'Both'),
+                    daily_basal_dose DECIMAL(5,2),
+                    insulin_to_carb_ratio DECIMAL(5,2),
+                    
+                    -- Device Preferences (from onboarding)
+                    cgm_status ENUM('No – Decided against it', 'No – Still deciding', 'No – Trying to get one', 'Yes – I already use one'),
+                    cgm_model ENUM('Dexcom G7 / One+', 'Dexcom G6 / G5 / One', 'Abbott Freestyle Libre'),
+                    insulin_delivery_status ENUM('Not using insulin', 'Only using basal insulin', 'MDI now, but considering a pump or smart pen', 'MDI now, actively trying to get one', 'MDI now, decided against a pump or smart pen', 'Omnipod 5', 'Omnipod Dash'),
+                    pump_model ENUM('Omnipod 5', 'Omnipod Dash'),
+                    
+                    -- Onboarding Tracking
+                    onboarding_completed BOOLEAN DEFAULT FALSE,
+                    onboarding_completed_at TIMESTAMP NULL,
+                    
+                    -- Audit Fields
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    
+                    INDEX idx_clerk_user_id (clerk_user_id),
+                    INDEX idx_email (email),
+                    INDEX idx_onboarding_completed (onboarding_completed)
+                )
+            """))
+            conn.commit()
+            print("✅ Users table created/verified successfully")
+    except Exception as e:
+        print(f"Error creating users table: {e}")
+        raise
+
+def create_basal_dose_logs_table():
+    """Create the basal_dose_logs table for basal insulin dose tracking"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS basal_dose_logs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    timestamp DATETIME NOT NULL,
+                    insulin_type VARCHAR(20) DEFAULT 'basal',
+                    insulin_name VARCHAR(200) NOT NULL,
+                    dose_units DECIMAL(8,2) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_user_timestamp (user_id, timestamp),
+                    INDEX idx_insulin_type (insulin_type)
+                )
+            """))
+            conn.commit()
+            print("✅ Basal dose logs table created/verified successfully")
+    except Exception as e:
+        print(f"Error creating basal_dose_logs table: {e}")
+        raise
+
 def initialize_database():
     """Creates all necessary database tables if they don't exist."""
     print("--- Initializing Database ---")
+    create_users_table()  # Create users table first for foreign key references
     create_glucose_log_table()
     create_food_log_table()
     create_activity_log_table()
     create_medication_log_table()
     create_sleep_log_table()
+    create_basal_dose_logs_table()  # Add basal dose logs table
     create_health_data_archive_table()
     create_health_data_display_table()
     create_verification_health_data_table()
@@ -313,6 +393,95 @@ def initialize_database():
 
 # Run initialization at startup
 initialize_database()
+
+# --- User Management Helper Functions ---
+
+def get_user_id_from_clerk(clerk_user_id: str) -> int:
+    """
+    Get the database user_id from a Clerk user_id
+    
+    Args:
+        clerk_user_id: The Clerk user identifier
+        
+    Returns:
+        int: The database user ID
+        
+    Raises:
+        ValueError: If user not found
+    """
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT user_id FROM users WHERE clerk_user_id = :clerk_user_id
+            """), {'clerk_user_id': clerk_user_id}).fetchone()
+            
+            if not result:
+                raise ValueError(f"User not found for clerk_user_id: {clerk_user_id}")
+            
+            return result.user_id
+    except Exception as e:
+        print(f"Error getting user_id for clerk_user_id {clerk_user_id}: {e}")
+        raise
+
+def get_or_create_user(clerk_user_id: str, email: str, full_name: str = None, profile_image_url: str = None) -> dict:
+    """
+    Get existing user or create new user with basic information
+    
+    Args:
+        clerk_user_id: The Clerk user identifier
+        email: User's email address
+        full_name: User's full name (optional)
+        profile_image_url: User's profile image URL (optional)
+        
+    Returns:
+        dict: User information including database user_id and whether user was created
+    """
+    try:
+        with engine.connect() as conn:
+            # Check if user already exists
+            existing_user = conn.execute(text("""
+                SELECT user_id, onboarding_completed FROM users WHERE clerk_user_id = :clerk_user_id
+            """), {'clerk_user_id': clerk_user_id}).fetchone()
+            
+            if existing_user:
+                # Update last_active_at for existing user
+                conn.execute(text("""
+                    UPDATE users SET last_active_at = CURRENT_TIMESTAMP 
+                    WHERE clerk_user_id = :clerk_user_id
+                """), {'clerk_user_id': clerk_user_id})
+                conn.commit()
+                
+                return {
+                    "user_id": existing_user.user_id,
+                    "onboarding_completed": bool(existing_user.onboarding_completed),
+                    "created": False
+                }
+            
+            # Create new user
+            result = conn.execute(text("""
+                INSERT INTO users (clerk_user_id, email, full_name, profile_image_url)
+                VALUES (:clerk_user_id, :email, :full_name, :profile_image_url)
+            """), {
+                'clerk_user_id': clerk_user_id,
+                'email': email,
+                'full_name': full_name,
+                'profile_image_url': profile_image_url
+            })
+            
+            user_id = result.lastrowid
+            conn.commit()
+            
+            print(f"✅ Created new user with database ID {user_id} for clerk_user_id: {clerk_user_id}")
+            
+            return {
+                "user_id": user_id,
+                "onboarding_completed": False,
+                "created": True
+            }
+            
+    except Exception as e:
+        print(f"Error in get_or_create_user for clerk_user_id {clerk_user_id}: {e}")
+        raise
 
 # Setup persistent ChromaDB memory
 try:
@@ -365,6 +534,7 @@ def chat():
     health_snapshot = data.get('health_snapshot')
     image_data_b64 = data.get('image')  # Base64 encoded image string
     chat_history = data.get('chat_history', [])
+    clerk_user_id = data.get('clerk_user_id')
 
     # ------------------------------------------------------------
     # QUICK GREETING HANDLER – bypass heavy reasoning for casual greetings
@@ -422,21 +592,34 @@ def chat():
 
     # Fetch recent glucose logs
     try:
-        with engine.connect() as conn:
-            recent_glucose_result = conn.execute(text("""
-                SELECT timestamp, glucose_level 
-                FROM glucose_log 
-                WHERE user_id = 1 
-                ORDER BY timestamp DESC 
-                LIMIT 5
-            """)).fetchall()
-            
-            today_start = datetime.now().strftime('%Y-%m-%d 00:00:00')
-            today_avg_result = conn.execute(text("""
-                SELECT AVG(glucose_level) as avg_glucose
-                FROM glucose_log 
-                WHERE user_id = 1 AND timestamp >= :today_start
-            """), {'today_start': today_start}).fetchone()
+        # Get user_id from clerk_user_id if available
+        user_id = None
+        if clerk_user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                print(f"Warning: Could not resolve user_id from clerk_user_id {clerk_user_id}: {e}")
+        
+        if user_id:
+            with engine.connect() as conn:
+                recent_glucose_result = conn.execute(text("""
+                    SELECT timestamp, glucose_level 
+                    FROM glucose_log 
+                    WHERE user_id = :user_id 
+                    ORDER BY timestamp DESC 
+                    LIMIT 5
+                """), {'user_id': user_id}).fetchall()
+                
+                today_start = datetime.now().strftime('%Y-%m-%d 00:00:00')
+                today_avg_result = conn.execute(text("""
+                    SELECT AVG(glucose_level) as avg_glucose
+                    FROM glucose_log 
+                    WHERE user_id = :user_id AND timestamp >= :today_start
+                """), {'user_id': user_id, 'today_start': today_start}).fetchone()
+        else:
+            # No user_id available, set empty results
+            recent_glucose_result = []
+            today_avg_result = None
         
         if recent_glucose_result:
             recent_glucose_str = "Recent glucose logs:"
@@ -455,14 +638,17 @@ def chat():
 
     # Fetch latest meal from database
     try:
-        with engine.connect() as conn:
-            latest_meals_result = conn.execute(text("""
-                SELECT food_description, meal_type, timestamp, carbs 
-                FROM food_log 
-                WHERE user_id = 1 
-                ORDER BY timestamp DESC 
-                LIMIT 5
-            """)).fetchall()
+        if user_id:
+            with engine.connect() as conn:
+                latest_meals_result = conn.execute(text("""
+                    SELECT food_description, meal_type, timestamp, carbs 
+                    FROM food_log 
+                    WHERE user_id = :user_id 
+                    ORDER BY timestamp DESC 
+                    LIMIT 5
+                """), {'user_id': user_id}).fetchall()
+        else:
+            latest_meals_result = []
         
         if latest_meals_result:
             latest_meals_str = "Recent logged meals:"
@@ -694,11 +880,20 @@ def gemini_analyze():
         
         # Get recent glucose pattern for personalized advice
         try:
-            with engine.connect() as conn:
-                recent_avg = conn.execute(text("""
-                    SELECT AVG(glucose_level) FROM glucose_log 
-                    WHERE user_id = 1 AND timestamp >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-                """)).scalar()
+            clerk_user_id = data.get('clerk_user_id')
+            recent_avg = None
+            
+            if clerk_user_id:
+                try:
+                    user_id = get_user_id_from_clerk(clerk_user_id)
+                    with engine.connect() as conn:
+                        recent_avg = conn.execute(text("""
+                            SELECT AVG(glucose_level) FROM glucose_log 
+                            WHERE user_id = :user_id AND timestamp >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                        """), {'user_id': user_id}).scalar()
+                except ValueError as e:
+                    print(f"Warning: Could not resolve user_id from clerk_user_id {clerk_user_id}: {e}")
+                    recent_avg = None
                 
                 if recent_avg and recent_avg > 180:
                     personalized_advice = "💡 **Tip:** Your recent levels have been elevated. Consider light activity after eating or consult your doctor about meal-time insulin."
@@ -746,14 +941,17 @@ def log_glucose():
     create_glucose_log_table()
     
     data = request.json
-    user_id = 1 # Assuming user_id 1 for now
+    clerk_user_id = data.get('clerk_user_id')
     glucose_level = data.get('glucoseLevel')
     log_time_str = data.get('time')
 
-    if not all([glucose_level, log_time_str]):
-        return jsonify({"error": "Missing glucose level or time"}), 400
+    if not all([clerk_user_id, glucose_level, log_time_str]):
+        return jsonify({"error": "Missing required fields: clerk_user_id, glucoseLevel, or time"}), 400
     
     try:
+        # Get the database user_id from clerk_user_id
+        user_id = get_user_id_from_clerk(clerk_user_id)
+        
         # The timestamp string is now sent in 'YYYY-MM-DD HH:MM:SS' format from the frontend,
         # which is directly usable by MySQL.
         timestamp = log_time_str
@@ -765,6 +963,9 @@ def log_glucose():
             """), {'user_id': user_id, 'timestamp': timestamp, 'glucose_level': glucose_level})
             conn.commit()
         return jsonify({"message": "Glucose logged successfully"}), 200
+    except ValueError as e:
+        print(f"User lookup error: {e}")
+        return jsonify({"error": "User not found"}), 404
     except Exception as e:
         print(f"Error logging glucose: {e}")
         return jsonify({"error": "Failed to log glucose data."}), 500
@@ -776,7 +977,7 @@ def log_meal():
     create_food_log_table()
     
     data = request.json
-    user_id = 1 # Hardcoded for now
+    clerk_user_id = data.get('clerk_user_id')
     
     # Extract all expected fields, providing defaults for new ones
     meal_type = data.get('meal_type')
@@ -789,8 +990,8 @@ def log_meal():
     fiber = data.get('fiber_g')     # Match frontend key
 
     # Basic validation for required fields
-    if not all([meal_type, food_description]):
-        return jsonify({"error": "Missing meal_type or food_description"}), 400
+    if not all([clerk_user_id, meal_type, food_description]):
+        return jsonify({"error": "Missing required fields: clerk_user_id, meal_type, or food_description"}), 400
     
     # Coalesce None to 0 for numerical fields
     calories = float(calories or 0)
@@ -801,6 +1002,9 @@ def log_meal():
     fiber = float(fiber or 0)
 
     try:
+        # Get the database user_id from clerk_user_id
+        user_id = get_user_id_from_clerk(clerk_user_id)
+        
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with engine.connect() as conn:
             # Updated SQL query with all nutritional columns
@@ -836,12 +1040,223 @@ def log_meal():
             )
             print("✅ Added meal log to ChromaDB memory.")
         return jsonify({"message": "Meal logged successfully"}), 200
+    except ValueError as e:
+        print(f"User lookup error: {e}")
+        return jsonify({"error": "User not found"}), 404
     except Exception as e:
         print(f"Error logging meal: {e}")
         # Provide a more specific error message if it's a known schema issue
         if "Unknown column" in str(e):
              return jsonify({"error": "Database schema error. Make sure the 'food_log' table has columns for protein, fat, sugar, and fiber."}), 500
         return jsonify({"error": "Failed to log meal data."}), 500
+
+# New endpoint for fetching recent meal data
+@app.route('/api/recent-meal', methods=['GET'])
+def get_recent_meal():
+    """Get the most recent meal logged by the user with enhanced logging"""
+    try:
+        clerk_user_id = request.args.get('clerk_user_id', type=str)
+        
+        if not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "clerk_user_id is required"
+            }), 400
+        
+        # Get the database user_id from clerk_user_id
+        try:
+            user_id = get_user_id_from_clerk(clerk_user_id)
+            print(f"🔍 Fetching recent meal for user_id: {user_id} (clerk_user_id: {clerk_user_id})")
+        except ValueError as e:
+            print(f"❌ User lookup failed for clerk_user_id: {clerk_user_id}")
+            return jsonify({
+                "success": False,
+                "error": "User not found"
+            }), 404
+        
+        with engine.connect() as conn:
+            # Fetch the most recent meal for the user
+            recent_meal = conn.execute(text("""
+                SELECT food_description, meal_type, timestamp, carbs, calories
+                FROM food_log 
+                WHERE user_id = :user_id 
+                ORDER BY timestamp DESC 
+                LIMIT 1
+            """), {'user_id': user_id}).fetchone()
+            
+            if recent_meal:
+                print(f"✅ Found recent meal: {recent_meal.food_description[:50]}... at {recent_meal.timestamp}")
+                return jsonify({
+                    "success": True,
+                    "meal": {
+                        "food_description": recent_meal.food_description,
+                        "meal_type": recent_meal.meal_type,
+                        "timestamp": recent_meal.timestamp.isoformat(),
+                        "carbs": float(recent_meal.carbs or 0),
+                        "calories": float(recent_meal.calories or 0)
+                    }
+                }), 200
+            else:
+                print(f"⚠️ No meals found for user_id: {user_id}")
+                return jsonify({
+                    "success": True,
+                    "meal": None
+                }), 200
+                
+    except Exception as e:
+        print(f"💥 Error fetching recent meal: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Failed to fetch recent meal data"
+        }), 500
+
+@app.route('/api/extract-food-items', methods=['POST'])
+def extract_food_items():
+    """
+    Extract core food items from meal descriptions using Gemini AI.
+    This endpoint intelligently parses meal descriptions to extract only
+    the main food items, removing generic words and descriptions.
+    """
+    try:
+        data = request.json
+        food_description = data.get('food_description', '').strip()
+        
+        if not food_description:
+            return jsonify({
+                "success": False,
+                "error": "food_description is required"
+            }), 400
+        
+        # If the description is very short (1-3 words), return as-is with basic cleaning
+        words = food_description.split()
+        if len(words) <= 3:
+            # Basic cleaning for short descriptions
+            cleaned = food_description.strip().lower()
+            # Remove common generic words even from short descriptions
+            generic_words = ['simple', 'wholesome', 'meal', 'tasty', 'delicious', 'healthy', 'fresh']
+            for word in generic_words:
+                cleaned = cleaned.replace(word, '').strip()
+            
+            # Capitalize properly
+            result = ' '.join([w.capitalize() for w in cleaned.split() if w])
+            return jsonify({
+                "success": True,
+                "extracted_items": result or food_description.strip(),
+                "method": "basic_cleaning"
+            }), 200
+        
+        # For longer descriptions, use Gemini if available
+        if gemini_model:
+            try:
+                prompt = f"""
+Extract only the core food items from this meal description. Follow these rules:
+
+1. Extract ONLY actual food names (e.g., "rice", "chicken curry", "roti", "salad")
+2. Remove ALL generic descriptive words like: simple, wholesome, meal, Indian, tasty, delicious, healthy, fresh, good, nice, etc.
+3. Remove quantity words like: bowl, plate, cup, serving, etc.
+4. Remove cooking methods unless they're part of the food name (e.g., "fried rice" is OK, but "boiled" alone is not)
+5. Keep specific dish names intact (e.g., "chicken curry", "dal tadka")
+6. Limit to 8-10 words maximum
+7. Return only the food items, separated by commas if multiple items
+
+Meal description: "{food_description}"
+
+Return only the extracted food items, nothing else:
+"""
+                
+                response = gemini_model.generate_content(prompt)
+                extracted_items = response.text.strip()
+                
+                # Clean up the response
+                extracted_items = extracted_items.replace('**', '').replace('*', '').strip()
+                
+                # Remove any remaining generic words that might have slipped through
+                generic_words = ['simple', 'wholesome', 'meal', 'indian', 'tasty', 'delicious', 
+                               'healthy', 'fresh', 'good', 'nice', 'traditional', 'typical',
+                               'homemade', 'prepared', 'cooked', 'served', 'today', 'yesterday']
+                
+                words = extracted_items.lower().split()
+                filtered_words = [word.strip(',') for word in words if word.strip(',') not in generic_words]
+                
+                # Reconstruct with proper capitalization
+                result = ' '.join([w.capitalize() for w in filtered_words if w])
+                
+                print(f"✅ Gemini extracted food items: '{result}' from '{food_description}'")
+                
+                return jsonify({
+                    "success": True,
+                    "extracted_items": result,
+                    "method": "gemini_extraction"
+                }), 200
+                
+            except Exception as e:
+                print(f"❌ Gemini extraction failed: {e}")
+                # Fall back to rule-based extraction
+        
+        # Fallback rule-based extraction when Gemini is not available
+        def rule_based_extraction(description):
+            # Convert to lowercase for processing
+            text = description.lower().strip()
+            
+            # Remove common prefixes
+            prefixes_to_remove = [
+                r'^(i had|i ate|today i had|for my|my|the|a|an)\s+',
+                r'^(breakfast|lunch|dinner|snack):\s*',
+                r'^(this morning|this afternoon|this evening|tonight|today|yesterday)\s+',
+                r'^(simple|wholesome|tasty|delicious|healthy|fresh|good|nice)\s+',
+                r'^(traditional|typical|homemade|prepared|cooked|served)\s+'
+            ]
+            
+            for prefix in prefixes_to_remove:
+                text = re.sub(prefix, '', text)
+            
+            # Remove sentence endings
+            text = re.sub(r'[.!?]+$', '', text).strip()
+            
+            # Split into words and filter out generic words
+            words = text.split()
+            
+            # Generic words to remove
+            generic_words = {
+                'simple', 'wholesome', 'meal', 'indian', 'tasty', 'delicious', 
+                'healthy', 'fresh', 'good', 'nice', 'traditional', 'typical',
+                'homemade', 'prepared', 'cooked', 'served', 'today', 'yesterday',
+                'bowl', 'plate', 'cup', 'serving', 'portion', 'small', 'large',
+                'big', 'little', 'hot', 'cold', 'warm', 'spicy', 'mild'
+            }
+            
+            # Keep important food-related words and connecting words
+            filtered_words = []
+            for word in words:
+                clean_word = word.strip('.,!?()[]{}";:')
+                if clean_word and clean_word not in generic_words:
+                    filtered_words.append(clean_word)
+            
+            # Limit to 8 words
+            filtered_words = filtered_words[:8]
+            
+            # Capitalize properly
+            result = ' '.join([w.capitalize() for w in filtered_words])
+            
+            return result
+        
+        extracted = rule_based_extraction(food_description)
+        
+        print(f"✅ Rule-based extracted food items: '{extracted}' from '{food_description}'")
+        
+        return jsonify({
+            "success": True,
+            "extracted_items": extracted or food_description.strip(),
+            "method": "rule_based_extraction"
+        }), 200
+        
+    except Exception as e:
+        print(f"💥 Error extracting food items: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Failed to extract food items",
+            "extracted_items": data.get('food_description', '').strip()
+        }), 500
 
 # New endpoint for logging activity data
 @app.route('/api/log-activity', methods=['POST'])
@@ -850,7 +1265,7 @@ def log_activity():
     create_activity_log_table()
     
     data = request.json
-    user_id = 1 # Assuming user_id 1 for now
+    clerk_user_id = data.get('clerk_user_id')
     activity_type = data.get('activity_type')
     duration_minutes = data.get('duration_minutes')
     steps = data.get('steps', 0) # Optional
@@ -858,10 +1273,13 @@ def log_activity():
     # Assuming activity is logged at current time
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-    if not all([activity_type, duration_minutes]):
-        return jsonify({"error": "Missing activity details"}), 400
+    if not all([clerk_user_id, activity_type, duration_minutes]):
+        return jsonify({"error": "Missing required fields: clerk_user_id, activity_type, or duration_minutes"}), 400
     
     try:
+        # Get the database user_id from clerk_user_id
+        user_id = get_user_id_from_clerk(clerk_user_id)
+        
         with engine.connect() as conn:
             conn.execute(text("""
                 INSERT INTO activity_log (user_id, timestamp, activity_type, duration_minutes, steps, calories_burned)
@@ -869,6 +1287,9 @@ def log_activity():
             """), {'user_id': user_id, 'timestamp': timestamp, 'activity_type': activity_type, 'duration_minutes': duration_minutes, 'steps': steps, 'calories_burned': calories_burned})
             conn.commit()
         return jsonify({"message": "Activity logged successfully"}), 200
+    except ValueError as e:
+        print(f"User lookup error: {e}")
+        return jsonify({"error": "User not found"}), 404
     except Exception as e:
         print(f"Error logging activity: {e}")
         return jsonify({"error": "Failed to log activity data."}), 500
@@ -882,14 +1303,24 @@ def predict_glucose():
     recent_carbs = data.get('recent_carbs', 0) 
     recent_activity_minutes = data.get('recent_activity_minutes', 0)
     recent_sleep_quality = data.get('recent_sleep_quality', 'average')
+    clerk_user_id = data.get('clerk_user_id')
 
     if current_glucose is None:
         return jsonify({"error": "Current glucose level is required."}), 400
+    
+    if not clerk_user_id:
+        return jsonify({"error": "clerk_user_id is required."}), 400
 
     if not nixtla_client:
         return jsonify({"error": "Nixtla TimeGPT is not initialized. Please check backend logs."}), 503
 
     try:
+        # Get the database user_id from clerk_user_id
+        try:
+            user_id = get_user_id_from_clerk(clerk_user_id)
+        except ValueError as e:
+            return jsonify({"error": f"User not found: {str(e)}"}), 404
+        
         # --- ROBUST DATA PREPARATION PIPELINE ---
         
         # Define prediction frequency and a rounded 'now' timestamp for alignment
@@ -898,7 +1329,6 @@ def predict_glucose():
 
         # 1. Fetch historical data for a sufficient lookback period
         lookback_days = 30
-        user_id = 1 # Hardcoded for now
         history_start_date = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
         with engine.connect() as conn:
@@ -923,10 +1353,10 @@ def predict_glucose():
                 WHERE user_id = :user_id AND timestamp >= :start_date AND duration_minutes > 0
             """), conn, params={'user_id': user_id, 'start_date': history_start_date}, parse_dates=['timestamp'])
 
-            # Fetch step count data
+            # Fetch step count data from DISPLAY table (consistent with dashboard)
             steps_df = pd.read_sql(text("""
                 SELECT start_date as timestamp, value as steps
-                FROM health_data_archive
+                FROM health_data_display
                 WHERE user_id = :user_id AND data_type = 'StepCount'
                   AND start_date >= :start_date AND value > 0
             """), conn, params={'user_id': user_id, 'start_date': history_start_date}, parse_dates=['timestamp'])
@@ -934,7 +1364,7 @@ def predict_glucose():
             # Fetch workout data to create a binary flag for when user is in a formal workout
             workout_df = pd.read_sql(text("""
                 SELECT start_date, end_date
-                FROM health_data_archive
+                FROM health_data_display
                 WHERE user_id = :user_id AND data_type = 'Workout'
                   AND start_date >= :start_date
             """), conn, params={'user_id': user_id, 'start_date': history_start_date}, parse_dates=['start_date', 'end_date'])
@@ -1667,7 +2097,18 @@ def log_medication():
     create_medication_log_table()
     
     data = request.json
-    user_id = 1 # Assuming user_id 1 for now
+    clerk_user_id = data.get('clerk_user_id')
+    
+    if not clerk_user_id:
+        return jsonify({"error": "clerk_user_id is required"}), 400
+    
+    try:
+        # Get the database user_id from clerk_user_id
+        user_id = get_user_id_from_clerk(clerk_user_id)
+    except ValueError as e:
+        print(f"User lookup error: {e}")
+        return jsonify({"error": "User not found"}), 404
+    
     medication_type = data.get('medication_type')
     medication_name = data.get('medication_name')
     dosage = data.get('dosage')
@@ -1708,6 +2149,140 @@ def log_medication():
         print(f"Error logging medication: {e}")
         return jsonify({"error": "Failed to log medication data."}), 500
 
+# New endpoint for logging basal dose data
+@app.route('/api/log-basal-dose', methods=['POST'])
+def log_basal_dose():
+    # Ensure the basal_dose_logs table exists
+    create_basal_dose_logs_table()
+    
+    data = request.json
+    clerk_user_id = data.get('clerk_user_id')
+    insulin_name = data.get('insulin_name')
+    dose_units = data.get('dose_units')
+    log_time_str = data.get('timestamp')  # Optional - if not provided, use current time
+
+    if not all([clerk_user_id, insulin_name, dose_units]):
+        return jsonify({"error": "Missing required fields: clerk_user_id, insulin_name, or dose_units"}), 400
+    
+    # Validate and convert dose_units to float
+    try:
+        dose_units = float(dose_units)
+        if dose_units <= 0:
+            return jsonify({"error": "Dose must be a positive number"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid dose format. Must be a number"}), 400
+    
+    try:
+        # Get the database user_id from clerk_user_id
+        user_id = get_user_id_from_clerk(clerk_user_id)
+        
+        # Use provided timestamp or current time
+        if log_time_str:
+            # Parse ISO timestamp and convert to MySQL-compatible format
+            try:
+                # Handle ISO format with Z suffix
+                if log_time_str.endswith('Z'):
+                    parsed_dt = datetime.fromisoformat(log_time_str.replace('Z', '+00:00'))
+                else:
+                    parsed_dt = datetime.fromisoformat(log_time_str)
+                timestamp = parsed_dt.strftime('%Y-%m-%d %H:%M:%S')
+                print(f"✅ Parsed timestamp from {log_time_str} to {timestamp}")
+            except ValueError as e:
+                # Fallback to current time if parsing fails
+                print(f"⚠️ Failed to parse timestamp {log_time_str}: {e}")
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO basal_dose_logs (user_id, timestamp, insulin_name, dose_units)
+                VALUES (:user_id, :timestamp, :insulin_name, :dose_units)
+            """), {
+                'user_id': user_id,
+                'timestamp': timestamp,
+                'insulin_name': insulin_name,
+                'dose_units': dose_units
+            })
+            conn.commit()
+        return jsonify({"message": "Basal dose logged successfully"}), 200
+    except ValueError as e:
+        print(f"User lookup error: {e}")
+        return jsonify({"error": "User not found"}), 404
+    except Exception as e:
+        print(f"Error logging basal dose: {e}")
+        return jsonify({"error": "Failed to log basal dose data."}), 500
+
+# New endpoint for fetching basal dose history
+@app.route('/api/basal-dose-history', methods=['GET'])
+def get_basal_dose_history():
+    """Fetch basal dose history for the last 14 days for a specific user"""
+    try:
+        user_id = request.args.get('user_id', type=int)
+        clerk_user_id = request.args.get('clerk_user_id', type=str)
+        
+        # Require either user_id or clerk_user_id
+        if not user_id and not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "Either user_id or clerk_user_id is required"
+            }), 400
+        
+        # If we have clerk_user_id but no user_id, resolve it
+        if clerk_user_id and not user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 404
+        
+        # Calculate date range for last 14 days
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=14)
+        
+        with engine.connect() as conn:
+            basal_records = conn.execute(text("""
+                SELECT timestamp, insulin_name, dose_units 
+                FROM basal_dose_logs 
+                WHERE user_id = :user_id AND timestamp >= :start_date
+                ORDER BY timestamp DESC
+            """), {
+                'user_id': user_id, 
+                'start_date': start_date.strftime('%Y-%m-%d %H:%M:%S')
+            }).fetchall()
+            
+            # Convert to list of dictionaries for JSON response
+            basal_logs = []
+            for record in basal_records:
+                basal_logs.append({
+                    'timestamp': record.timestamp.isoformat(),
+                    'insulin_name': record.insulin_name,
+                    'dose_units': float(record.dose_units)
+                })
+            
+            return jsonify({
+                'success': True,
+                'basal_logs': basal_logs,
+                'summary': {
+                    'total_entries': len(basal_logs),
+                    'date_range': {
+                        'start_date': start_date.isoformat(),
+                        'end_date': end_date.isoformat(),
+                        'days_back': 14
+                    }
+                }
+            }), 200
+            
+    except Exception as e:
+        print(f"Error fetching basal dose history: {e}")
+        return jsonify({
+            'success': False,
+            'error': f'Failed to fetch basal dose history: {str(e)}',
+            'basal_logs': []
+        }), 500
+
 # ---------------------------------------------------------------------
 # Sleep summary helpers
 # ---------------------------------------------------------------------
@@ -1741,10 +2316,10 @@ def refresh_sleep_summary(user_id: int = 1):
     """Recalculate sleep summary rows for a user using ACTUAL sleep session data, filtering out scheduled times."""
     try:
         with engine.begin() as conn:
-            # Get all raw sleep analysis samples for the user
+            # Get all raw sleep analysis samples for the user from DISPLAY table
             raw_sleep_records = conn.execute(text("""
                 SELECT start_date, end_date, metadata, value
-                FROM health_data_archive
+                FROM health_data_display
                 WHERE data_type = 'SleepAnalysis' AND user_id = :uid
                 ORDER BY start_date
             """), {"uid": user_id}).fetchall()
@@ -2060,13 +2635,34 @@ def refresh_sleep_summary(user_id: int = 1):
 def get_diabetes_dashboard():
     """Provides a comprehensive summary for the diabetes dashboard."""
     try:
-        user_id = request.args.get('user_id', 1, type=int)
+        user_id = request.args.get('user_id', type=int)
+        clerk_user_id = request.args.get('clerk_user_id', type=str)
         days = request.args.get('days', 15, type=int)
+        
+        # Require either user_id or clerk_user_id
+        if not user_id and not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "Either user_id or clerk_user_id is required"
+            }), 400
+        
+        # If we have clerk_user_id but no user_id, resolve it
+        if clerk_user_id and not user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 404
         
         end_date = date.today()
         start_date = end_date - timedelta(days=days)
         start_of_range_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
 
+        # Ensure user's data is properly migrated from display to archive table if needed
+        migrate_display_to_archive_for_user(user_id)
+        
         with engine.connect() as conn:
             # --- 1. GLUCOSE DATA ---
             glucose_query = text("""
@@ -2137,10 +2733,10 @@ def get_diabetes_dashboard():
             avg_sleep_hours = sum(s['sleep_hours'] for s in sleep_data if s['has_data']) / len([s for s in sleep_data if s['has_data']]) if any(s['has_data'] for s in sleep_data) else 0
 
             # --- 5. ACTIVITY DATA (STEPS + CALORIES FROM APPLE HEALTH + MANUAL) ---
-            # Get Apple Health step data
+            # Get Apple Health step data from DISPLAY table (fast dashboard access)
             apple_steps_query = text("""
                 SELECT DATE(start_date) as date, SUM(CAST(value AS DECIMAL(10,2))) as total_steps 
-                FROM health_data_archive
+                FROM health_data_display
                 WHERE user_id = :user_id AND data_type = 'StepCount' 
                   AND start_date >= :start_date
                 GROUP BY DATE(start_date)
@@ -2148,10 +2744,10 @@ def get_diabetes_dashboard():
             """)
             apple_step_records = conn.execute(apple_steps_query, {'user_id': user_id, 'start_date': start_of_range_dt}).fetchall()
             
-            # Get Apple Health active calories burned data
+            # Get Apple Health active calories burned data from DISPLAY table
             apple_calories_query = text("""
                 SELECT DATE(start_date) as date, SUM(CAST(value AS DECIMAL(10,2))) as total_calories 
-                FROM health_data_archive
+                FROM health_data_display
                 WHERE user_id = :user_id AND data_type = 'ActiveEnergyBurned' 
                   AND start_date >= :start_date
                 GROUP BY DATE(start_date)
@@ -2171,11 +2767,11 @@ def get_diabetes_dashboard():
             """)
             manual_activity_records = conn.execute(manual_activity_query, {'user_id': user_id, 'start_date': start_date}).fetchall()
             
-            # Get Apple Health workout durations (in minutes)
+            # Get Apple Health workout durations (in minutes) from DISPLAY table
             apple_workout_query = text("""
                 SELECT DATE(start_date) as date,
                        SUM(TIMESTAMPDIFF(MINUTE, start_date, end_date)) as total_minutes
-                FROM health_data_archive
+                FROM health_data_display
                 WHERE user_id = :user_id AND data_type = 'Workout'
                   AND start_date >= :start_date
                 GROUP BY DATE(start_date)
@@ -2252,10 +2848,10 @@ def get_diabetes_dashboard():
             print(f"🔥 CALORIES SUMMARY: {len(activity_data)} days, {total_calories} total calories, {int(avg_daily_calories)} avg daily")
 
             # --- 6. WALKING + RUNNING DISTANCE DATA ---
-            # Get Apple Health distance data
+            # Get Apple Health distance data from DISPLAY table
             apple_distance_query = text("""
                 SELECT DATE(start_date) as date, SUM(CAST(value AS DECIMAL(10,4))) as total_distance 
-                FROM health_data_archive
+                FROM health_data_display
                 WHERE user_id = :user_id AND data_type = 'DistanceWalkingRunning' 
                   AND start_date >= :start_date
                 GROUP BY DATE(start_date)
@@ -2323,14 +2919,35 @@ def get_activity_logs():
         # Ensure the activity_log table exists
         create_activity_log_table()
         
-        user_id = request.args.get('user_id', 1, type=int)
+        user_id = request.args.get('user_id', type=int)
+        clerk_user_id = request.args.get('clerk_user_id', type=str)
         days_back = request.args.get('days', 30, type=int)
+        
+        # Require either user_id or clerk_user_id
+        if not user_id and not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "Either user_id or clerk_user_id is required"
+            }), 400
+        
+        # If we have clerk_user_id but no user_id, resolve it
+        if clerk_user_id and not user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 404
         
         # Calculate date range
         end_date = date.today()
         start_date = end_date - timedelta(days=days_back)
         
         activity_logs = []
+        
+        # Ensure user's data is properly migrated from display to archive table if needed
+        migrate_display_to_archive_for_user(user_id)
         
         with engine.connect() as conn:
             # 1. MANUAL ACTIVITY LOGS from activity_log table
@@ -2379,7 +2996,7 @@ def get_activity_logs():
             
             print(f"📈 Total activities for user {user_id}: {total_activities[0]}, Latest: {total_activities[1]}")
 
-            # 2. APPLE HEALTH WORKOUT DATA from health_data_archive table (simplified - disabled for now to avoid GROUP BY issues)
+            # 2. APPLE HEALTH WORKOUT DATA from health_data_display table (fast dashboard access)
             try:
                 apple_workouts = conn.execute(text("""
                     SELECT 
@@ -2420,7 +3037,7 @@ def get_activity_logs():
                         END as distance_km,
                         'Apple Health Workout' as source,
                         start_date as sort_timestamp
-                    FROM health_data_archive 
+                    FROM health_data_display 
                     WHERE user_id = :user_id 
                       AND data_type = 'Workout'
                       AND DATE(start_date) BETWEEN :start_date AND :end_date
@@ -2431,7 +3048,7 @@ def get_activity_logs():
                 print(f"⚠️ Apple Health workouts query failed: {e}")
                 apple_workouts = []
 
-            # 3. APPLE HEALTH STEP COUNT DATA (daily summaries)
+            # 3. APPLE HEALTH STEP COUNT DATA (daily summaries) from DISPLAY table
             try:
                 apple_steps = conn.execute(text("""
                     SELECT 
@@ -2453,7 +3070,7 @@ def get_activity_logs():
                         SELECT 
                             DATE(start_date) as date_col,
                             SUM(value) as total_steps
-                        FROM health_data_archive 
+                        FROM health_data_display 
                         WHERE user_id = :user_id 
                           AND data_type = 'StepCount'
                           AND DATE(start_date) BETWEEN :start_date AND :end_date
@@ -2471,7 +3088,7 @@ def get_activity_logs():
                 print(f"⚠️ Apple Health steps query failed: {e}")
                 apple_steps = []
 
-            # 4. APPLE HEALTH DISTANCE DATA (daily summaries)
+            # 4. APPLE HEALTH DISTANCE DATA (daily summaries) from DISPLAY table
             try:
                 apple_distance = conn.execute(text("""
                     SELECT 
@@ -2493,7 +3110,7 @@ def get_activity_logs():
                         SELECT 
                             DATE(start_date) as date_col,
                             SUM(value) / 1000 as total_distance_km
-                        FROM health_data_archive 
+                        FROM health_data_display 
                         WHERE user_id = :user_id 
                           AND data_type = 'DistanceWalkingRunning'
                           AND DATE(start_date) BETWEEN :start_date AND :end_date
@@ -2511,7 +3128,7 @@ def get_activity_logs():
                 print(f"⚠️ Apple Health distance query failed: {e}")
                 apple_distance = []
             
-            # Debug: Check what step data exists in health_data_archive table
+            # Debug: Check what step data exists in health_data_display table (dashboard data source)
             try:
                 step_debug = conn.execute(text("""
                     SELECT 
@@ -2523,7 +3140,7 @@ def get_activity_logs():
                         MIN(value) as min_value,
                         MAX(value) as max_value,
                         MAX(unit) as unit
-                    FROM health_data_archive 
+                    FROM health_data_display 
                     WHERE user_id = :user_id 
                       AND data_type IN ('StepCount', 'ActiveEnergyBurned', 'DistanceWalkingRunning')
                       AND DATE(start_date) >= :debug_start_date
@@ -2661,8 +3278,26 @@ def get_activity_logs():
 def get_glucose_history():
     """Fetch glucose history from the database for chart visualization"""
     try:
-        user_id = request.args.get('user_id', 1, type=int)
+        user_id = request.args.get('user_id', type=int)
+        clerk_user_id = request.args.get('clerk_user_id', type=str)
         days_back = request.args.get('days', 7, type=int)  # Default to last 7 days
+        
+        # Require either user_id or clerk_user_id
+        if not user_id and not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "Either user_id or clerk_user_id is required"
+            }), 400
+        
+        # If we have clerk_user_id but no user_id, resolve it
+        if clerk_user_id and not user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 404
         
         # Calculate date range
         end_date = datetime.now()
@@ -2718,6 +3353,213 @@ def health_check():
         "message": "SugarSense.ai backend is running",
         "version": "1.0.0"
     }), 200
+
+# User Registration and Management Endpoints
+@app.route('/api/register-user', methods=['POST'])
+def register_user():
+    """
+    Register a new user or get existing user information
+    Called immediately after successful Clerk authentication
+    """
+    try:
+        data = request.json
+        
+        # Validate required fields
+        clerk_user_id = data.get('clerk_user_id')
+        email = data.get('email')
+        
+        if not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "clerk_user_id is required"
+            }), 400
+            
+        if not email:
+            return jsonify({
+                "success": False,
+                "error": "email is required"
+            }), 400
+        
+        # Optional fields
+        full_name = data.get('full_name')
+        profile_image_url = data.get('profile_image_url')
+        
+        # Get or create user
+        user_info = get_or_create_user(
+            clerk_user_id=clerk_user_id,
+            email=email,
+            full_name=full_name,
+            profile_image_url=profile_image_url
+        )
+        
+        return jsonify({
+            "success": True,
+            "user_id": user_info["user_id"],
+            "onboarding_completed": user_info["onboarding_completed"],
+            "created": user_info["created"],
+            "message": "User registered successfully" if user_info["created"] else "User retrieved successfully"
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in register_user: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Failed to register user: {str(e)}"
+        }), 500
+
+@app.route('/api/user-profile', methods=['GET'])
+def get_user_profile():
+    """
+    Get user profile information by clerk_user_id
+    """
+    try:
+        clerk_user_id = request.args.get('clerk_user_id')
+        
+        if not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "clerk_user_id parameter is required"
+            }), 400
+        
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT * FROM users WHERE clerk_user_id = :clerk_user_id
+            """), {'clerk_user_id': clerk_user_id}).fetchone()
+            
+            if not result:
+                return jsonify({
+                    "success": False,
+                    "error": "User not found"
+                }), 404
+            
+            # Convert result to dictionary
+            user_data = {
+                "user_id": result.user_id,
+                "clerk_user_id": result.clerk_user_id,
+                "email": result.email,
+                "full_name": result.full_name,
+                "profile_image_url": result.profile_image_url,
+                "onboarding_completed": bool(result.onboarding_completed),
+                "created_at": result.created_at.isoformat() if result.created_at else None,
+                "last_active_at": result.last_active_at.isoformat() if result.last_active_at else None,
+                # Additional demographic & device preference fields so the client can pre-fill the edit profile form
+                "gender": result.gender,
+                "height_value": float(result.height_value) if getattr(result, "height_value", None) is not None else None,
+                "height_unit": result.height_unit,
+                "weight_value": float(result.weight_value) if getattr(result, "weight_value", None) is not None else None,
+                "weight_unit": result.weight_unit,
+                "cgm_model": result.cgm_model,
+                "pump_model": result.pump_model,
+                # Diabetes-related fields
+                "has_diabetes": result.has_diabetes,
+                "diabetes_type": result.diabetes_type,
+                "year_of_diagnosis": int(result.year_of_diagnosis) if result.year_of_diagnosis else None,
+                "uses_insulin": result.uses_insulin,
+                "insulin_type": result.insulin_type,
+                "daily_basal_dose": float(result.daily_basal_dose) if result.daily_basal_dose else None,
+                "insulin_to_carb_ratio": float(result.insulin_to_carb_ratio) if result.insulin_to_carb_ratio else None,
+            }
+            
+            return jsonify({
+                "success": True,
+                "user": user_data
+            }), 200
+            
+    except Exception as e:
+        print(f"Error in get_user_profile: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Failed to get user profile: {str(e)}"
+        }), 500
+
+@app.route('/api/save-onboarding-data', methods=['POST'])
+def save_onboarding_data():
+    """
+    Save user onboarding data and mark onboarding as completed
+    """
+    try:
+        data = request.json
+        
+        # Validate required fields
+        clerk_user_id = data.get('clerk_user_id')
+        if not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "clerk_user_id is required"
+            }), 400
+        
+        # Get the database user_id from clerk_user_id
+        user_id = get_user_id_from_clerk(clerk_user_id)
+        
+        with engine.connect() as conn:
+            # Update user with onboarding data
+            update_query = text("""
+                UPDATE users SET 
+                    date_of_birth = :date_of_birth,
+                    gender = :gender,
+                    height_value = :height_value,
+                    height_unit = :height_unit,
+                    weight_value = :weight_value,
+                    weight_unit = :weight_unit,
+                    has_diabetes = :has_diabetes,
+                    diabetes_type = :diabetes_type,
+                    year_of_diagnosis = :year_of_diagnosis,
+                    uses_insulin = :uses_insulin,
+                    insulin_type = :insulin_type,
+                    daily_basal_dose = :daily_basal_dose,
+                    insulin_to_carb_ratio = :insulin_to_carb_ratio,
+                    cgm_status = :cgm_status,
+                    cgm_model = :cgm_model,
+                    insulin_delivery_status = :insulin_delivery_status,
+                    pump_model = :pump_model,
+                    onboarding_completed = TRUE,
+                    onboarding_completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE user_id = :user_id
+            """)
+            
+            conn.execute(update_query, {
+                'user_id': user_id,
+                'date_of_birth': data.get('date_of_birth'),
+                'gender': data.get('gender'),
+                'height_value': data.get('height_value'),
+                'height_unit': data.get('height_unit'),
+                'weight_value': data.get('weight_value'),
+                'weight_unit': data.get('weight_unit'),
+                'has_diabetes': data.get('has_diabetes'),
+                'diabetes_type': data.get('diabetes_type'),
+                'year_of_diagnosis': data.get('year_of_diagnosis'),
+                'uses_insulin': data.get('uses_insulin'),
+                'insulin_type': data.get('insulin_type'),
+                'daily_basal_dose': data.get('daily_basal_dose'),
+                'insulin_to_carb_ratio': data.get('insulin_to_carb_ratio'),
+                'cgm_status': data.get('cgm_status'),
+                'cgm_model': data.get('cgm_model'),
+                'insulin_delivery_status': data.get('insulin_delivery_status'),
+                'pump_model': data.get('pump_model')
+            })
+            conn.commit()
+            
+            print(f"✅ Onboarding data saved for user_id {user_id} (clerk_user_id: {clerk_user_id})")
+            
+        return jsonify({
+            "success": True,
+            "message": "Onboarding data saved successfully",
+            "user_id": user_id
+        }), 200
+        
+    except ValueError as e:
+        print(f"User lookup error: {e}")
+        return jsonify({
+            "success": False,
+            "error": "User not found"
+        }), 404
+    except Exception as e:
+        print(f"Error saving onboarding data: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Failed to save onboarding data: {str(e)}"
+        }), 500
 
 # Network diagnostic endpoint
 @app.route('/api/network-test', methods=['GET'])
@@ -3431,10 +4273,10 @@ def get_improved_sleep_data(user_id: int = 1, days_back: int = 25):
         with engine.connect() as conn:
             start_date_dt = datetime.now(timezone.utc) - timedelta(days=days_back)
             
-            # Fetch all raw sleep analysis records
+            # Fetch all raw sleep analysis records from DISPLAY table
             raw_sleep_query = text("""
                 SELECT start_date, end_date, value, metadata
-                FROM health_data_archive
+                FROM health_data_display
                 WHERE data_type = 'SleepAnalysis' AND user_id = :uid
                   AND end_date >= :start_date
                 ORDER BY end_date
@@ -3930,6 +4772,71 @@ def improved_sleep_analysis():
 #             "message": "Failed to clean simulated entries"
 #         }), 500
 
+def migrate_display_to_archive_for_user(user_id: int) -> int:
+    """
+    Migrate health data from health_data_display to health_data_archive for users who only have display data.
+    This fixes the issue where new users have data in display but not archive tables.
+    """
+    try:
+        with engine.connect() as conn:
+            # Check if user has any data in archive table
+            archive_count = conn.execute(text("""
+                SELECT COUNT(*) as count
+                FROM health_data_archive
+                WHERE user_id = :user_id
+            """), {'user_id': user_id}).fetchone()
+            
+            # Check if user has data in display table
+            display_count = conn.execute(text("""
+                SELECT COUNT(*) as count
+                FROM health_data_display
+                WHERE user_id = :user_id
+            """), {'user_id': user_id}).fetchone()
+            
+            archive_records = archive_count.count if archive_count else 0
+            display_records = display_count.count if display_count else 0
+            
+            print(f"📊 User {user_id}: Archive={archive_records}, Display={display_records}")
+            
+            # If user has display data but little/no archive data, migrate
+            if display_records > 0 and archive_records < display_records:
+                print(f"🔄 Migrating {display_records} records from display to archive for user {user_id}")
+                
+                # Copy all records from display to archive (with upsert to handle conflicts)
+                migration_query = text("""
+                    INSERT INTO health_data_archive (
+                        user_id, data_type, data_subtype, value, value_string, unit,
+                        start_date, end_date, source_name, source_bundle_id, device_name, 
+                        sample_id, category_type, workout_activity_type, total_energy_burned,
+                        total_distance, average_quantity, minimum_quantity, maximum_quantity, metadata
+                    )
+                    SELECT 
+                        user_id, data_type, data_subtype, value, value_string, unit,
+                        start_date, end_date, source_name, source_bundle_id, device_name, 
+                        sample_id, category_type, workout_activity_type, total_energy_burned,
+                        total_distance, average_quantity, minimum_quantity, maximum_quantity, metadata
+                    FROM health_data_display
+                    WHERE user_id = :user_id
+                    ON DUPLICATE KEY UPDATE
+                        value = VALUES(value),
+                        value_string = VALUES(value_string),
+                        metadata = VALUES(metadata)
+                """)
+                
+                result = conn.execute(migration_query, {'user_id': user_id})
+                conn.commit()
+                
+                migrated_count = result.rowcount
+                print(f"✅ Successfully migrated {migrated_count} records for user {user_id}")
+                return migrated_count
+            else:
+                print(f"ℹ️ No migration needed for user {user_id}")
+                return 0
+                
+    except Exception as e:
+        print(f"❌ Error migrating data for user {user_id}: {e}")
+        return 0
+
 def auto_clean_health_data_duplicates(user_id: int = 1) -> int:
     """
     Automatically clean duplicates for critical health data types that are prone to duplication.
@@ -4322,7 +5229,25 @@ def get_todays_insights():
     3. Fallback to rule-based insights if LLM fails
     """
     try:
-        user_id = request.args.get('user_id', 1, type=int)
+        # Get user ID from query parameter or resolve from clerk_user_id
+        user_id = request.args.get('user_id', type=int)
+        clerk_user_id = request.args.get('clerk_user_id', type=str)
+        
+        if not user_id and not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "Either user_id or clerk_user_id is required"
+            }), 400
+        
+        # If we have clerk_user_id but no user_id, resolve it
+        if clerk_user_id and not user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 404
         
         print(f"🔍 Generating insights for user {user_id}...")
         
@@ -4659,10 +5584,10 @@ def analyze_activity_data(conn, user_id: int, today: date) -> dict:
         """), {'user_id': user_id, 'today': today}).fetchone()
         apple_steps = int(steps_data.total_steps or 0) if steps_data else 0
 
-        # Workout durations (in minutes)
+        # Workout durations (in minutes) from DISPLAY table
         workouts = conn.execute(text("""
             SELECT workout_activity_type, start_date, end_date
-            FROM health_data_archive
+            FROM health_data_display
             WHERE user_id = :user_id
               AND data_type = 'Workout'
               AND DATE(start_date) = :today
@@ -4980,11 +5905,73 @@ def generate_rule_based_insights(metrics: dict) -> list:
     # Sort by priority and limit to 3
     return sorted(insights, key=lambda x: x['priority'], reverse=True)[:3]
 
+@app.route('/api/migrate-user-health-data', methods=['POST'])
+def migrate_user_health_data():
+    """
+    Manually trigger migration of health data from display to archive table for a specific user.
+    This fixes the issue where users have data in health_data_display but not health_data_archive.
+    """
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id') if data else request.args.get('user_id', type=int)
+        clerk_user_id = data.get('clerk_user_id') if data else request.args.get('clerk_user_id', type=str)
+        
+        # Require either user_id or clerk_user_id
+        if not user_id and not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "Either user_id or clerk_user_id is required"
+            }), 400
+        
+        # If we have clerk_user_id but no user_id, resolve it
+        if clerk_user_id and not user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 404
+        
+        # Perform migration
+        migrated_count = migrate_display_to_archive_for_user(user_id)
+        
+        return jsonify({
+            "success": True,
+            "message": f"Migration completed for user {user_id}",
+            "migrated_records": migrated_count
+        })
+        
+    except Exception as e:
+        print(f"❌ Error in migration endpoint: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Migration failed: {str(e)}"
+        }), 500
+
 @app.route('/api/injection-site-recommendation', methods=['GET'])
 def get_injection_site_recommendation():
     """Get LLM-based injection site recommendation based on recent injection history"""
     try:
-        user_id = request.args.get('user_id', 1, type=int)
+        user_id = request.args.get('user_id', type=int)
+        clerk_user_id = request.args.get('clerk_user_id', type=str)
+        
+        # Require either user_id or clerk_user_id
+        if not user_id and not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "Either user_id or clerk_user_id is required"
+            }), 400
+        
+        # If we have clerk_user_id but no user_id, resolve it
+        if clerk_user_id and not user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 404
         
         # Fetch recent insulin injection history (last 10 entries)
         with engine.connect() as conn:
@@ -5122,6 +6109,269 @@ def get_rule_based_recommendation(injection_history):
         "history_count": len(injection_history),
         "fallback": True
     })
+
+@app.route('/api/update-user-profile', methods=['PUT'])
+def update_user_profile():
+    """
+    Update user profile data (Phase 1: Basic demographics and preferences)
+    """
+    try:
+        data = request.json
+        
+        # Validate required fields
+        clerk_user_id = data.get('clerk_user_id')
+        if not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "clerk_user_id is required"
+            }), 400
+        
+        # Get the database user_id from clerk_user_id
+        user_id = get_user_id_from_clerk(clerk_user_id)
+        
+        # Extract updateable fields (Phase 1: Basic info + diabetes info)
+        updateable_fields = {
+            'full_name': data.get('full_name'),
+            'email': data.get('email'),
+            'height_value': data.get('height_value'),
+            'height_unit': data.get('height_unit'),
+            'weight_value': data.get('weight_value'),
+            'weight_unit': data.get('weight_unit'),
+            'gender': data.get('gender'),
+            'cgm_model': data.get('cgm_model'),
+            'pump_model': data.get('pump_model'),
+            'profile_image_url': data.get('profile_image_url'),
+            # Diabetes-related fields
+            'has_diabetes': data.get('has_diabetes'),
+            'diabetes_type': data.get('diabetes_type'),
+            'year_of_diagnosis': data.get('year_of_diagnosis'),
+            'uses_insulin': data.get('uses_insulin'),
+            'insulin_type': data.get('insulin_type'),
+            'daily_basal_dose': data.get('daily_basal_dose'),
+            'insulin_to_carb_ratio': data.get('insulin_to_carb_ratio')
+        }
+        
+        # Remove None values to avoid updating fields that weren't provided
+        update_data = {k: v for k, v in updateable_fields.items() if v is not None}
+        
+        if not update_data:
+            return jsonify({
+                "success": False,
+                "error": "No valid fields provided for update"
+            }), 400
+        
+        # Validate data ranges
+        validation_errors = validate_profile_update_data(update_data)
+        if validation_errors:
+            return jsonify({
+                "success": False,
+                "error": "Validation failed",
+                "validation_errors": validation_errors
+            }), 400
+        
+        # Build dynamic UPDATE query
+        set_clauses = []
+        params = {'user_id': user_id}
+        
+        for field, value in update_data.items():
+            set_clauses.append(f"{field} = :{field}")
+            params[field] = value
+        
+        # Add updated timestamp
+        set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+        
+        with engine.connect() as conn:
+            # Execute the update
+            update_query = text(f"""
+                UPDATE users SET 
+                {', '.join(set_clauses)}
+                WHERE user_id = :user_id
+            """)
+            
+            result = conn.execute(update_query, params)
+            
+            if result.rowcount == 0:
+                return jsonify({
+                    "success": False,
+                    "error": "User not found or no changes made"
+                }), 404
+            
+            conn.commit()
+            
+            # Return updated user data
+            updated_user = conn.execute(text("""
+                SELECT user_id, full_name, email, height_value, height_unit, 
+                       weight_value, weight_unit, gender, cgm_model, pump_model,
+                       profile_image_url, has_diabetes, diabetes_type, year_of_diagnosis,
+                       uses_insulin, insulin_type, daily_basal_dose, insulin_to_carb_ratio, updated_at
+                FROM users 
+                WHERE user_id = :user_id
+            """), {'user_id': user_id}).fetchone()
+            
+            print(f"✅ Profile updated for user_id {user_id}. Fields updated: {list(update_data.keys())}")
+            
+        return jsonify({
+            "success": True,
+            "message": "Profile updated successfully",
+            "updated_fields": list(update_data.keys()),
+            "user_data": {
+                "user_id": updated_user.user_id,
+                "full_name": updated_user.full_name,
+                "email": updated_user.email,
+                "height_value": float(updated_user.height_value) if updated_user.height_value else None,
+                "height_unit": updated_user.height_unit,
+                "weight_value": float(updated_user.weight_value) if updated_user.weight_value else None,
+                "weight_unit": updated_user.weight_unit,
+                "gender": updated_user.gender,
+                "cgm_model": updated_user.cgm_model,
+                "pump_model": updated_user.pump_model,
+                "profile_image_url": updated_user.profile_image_url,
+                "has_diabetes": updated_user.has_diabetes,
+                "diabetes_type": updated_user.diabetes_type,
+                "year_of_diagnosis": int(updated_user.year_of_diagnosis) if updated_user.year_of_diagnosis else None,
+                "uses_insulin": updated_user.uses_insulin,
+                "insulin_type": updated_user.insulin_type,
+                "daily_basal_dose": float(updated_user.daily_basal_dose) if updated_user.daily_basal_dose else None,
+                "insulin_to_carb_ratio": float(updated_user.insulin_to_carb_ratio) if updated_user.insulin_to_carb_ratio else None,
+                "updated_at": updated_user.updated_at.isoformat() if updated_user.updated_at else None
+            }
+        }), 200
+        
+    except ValueError as e:
+        print(f"User lookup error: {e}")
+        return jsonify({
+            "success": False,
+            "error": "User not found"
+        }), 404
+    except Exception as e:
+        print(f"Error updating user profile: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Failed to update profile: {str(e)}"
+        }), 500
+
+def validate_profile_update_data(data: dict) -> list:
+    """
+    Validate profile update data for Phase 1 fields
+    Returns list of validation errors
+    """
+    errors = []
+    
+    # Height validation
+    if 'height_value' in data:
+        height = data['height_value']
+        height_unit = data.get('height_unit', 'cm')
+        
+        try:
+            height = float(height)
+            if height_unit == 'cm':
+                if height < 50 or height > 250:
+                    errors.append("Height must be between 50-250 cm")
+            elif height_unit == 'ft':
+                if height < 2 or height > 8:
+                    errors.append("Height must be between 2-8 feet")
+        except (ValueError, TypeError):
+            errors.append("Height must be a valid number")
+    
+    # Weight validation
+    if 'weight_value' in data:
+        weight = data['weight_value']
+        weight_unit = data.get('weight_unit', 'kg')
+        
+        try:
+            weight = float(weight)
+            if weight_unit == 'kg':
+                if weight < 20 or weight > 300:
+                    errors.append("Weight must be between 20-300 kg")
+            elif weight_unit == 'lbs':
+                if weight < 40 or weight > 660:
+                    errors.append("Weight must be between 40-660 lbs")
+        except (ValueError, TypeError):
+            errors.append("Weight must be a valid number")
+    
+    # Email validation
+    if 'email' in data:
+        email = data['email']
+        if email and '@' not in email:
+            errors.append("Invalid email format")
+    
+    # Gender validation
+    if 'gender' in data:
+        gender = data['gender']
+        valid_genders = ['Male', 'Female', 'Other', 'Prefer not to say']
+        if gender and gender not in valid_genders:
+            errors.append(f"Gender must be one of: {', '.join(valid_genders)}")
+    
+    # CGM Model validation
+    if 'cgm_model' in data:
+        cgm = data['cgm_model']
+        valid_cgms = ['Dexcom G7 / One+', 'Dexcom G6 / G5 / One', 'Abbott Freestyle Libre']
+        if cgm and cgm not in valid_cgms:
+            errors.append(f"CGM model must be one of: {', '.join(valid_cgms)}")
+    
+    # Pump Model validation
+    if 'pump_model' in data:
+        pump = data['pump_model']
+        valid_pumps = ['Omnipod 5', 'Omnipod Dash']
+        if pump and pump not in valid_pumps:
+            errors.append(f"Pump model must be one of: {', '.join(valid_pumps)}")
+    
+    # Diabetes validation
+    if 'has_diabetes' in data:
+        has_diabetes = data['has_diabetes']
+        valid_options = ['Yes', 'No', 'Not sure']
+        if has_diabetes and has_diabetes not in valid_options:
+            errors.append(f"Has diabetes must be one of: {', '.join(valid_options)}")
+    
+    if 'diabetes_type' in data:
+        diabetes_type = data['diabetes_type']
+        valid_types = ['Type 1', 'Type 2', 'Gestational', 'Pre-diabetes', 'Not sure']
+        if diabetes_type and diabetes_type not in valid_types:
+            errors.append(f"Diabetes type must be one of: {', '.join(valid_types)}")
+    
+    if 'year_of_diagnosis' in data:
+        year = data['year_of_diagnosis']
+        if year:
+            try:
+                year_int = int(year)
+                if year_int < 1900 or year_int > 2025:
+                    errors.append("Year of diagnosis must be between 1900 and 2025")
+            except (ValueError, TypeError):
+                errors.append("Year of diagnosis must be a valid year")
+    
+    if 'uses_insulin' in data:
+        uses_insulin = data['uses_insulin']
+        valid_options = ['Yes', 'No']
+        if uses_insulin and uses_insulin not in valid_options:
+            errors.append(f"Uses insulin must be one of: {', '.join(valid_options)}")
+    
+    if 'insulin_type' in data:
+        insulin_type = data['insulin_type']
+        valid_types = ['Basal', 'Bolus', 'Both']
+        if insulin_type and insulin_type not in valid_types:
+            errors.append(f"Insulin type must be one of: {', '.join(valid_types)}")
+    
+    if 'daily_basal_dose' in data:
+        dose = data['daily_basal_dose']
+        if dose:
+            try:
+                dose_float = float(dose)
+                if dose_float < 0 or dose_float > 200:
+                    errors.append("Daily basal dose must be between 0 and 200 units")
+            except (ValueError, TypeError):
+                errors.append("Daily basal dose must be a valid number")
+    
+    if 'insulin_to_carb_ratio' in data:
+        ratio = data['insulin_to_carb_ratio']
+        if ratio:
+            try:
+                ratio_float = float(ratio)
+                if ratio_float < 0 or ratio_float > 100:
+                    errors.append("Insulin to carb ratio must be between 0 and 100")
+            except (ValueError, TypeError):
+                errors.append("Insulin to carb ratio must be a valid number")
+    
+    return errors
 
 if __name__ == '__main__':
     # Print registered routes for debugging

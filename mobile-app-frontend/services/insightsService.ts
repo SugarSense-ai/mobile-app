@@ -1,5 +1,6 @@
 import { API_ENDPOINTS } from '@/constants/config';
 import { getBaseUrl } from './api';
+import { userService } from './userService';
 
 // TypeScript interfaces for insights
 export interface UserMetrics {
@@ -230,7 +231,7 @@ function generateFallbackInsights(metrics: UserMetrics): GeneratedInsight[] {
 /**
  * Fetch insights from backend with caching and fallback logic
  */
-export async function fetchTodaysInsights(forceRefresh: boolean = false): Promise<InsightsResponse> {
+export async function fetchTodaysInsights(forceRefresh: boolean = false, clerkUserId?: string): Promise<InsightsResponse> {
   // Return cached data if valid and not forcing refresh
   if (!forceRefresh && isCacheValid() && insightsCache.data) {
     console.log('📊 Returning cached insights');
@@ -240,7 +241,15 @@ export async function fetchTodaysInsights(forceRefresh: boolean = false): Promis
   try {
     console.log('🔍 Fetching fresh insights from backend...');
     const baseUrl = await getBaseUrl();
-    const response = await fetch(`${baseUrl}/api/insights`, {
+    
+    // Build query parameters
+    const params = new URLSearchParams();
+    if (clerkUserId) {
+      params.append('clerk_user_id', clerkUserId);
+    }
+    
+    const url = `${baseUrl}/api/insights${params.toString() ? '?' + params.toString() : ''}`;
+    const response = await fetch(url, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
@@ -267,62 +276,79 @@ export async function fetchTodaysInsights(forceRefresh: boolean = false): Promis
     }
 
   } catch (error) {
-    console.error('❌ Error fetching insights from backend:', error);
+    console.error('❌ Error fetching insights:', error);
     
-    // Attempt to fetch basic metrics for fallback
-    try {
-      const fallbackMetrics = await fetchBasicMetricsForFallback();
-      const fallbackInsights = generateFallbackInsights(fallbackMetrics);
-      
-      const fallbackResponse: InsightsResponse = {
-        success: true,
-        insights: fallbackInsights,
-        metrics: fallbackMetrics,
-        generatedAt: new Date().toISOString(),
-        llmUsed: false,
-        fallbackReason: `API Error: ${error instanceof Error ? error.message : 'Unknown error'}`
-      };
-
-      console.log('🔄 Generated fallback insights using rule-based logic');
-      return fallbackResponse;
-
-    } catch (fallbackError) {
-      console.error('❌ Fallback insights generation failed:', fallbackError);
-      
-      // Return minimal response with basic insights
-      const minimalResponse: InsightsResponse = {
-        success: false,
-        insights: [{
-          id: 'system-error',
-          type: 'neutral',
-          icon: '📱',
-          title: 'Keep Up the Good Work',
-          description: 'Continue logging your meals, glucose, and activity. We\'ll analyze your patterns as more data becomes available.',
-          priority: 1,
-          isAIGenerated: false,
-          fallbackUsed: true
-        }],
-        metrics: getEmptyMetrics(),
-        generatedAt: new Date().toISOString(),
-        llmUsed: false,
-        fallbackReason: `Complete failure: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        error: 'Unable to generate insights at this time'
-      };
-
-      return minimalResponse;
-    }
+    // Fallback to default insight
+    const fallbackInsights: InsightsResponse = {
+      success: true,
+      insights: [{
+        id: 'fallback-network',
+        type: 'neutral' as const,
+        icon: '📊',
+        title: 'Stay Consistent',
+        description: 'Keep logging your data consistently. Your health insights will improve as more data becomes available.',
+        priority: 1,
+        isAIGenerated: false,
+        fallbackUsed: true
+      }],
+      metrics: {
+        glucose: {
+          averageToday: null,
+          averageYesterday: null,
+          timeInRange: { today: null, yesterday: null },
+          highestReading: null,
+          lowestReading: null,
+          totalReadings: 0
+        },
+        meals: {
+          totalCarbs: 0,
+          totalCalories: 0,
+          mealCount: 0
+        },
+        activity: {
+          totalSteps: 0,
+          totalMinutes: 0,
+          activitiesLogged: 0,
+          caloriesBurned: 0
+        },
+        sleep: {
+          lastNightHours: null,
+          averageThisWeek: null,
+          quality: null
+        },
+        predictions: {
+          nextHourTrend: null,
+          confidence: 0,
+          riskLevel: 'low' as const
+        }
+      },
+      generatedAt: new Date().toISOString(),
+      llmUsed: false,
+      fallbackReason: `Network error: ${(error as Error).message}`
+    };
+    
+    return fallbackInsights;
   }
 }
 
 /**
  * Fetch basic metrics for fallback insights
  */
-async function fetchBasicMetricsForFallback(): Promise<UserMetrics> {
+async function fetchBasicMetricsForFallback(clerkUserId?: string): Promise<UserMetrics> {
   const baseUrl = await getBaseUrl();
   
-  // Fetch basic glucose history
-  const glucoseResponse = await fetch(`${baseUrl}/api/glucose-history`);
-  const glucoseData = glucoseResponse.ok ? await glucoseResponse.json() : { glucose_logs: [] };
+  // Fetch basic glucose history with user authentication
+  let glucoseData = { glucose_logs: [] };
+  if (clerkUserId) {
+    try {
+      const glucoseResponse = await fetch(`${baseUrl}/api/glucose-history?clerk_user_id=${encodeURIComponent(clerkUserId)}`);
+      if (glucoseResponse.ok) {
+        glucoseData = await glucoseResponse.json();
+      }
+    } catch (error) {
+      console.log('⚠️ Could not fetch glucose data for fallback metrics:', error);
+    }
+  }
   
   // Process glucose data for basic metrics
   const glucoseLogs = glucoseData.glucose_logs || [];

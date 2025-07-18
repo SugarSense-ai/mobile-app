@@ -159,4 +159,90 @@ export const styles = StyleSheet.create({
     fontSize: 15,
     color: COLORS.lightGray,
   },
+  authToggle: {
+    flexDirection: 'row',
+    backgroundColor: COLORS.liGray,
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: 24,
+  },
+  toggleButton: {
+    flex: 1,
+    paddingVertical: 12,
+    alignItems: 'center',
+    borderRadius: 8,
+  },
+  activeToggle: {
+    backgroundColor: COLORS.blue,
+  },
+  toggleText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: COLORS.gray,
+  },
+  activeToggleText: {
+    color: COLORS.white,
+  },
+  inputContainer: {
+    marginBottom: 24,
+  },
+  input: {
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    padding: 16,
+    fontSize: 16,
+    borderWidth: 1,
+    borderColor: COLORS.lightGray,
+    color: COLORS.surface,
+    marginBottom: 16,
+  },
+  emailButton: {
+    backgroundColor: COLORS.blue,
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginBottom: 24,
+    shadowColor: "#000",
+    shadowOffset: {
+      width: 0,
+      height: 4,
+    },
+    shadowOpacity: 0.15,
+    shadowRadius: 12,
+    elevation: 5,
+  },
+  emailButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: COLORS.white,
+  },
+  buttonDisabled: {
+    opacity: 0.7,
+  },
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: COLORS.lightGray,
+  },
+  dividerText: {
+    paddingHorizontal: 16,
+    fontSize: 14,
+    color: COLORS.gray,
+  },
+  resetButton: {
+    marginTop: 20,
+    paddingVertical: 8,
+    alignItems: 'center',
+  },
+  resetButtonText: {
+    fontSize: 12,
+    color: COLORS.lightGray,
+    textDecorationLine: 'underline',
+  },
 });
