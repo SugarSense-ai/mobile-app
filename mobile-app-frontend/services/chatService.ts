@@ -51,7 +51,8 @@ export const sendMessage = async (
   message: string,
   healthSnapshot: HealthSnapshot | null,
   chatHistory: ChatMessage[],
-  imageUri?: string | null
+  imageUri?: string | null,
+  clerkUserId?: string | null
 ): Promise<string> => {
   try {
     const baseUrl = await getBaseUrl();
@@ -70,6 +71,7 @@ export const sendMessage = async (
         image: imageBase64,
         health_snapshot: healthSnapshot,
         chat_history: chatHistory, // Send the whole chat message object
+        clerk_user_id: clerkUserId,
       }),
     });
 

@@ -647,8 +647,12 @@ export const triggerManualSync = async (userId: number = 1, days: number = 7): P
 };
 
 // ✅ NEW: Perform a full wipe and resync of all health data
-export const performFreshResync = async (userId: number = 1, days: number = 30): Promise<SyncResult> => {
-  console.log('🔥 Initiating FRESH RESYNC. This will wipe and re-ingest health data.');
+export const performFreshResync = async (userId?: number, days: number = 30): Promise<SyncResult> => {
+  if (!userId) {
+    throw new Error('User ID is required to perform fresh resync');
+  }
+  
+  console.log(`🔥 Initiating FRESH RESYNC for user ${userId}. This will wipe and re-ingest health data.`);
   
   try {
     // Step 1: Call the backend to clear all existing health data for the user
@@ -690,11 +694,11 @@ export const performFreshResync = async (userId: number = 1, days: number = 30):
       recordsSynced: syncResult.recordsSynced
     };
 
-  } catch (error: any) {
-    console.error('❌ FATAL: Fresh resync process failed:', error);
+  } catch (error) {
+    console.error('❌ Fresh resync failed:', error);
     return {
       success: false,
-      message: `Fresh resync failed: ${error.message}`
+      message: (error as Error).message,
     };
   }
 };
