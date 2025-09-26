@@ -1,5 +1,5 @@
 import { API_ENDPOINTS } from '@/constants/config';
-import { performFullHealthSync } from './healthKit';
+import { performFullHealthSync, quickSyncTodayOnly } from './healthKit';
 import { getBaseUrl } from './api';
 
 export interface ActivityLogEntry {
@@ -100,26 +100,69 @@ export interface DashboardData {
 /**
  * Fetch comprehensive dashboard data for diabetes management
  */
-export const fetchDashboardData = async (days: number = 15, userId?: number): Promise<DashboardData> => {
+export const fetchDashboardData = async (days: number = 15, userId?: number, tzOffset?: string): Promise<DashboardData> => {
   if (!userId) {
     throw new Error('User ID is required to fetch dashboard data');
   }
   
-  try {
-    // Use dynamic URL resolution instead of static BASE_URL
-    const baseUrl = await getBaseUrl();
-    const response = await fetch(`${baseUrl}/api/diabetes-dashboard?days=${days}&user_id=${userId}`);
-    
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+  const maxRetries = 3;
+  let lastError: Error | null = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`🔄 Fetching dashboard data (attempt ${attempt}/${maxRetries})`);
+      
+      // Use dynamic URL resolution instead of static BASE_URL
+      const baseUrl = await getBaseUrl();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
+      const tzParam = tzOffset ? `&tz_offset=${encodeURIComponent(tzOffset)}` : '';
+      const response = await fetch(
+        `${baseUrl}/api/diabetes-dashboard?days=${days}&user_id=${userId}${tzParam}`,
+        {
+          signal: controller.signal,
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+        }
+      );
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      console.log(`✅ Dashboard data fetched successfully (${days} days, user ${userId})`);
+      return data;
+      
+    } catch (error: any) {
+      lastError = error;
+      console.error(`❌ Dashboard fetch attempt ${attempt} failed:`, error.message);
+      
+      // Check if it's a retryable error
+      const isRetryableError = error.name === 'AbortError' || 
+                              error.message.includes('Network request failed') ||
+                              error.message.includes('fetch') ||
+                              (error.message.includes('HTTP error') && error.message.includes('50')); // 5xx errors
+      
+      if (isRetryableError && attempt < maxRetries) {
+        const retryDelay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+        console.log(`⏳ Retrying dashboard fetch in ${retryDelay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+        continue;
+      } else if (!isRetryableError) {
+        // Non-retryable error, break out of retry loop
+        break;
+      }
     }
-    
-    const data = await response.json();
-    return data;
-  } catch (error) {
-    console.error('Error fetching dashboard data:', error);
-    throw error;
   }
+  
+  console.error(`❌ All dashboard fetch attempts failed after ${maxRetries} tries`);
+  throw lastError || new Error('Failed to fetch dashboard data after multiple attempts');
 };
 
 /**
@@ -130,32 +173,80 @@ export const syncAndRefreshDashboard = async (days: number = 15, userId?: number
     throw new Error('User ID is required to sync dashboard data');
   }
   
+  let syncSuccess = false;
+  let dashboardData: DashboardData;
+  
   try {
     console.log('🔄 Starting health data sync and dashboard refresh...');
     
-    // Step 1: Sync latest health data from Apple Health
-    await performFullHealthSync(30, userId); // Sync last 30 days of data
+    // Step 1: Quick sync today's data first for immediate feedback
+    try {
+      console.log('🚀 Starting quick sync for today\'s data...');
+      const quickSyncResult = await quickSyncTodayOnly(userId);
+      if (quickSyncResult.success) {
+        console.log('✅ Quick sync completed - today\'s data available');
+        syncSuccess = true;
+      } else {
+        console.warn('⚠️ Quick sync failed:', quickSyncResult.message);
+      }
+    } catch (quickSyncError) {
+      console.warn('⚠️ Quick sync failed:', quickSyncError);
+    }
+
+    // Step 2: Attempt full sync in background (non-blocking)
+    // Don't await this - let it run in background while we show today's data
+    performFullHealthSync(15, userId).then(() => {
+      console.log('✅ Background full sync completed');
+      syncSuccess = true;
+    }).catch((syncError) => {
+      console.warn('⚠️ Background full sync failed:', syncError);
+      // This doesn't affect the immediate user experience
+    });
     
-    // Step 2: Sleep summary is now refreshed automatically on the backend within the sync endpoint.
-    // This call is no longer needed and the endpoint is disabled.
-    // const refreshResponse = await fetch(`${API_ENDPOINTS.BASE_URL}/refresh-sleep-summary`, {
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify({ user_id: userId })
-    // });
-    
-    // if (!refreshResponse.ok) {
-    //   console.warn('Warning: Failed to refresh sleep summary');
-    // }
-    
-    // Step 3: Fetch updated dashboard data
-    const dashboardData = await fetchDashboardData(days, userId);
-    
-    console.log('✅ Health data sync and dashboard refresh completed');
-    return dashboardData;
+         // Step 3: Sleep summary is now refreshed automatically on the backend within the sync endpoint.
+     // This call is no longer needed and the endpoint is disabled.
+     // const refreshResponse = await fetch(`${API_ENDPOINTS.BASE_URL}/refresh-sleep-summary`, {
+     //   method: 'POST',
+     //   headers: { 'Content-Type': 'application/json' },
+     //   body: JSON.stringify({ user_id: userId })
+     // });
+     
+     // if (!refreshResponse.ok) {
+     //   console.warn('Warning: Failed to refresh sleep summary');
+     // }
+     
+     // Step 4: Fetch updated dashboard data (this should work even if sync failed)
+    try {
+      dashboardData = await fetchDashboardData(days, userId);
+      
+      if (syncSuccess) {
+        console.log('✅ Health data sync and dashboard refresh completed successfully');
+      } else {
+        console.log('⚠️ Dashboard loaded with existing data (sync failed but data is available)');
+      }
+      
+      return dashboardData;
+      
+    } catch (dashboardError) {
+      console.error('❌ Failed to fetch dashboard data:', dashboardError);
+      
+      // If dashboard fetch fails, try with fewer days as fallback
+      if (days > 7) {
+        console.log('🔄 Retrying dashboard fetch with fewer days...');
+        try {
+          dashboardData = await fetchDashboardData(7, userId);
+          console.log('✅ Dashboard loaded with reduced date range');
+          return dashboardData;
+        } catch (fallbackError) {
+          console.error('❌ Fallback dashboard fetch also failed:', fallbackError);
+        }
+      }
+      
+      throw dashboardError;
+    }
     
   } catch (error) {
-    console.error('Error syncing health data and refreshing dashboard:', error);
+    console.error('❌ Critical error during sync and refresh:', error);
     throw error;
   }
 };

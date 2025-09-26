@@ -1,4 +1,31 @@
 // Network utility functions for better debugging and connectivity
+import { NativeModules } from 'react-native';
+
+// Helper to get the host IP address for development
+// This is crucial for connecting to a local backend from a physical device
+export const getHostIp = (): string => {
+  try {
+    const { scriptURL } = NativeModules.SourceCode;
+    console.log('🔍 NativeModules.SourceCode.scriptURL:', scriptURL);
+    
+    if (scriptURL) {
+      const address = scriptURL.split('://')[1].split('/')[0];
+      const hostname = address.split(':')[0];
+      console.log('🔍 Extracted hostname from scriptURL:', hostname);
+      
+      // Validate that we got a reasonable IP address
+      if (hostname && hostname !== 'localhost' && hostname !== '127.0.0.1') {
+        return hostname;
+      }
+    }
+  } catch (e) {
+    console.log('❌ Error extracting host IP from NativeModules:', e);
+  }
+  
+  // Fallback to current working IP for this network
+  console.log('🔄 Falling back to current working IP: 192.168.1.138');
+  return '192.168.1.138';
+};
 
 export interface NetworkInfo {
   workingUrl: string | null;
@@ -7,45 +34,67 @@ export interface NetworkInfo {
   responseTime: number;
 }
 
-export const testNetworkConnectivity = async (urls: string[]): Promise<NetworkInfo> => {
+export const testNetworkConnectivity = async (urls: string[], _retries: number = 2): Promise<NetworkInfo> => {
   const testedUrls: string[] = [];
   const failedUrls: string[] = [];
   const startTime = Date.now();
   
-  for (const url of urls) {
-    try {
-      console.log(`🔍 Testing connectivity to: ${url}`);
-      testedUrls.push(url);
-      
-      // Create abort controller for timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000); // 3 second timeout
-      
-      const response = await fetch(`${url}/api/health`, {
-        method: 'GET',
-        headers: { 'Accept': 'application/json' },
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (response.ok) {
-        const endTime = Date.now();
-        console.log(`✅ Connectivity test passed for: ${url} (${endTime - startTime}ms)`);
-        return {
-          workingUrl: url,
-          testedUrls,
-          failedUrls,
-          responseTime: endTime - startTime
-        };
-      } else {
+  const tryUrls = async (): Promise<string | null> => {
+    for (const url of urls) {
+      try {
+        console.log(`🔍 Testing connectivity to: ${url}`);
+        testedUrls.push(url);
+
+        // React Native's global fetch does **not** currently support AbortController.
+        // Using it triggers an immediate "TypeError: Network request failed" on iOS/Android.
+        // Instead, implement a universal timeout with Promise.race.
+
+        const fetchPromise = fetch(`${url}/api/health`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+        });
+
+        // Timeout after 5 seconds to avoid long hangs on unreachable hosts.
+        const timeoutPromise = new Promise((_resolve, reject) =>
+          setTimeout(() => reject(new Error('timeout')), 5000)
+        );
+
+        const response: any = await Promise.race([fetchPromise, timeoutPromise]);
+
+        if (response.ok) {
+          return url;
+        }
+
         console.log(`❌ Connectivity test failed for ${url}: HTTP ${response.status}`);
         failedUrls.push(url);
+      } catch (error) {
+        console.log(`❌ Connectivity test error for ${url}:`, error);
+        failedUrls.push(url);
       }
-    } catch (error) {
-      console.log(`❌ Connectivity test error for ${url}:`, error);
-      failedUrls.push(url);
     }
+    return null;
+  };
+
+  let working: string | null = null;
+  for (let attempt = 0; attempt < _retries + 1; attempt++) {
+    working = await tryUrls();
+    if (working) break;
+    // Small delay before retrying
+    if (attempt < _retries) {
+      await new Promise((r) => setTimeout(r, 1500));
+      console.log(`🔄 Retry connectivity attempt #${attempt + 2}`);
+    }
+  }
+
+  if (working) {
+    const endTime = Date.now();
+    console.log(`✅ Connectivity test passed for: ${working} (${endTime - startTime}ms)`);
+    return {
+      workingUrl: working,
+      testedUrls,
+      failedUrls,
+      responseTime: endTime - startTime,
+    };
   }
   
   const endTime = Date.now();
@@ -73,6 +122,7 @@ export const getNetworkDiagnostics = async (urls: string[]): Promise<{
     suggestions.push('• Verify you\'re connected to the same WiFi network as your computer');
     suggestions.push('• Make sure port 3001 is not blocked by firewall');
     suggestions.push('• Try restarting the backend server');
+    suggestions.push('• Check that the backend is running on 192.168.1.138:3001 or 192.168.0.103:3001');
   }
   
   const summary = networkInfo.workingUrl 
@@ -97,6 +147,7 @@ export const getCommonNetworkRanges = (): string[] => {
 };
 
 export default {
+  getHostIp,
   testNetworkConnectivity,
   getNetworkDiagnostics,
   getCommonNetworkRanges

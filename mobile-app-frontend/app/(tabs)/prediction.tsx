@@ -16,6 +16,7 @@ import {
   Image,
   ActivityIndicator,
   Animated,
+  PanResponder,
 } from 'react-native';
 import { LineChart } from 'react-native-chart-kit';
 import { FontAwesome5, MaterialCommunityIcons } from '@expo/vector-icons';
@@ -25,6 +26,7 @@ import { getBaseUrl } from '@/services/api';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import * as ImagePicker from 'expo-image-picker';
 import { fetchTodaysInsights, clearInsightsCache, InsightsResponse, GeneratedInsight } from '@/services/insightsService';
+import { useUserIds } from '@/services/userService';
 
 const { width } = Dimensions.get('window');
 
@@ -137,28 +139,6 @@ const sendLogData = async (endpoint: string, data: any) => {
 
 // Modern data for different granularities with enhanced styling
 const chartDataByGranularity = {
-  hourly: {
-    labels: ['00', '03', '06', '09', '12', '15', '18', 'Now', '+1h', '+2h', '+3h'],
-    datasets: [
-      {
-        data: [120, 105, 130, 160, 145, 135, 150, 170, 185, 195, 180],
-        color: (opacity = 1) => `rgba(59, 130, 246, ${opacity})`, // Modern blue gradient
-        strokeWidth: 3,
-        withDots: true,
-        withShadow: true,
-        withInnerLines: false,
-      },
-      {
-        data: [NaN, NaN, NaN, NaN, NaN, NaN, NaN, 170, 180, 196, 175],
-        color: (opacity = 1) => `rgba(251, 113, 133, ${opacity})`, // Modern coral
-        strokeWidth: 3,
-        withDots: true,
-        withShadow: false,
-        strokeDashArray: [8, 4], // Dashed line for predictions
-      },
-    ],
-    legend: ['Measured Glucose', 'AI Prediction'],
-  },
   '15min': {
     labels: ['00', '03', '06', '09', '12', '15', '18', 'Now', '+15m', '+30m', '+45m', '+1h', '+1h15m', '+1h30m', '+1h45m', '+2h'],
     datasets: [
@@ -181,11 +161,11 @@ const chartDataByGranularity = {
     ],
     legend: ['Measured Glucose', 'AI Prediction'],
   },
-  '5min': {
-    labels: ['00', '03', '06', '09', '12', '15', '18', 'Now', '+5m', '+10m', '+15m', '+20m', '+25m', '+30m', '+35m', '+40m', '+45m', '+50m', '+55m', '+1h'],
+  '30min': {
+    labels: ['00', '03', '06', '09', '12', '15', '18', 'Now', '+30m', '+1h', '+1h30m', '+2h'],
     datasets: [
       {
-        data: [120, 105, 130, 160, 145, 135, 150, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 182, 185],
+        data: [120, 105, 130, 160, 145, 135, 150, 170, 185, 195, 200, 190],
         color: (opacity = 1) => `rgba(59, 130, 246, ${opacity})`,
         strokeWidth: 3,
         withDots: true,
@@ -193,7 +173,7 @@ const chartDataByGranularity = {
         withInnerLines: false,
       },
       {
-        data: [NaN, NaN, NaN, NaN, NaN, NaN, NaN, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182],
+        data: [NaN, NaN, NaN, NaN, NaN, NaN, NaN, 170, 180, 196, 205, 185],
         color: (opacity = 1) => `rgba(251, 113, 133, ${opacity})`,
         strokeWidth: 3,
         withDots: true,
@@ -237,6 +217,8 @@ function cleanChartData(rawData: ChartKitData): ChartKitData {
 }
 
 export default function PredictionDashboard(){
+  const { getDatabaseUserId, clerkUserId } = useUserIds();
+  const [currentUserId, setCurrentUserId] = useState<number | null>(null);
   const [isModalVisible, setIsModalVisible] = useState(false);
   const [loggingType, setLoggingType] = useState<'meal' | 'activity' | 'glucose' | 'medication' | null>(null);
   const [logDetails, setLogDetails] = useState<any>({});
@@ -285,7 +267,7 @@ export default function PredictionDashboard(){
   const [showRecommendation, setShowRecommendation] = useState<boolean>(true);
 
   // New state for chart granularity
-  const [granularity, setGranularity] = useState<'hourly' | '15min' | '5min'>('hourly');
+  const [granularity, setGranularity] = useState<'15min' | '30min'>('15min');
 
   // New state for tooltip and selected point
   const [tooltip, setTooltip] = useState<{ x: number; y: number; value: number; label: string; datasetIndex: number; pointIndex: number } | null>(null);
@@ -309,6 +291,10 @@ export default function PredictionDashboard(){
   const [insightsLoading, setInsightsLoading] = useState<boolean>(true);
   const [insightsError, setInsightsError] = useState<string | null>(null);
   const [lastInsightsRefresh, setLastInsightsRefresh] = useState<Date | null>(null);
+  
+  // New state for last meal data
+  const [lastMeal, setLastMeal] = useState<string | null>(null);
+  const [isLoadingLastMeal, setIsLoadingLastMeal] = useState<boolean>(true);
   const chartWidth = width - 40;
   const chartHeight = 200;
 
@@ -340,8 +326,27 @@ export default function PredictionDashboard(){
     }
   }, [toastMessage]);
 
+  // Initialize user ID
+  useEffect(() => {
+    const initializeUserId = async () => {
+      try {
+        const dbUserId = await getDatabaseUserId();
+        if (dbUserId) {
+          setCurrentUserId(dbUserId);
+          console.log('✅ Prediction: Initialized with database user ID:', dbUserId);
+        } else {
+          console.error('❌ Prediction: Failed to get database user ID');
+        }
+      } catch (error) {
+        console.error('❌ Prediction: Error getting user ID:', error);
+      }
+    };
+
+    initializeUserId();
+  }, []);
+
   // Function to generate dynamic chart data based on glucose history and predictions
-  const generateDynamicChartData = (granularityType: 'hourly' | '15min' | '5min') => {
+  const generateDynamicChartData = (granularityType: '15min' | '30min') => {
     console.log('🎯 Generating chart data for granularity:', granularityType);
     console.log('📊 Current glucose history length:', glucoseHistory.length);
     console.log('📊 Current glucose value:', currentGlucose);
@@ -350,10 +355,22 @@ export default function PredictionDashboard(){
     const now = new Date();
     const baseData = chartDataByGranularity[granularityType];
     
-    // If we have no glucose history and no current glucose, use fallback
+    // If we have no glucose history and no current glucose, return empty chart
     if (glucoseHistory.length === 0 && currentGlucose === null) {
-      console.log('⚠️ No glucose data available, using base chart data');
-      return baseData;
+      console.log('⚠️ No glucose data available, returning empty chart');
+      return {
+        labels: ['No Data'],
+        datasets: [
+          {
+            data: [0],
+            color: (opacity = 1) => `rgba(156, 163, 175, ${opacity})`, // Gray color for empty state
+            strokeWidth: 2,
+            withDots: false,
+            withShadow: false,
+          }
+        ],
+        legend: ['No Data Available'],
+      };
     }
     
     // Create a simplified approach: show recent glucose readings + predictions
@@ -380,7 +397,7 @@ export default function PredictionDashboard(){
       
       // Intelligently skip labels to prevent overlap, based on granularity.
       // We'll show fewer labels for broader time ranges.
-      const labelInterval = granularityType === 'hourly' ? 3 : granularityType === '15min' ? 2 : 1;
+      const labelInterval = granularityType === '15min' ? 2 : 1;
       let label = '';
 
       // Always show the first label, the last ("Now"), and interval-based labels.
@@ -396,16 +413,22 @@ export default function PredictionDashboard(){
       predictionData.push(0); // No predictions for historical data
     });
     
-    // Add prediction labels and data
-    const predictionLabels = granularityType === 'hourly' ? ['+1h', '+2h', '+3h'] :
-                            granularityType === '15min' ? ['+15m', '+30m', '+45m', '+1h'] :
-                            ['+5m', '+10m', '+15m', '+20m'];
+    // Add prediction labels and data - 2 hours for both intervals
+    const predictionLabels = granularityType === '15min' ? 
+                            ['+15m', '+30m', '+45m', '+1h', '+1h15m', '+1h30m', '+1h45m', '+2h'] :
+                            ['+30m', '+1h', '+1h30m', '+2h'];
     
     predictionLabels.forEach((label, index) => {
       labels.push(label);
       measuredData.push(0); // No measured data for future
-      if (predictedLevels.length > index) {
-        predictionData.push(predictedLevels[index]);
+      
+      // Calculate the correct prediction index based on granularity
+      // For 15min: use sequential predictions (0, 1, 2, 3, 4, 5, 6, 7)
+      // For 30min: use every other prediction (1, 3, 5, 7) to represent 30-min intervals
+      const predictionIndex = granularityType === '15min' ? index : (index * 2) + 1;
+      
+      if (predictedLevels.length > predictionIndex) {
+        predictionData.push(predictedLevels[predictionIndex]);
       } else {
         // Fallback prediction based on current glucose
         const baseValue = currentGlucose || 120;
@@ -431,6 +454,153 @@ export default function PredictionDashboard(){
       ],
       legend: baseData.legend,
     };
+  };
+
+  // Helper function to format meal name to up to 8 words with better descriptive summary
+  const formatMealName = async (foodDescription: string): Promise<string> => {
+    if (!foodDescription || typeof foodDescription !== 'string') {
+      return '';
+    }
+
+    try {
+      console.log('🍽️ Extracting food items from:', foodDescription);
+      
+      const baseUrl = await getBaseUrl();
+      const response = await fetch(`${baseUrl}/api/extract-food-items`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          food_description: foodDescription
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        console.log('✅ Extracted food items:', data.extracted_items, 'using method:', data.method);
+        return data.extracted_items || foodDescription.trim();
+      } else {
+        console.error('❌ Failed to extract food items:', response.status);
+        return fallbackFormatMealName(foodDescription);
+      }
+    } catch (error) {
+      console.error('💥 Error extracting food items:', error);
+      return fallbackFormatMealName(foodDescription);
+    }
+  };
+
+  // Fallback formatting function for when the API fails
+  const fallbackFormatMealName = (foodDescription: string): string => {
+    if (!foodDescription || typeof foodDescription !== 'string') {
+      return '';
+    }
+    
+    // Clean up the description
+    let description = foodDescription.trim();
+    
+    // Remove sentence endings and extra punctuation
+    description = description.replace(/[.!?]+$/, '').trim();
+    
+    // Remove common prefixes that don't add value (be more conservative)
+    description = description.replace(/^(i had|i ate|today i had|for my)\s+/i, '');
+    
+    // Remove time-based prefixes
+    description = description.replace(/^(breakfast|lunch|dinner|snack):\s*/i, '');
+    description = description.replace(/^(this morning|this afternoon|this evening|tonight|today)\s+/i, '');
+    
+    // Split into words
+    const words = description.split(/\s+/).filter(word => word.length > 0);
+    
+    // If the description is very short (1-2 words), keep it as is
+    if (words.length <= 2) {
+      return words.map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()).join(' ');
+    }
+    
+    // Take up to 6 words to allow for better wrapping (instead of 8)
+    let limitedWords = words.slice(0, 6);
+    
+    // If we have more than 6 words, try to find a natural break point
+    if (words.length > 6) {
+      // Look for natural break points like "with", "and", "or"
+      for (let i = 4; i < Math.min(6, words.length); i++) {
+        if (['with', 'and', 'or', 'plus', '+'].includes(limitedWords[i].toLowerCase())) {
+          limitedWords = limitedWords.slice(0, i + 1); // Include the connecting word
+          break;
+        }
+      }
+    }
+    
+    // Join words
+    let formattedName = limitedWords.join(' ');
+    
+    // Capitalize properly
+    formattedName = formattedName
+      .split(' ')
+      .map((word, index) => {
+        // Don't capitalize common connecting words unless they're the first word
+        const lowerWord = word.toLowerCase();
+        if (index > 0 && ['with', 'and', 'or', 'of', 'in', 'on', 'at', 'to', 'for', 'the', 'a', 'an'].includes(lowerWord)) {
+          return lowerWord;
+        }
+        return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+      })
+      .join(' ')
+      .trim();
+    
+    return formattedName;
+  };
+
+  // Function to fetch the most recent meal for the user
+  const fetchLastMeal = async () => {
+    if (!clerkUserId) {
+      console.log('⏳ Waiting for clerk user ID to fetch last meal...');
+      return;
+    }
+
+    try {
+      console.log('🔍 Fetching last meal for user:', clerkUserId);
+      setIsLoadingLastMeal(true);
+      
+      const baseUrl = await getBaseUrl();
+      const url = `${baseUrl}/api/recent-meal?clerk_user_id=${encodeURIComponent(clerkUserId)}`;
+      console.log('🌐 Fetching last meal from URL:', url);
+      
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      
+      console.log('📡 Last meal response status:', response.status);
+      
+      if (response.ok) {
+        const data = await response.json();
+        console.log('📊 Last meal response data:', data);
+        
+                 if (data.success && data.meal) {
+           const rawDescription = data.meal.food_description;
+           const formattedMealName = await formatMealName(rawDescription);
+           console.log('🍽️ Raw meal description:', rawDescription);
+           console.log('🍽️ Formatted meal name:', formattedMealName);
+           console.log('🍽️ Formatted meal length:', formattedMealName.length, 'characters');
+           setLastMeal(formattedMealName || null);
+         } else {
+           console.log('⚠️ No recent meal found for user');
+           setLastMeal(null);
+         }
+      } else {
+        console.error('❌ Failed to fetch last meal:', response.status);
+        setLastMeal(null);
+      }
+    } catch (error) {
+      console.error('💥 Error fetching last meal:', error);
+      setLastMeal(null);
+    } finally {
+      setIsLoadingLastMeal(false);
+      console.log('🏁 Last meal fetch completed');
+    }
   };
 
   // Function to compute today's stats from glucose history
@@ -526,14 +696,17 @@ export default function PredictionDashboard(){
     setAnalysisError(null); // Reset previous errors
     try {
       console.log('🖼️ Sending image to Gemini for analysis...');
-      const response = await fetch(`${API_ENDPOINTS.BASE_URL}/gemini-analyze`, {
+      // Use dynamic URL resolution instead of static BASE_URL
+      const baseUrl = await getBaseUrl();
+      const response = await fetch(`${baseUrl}/gemini-analyze`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
           imageData: base64Image,
-          prompt_type: 'food_analysis' // Specify the type of analysis
+          prompt_type: 'food_analysis', // Specify the type of analysis
+          clerk_user_id: clerkUserId
         }),
       });
 
@@ -577,13 +750,18 @@ export default function PredictionDashboard(){
 
   // Function to fetch glucose history from backend
   const fetchGlucoseHistory = async () => {
+    if (!clerkUserId) {
+      console.log('⏳ Waiting for clerk user ID to fetch glucose history...');
+      return;
+    }
+
     try {
-      console.log('🔍 Starting glucose history fetch...');
+      console.log('🔍 Starting glucose history fetch for user:', clerkUserId);
       setIsLoadingHistory(true);
       
       // Use dynamic URL resolution instead of static BASE_URL
       const baseUrl = await getBaseUrl();
-      const url = `${baseUrl}/api/glucose-history`;
+      const url = `${baseUrl}/api/glucose-history?clerk_user_id=${encodeURIComponent(clerkUserId)}`;
       console.log('🌐 Fetching from URL:', url);
       
       const response = await fetch(url, {
@@ -661,6 +839,7 @@ export default function PredictionDashboard(){
           recent_carbs: carbs,
           recent_activity_minutes: activity,
           recent_sleep_quality: sleep,
+          clerk_user_id: clerkUserId,
         }),
       });
       const data = await response.json();
@@ -675,12 +854,22 @@ export default function PredictionDashboard(){
     }
   };
 
-  // Fetch glucose history when component mounts
+  // Fetch glucose history when component mounts and clerkUserId is available
   useEffect(() => {
-    console.log('🔄 Prediction component mounted, fetching glucose history...');
+    if (clerkUserId) {
+      console.log('🔄 Prediction component mounted, fetching glucose history for user:', clerkUserId);
     console.log('🔧 API_ENDPOINTS.BASE_URL:', API_ENDPOINTS.BASE_URL);
     fetchGlucoseHistory();
-  }, []);
+    }
+  }, [clerkUserId]);
+
+  // Fetch last meal when component mounts and clerkUserId is available
+  useEffect(() => {
+    if (clerkUserId) {
+      console.log('🔄 Prediction component mounted, fetching last meal for user:', clerkUserId);
+      fetchLastMeal();
+    }
+  }, [clerkUserId]);
 
   // Fetch predictions when current glucose or related data changes
   useEffect(() => {
@@ -704,12 +893,17 @@ export default function PredictionDashboard(){
 
   // Function to fetch insights
   const fetchInsights = async (forceRefresh: boolean = false) => {
+    if (!currentUserId) {
+      console.log('⏳ Prediction: Waiting for user ID to fetch insights...');
+      return;
+    }
+
     try {
       setInsightsLoading(true);
       setInsightsError(null);
       
       console.log('🔍 Fetching today\'s insights...');
-      const response = await fetchTodaysInsights(forceRefresh);
+      const response = await fetchTodaysInsights(forceRefresh, clerkUserId || undefined);
       
       if (response.success) {
         setInsights(response.insights);
@@ -743,16 +937,16 @@ export default function PredictionDashboard(){
       }
     } catch (error) {
       console.error('❌ Error fetching insights:', error);
-      setInsightsError('Unable to load insights. Please try again.');
+      setInsightsError((error as Error).message);
       
-      // Set error fallback insights
+      // Set fallback insights on error
       if (insights.length === 0) {
         setInsights([{
-          id: 'error-fallback',
+          id: 'fallback-error',
           type: 'neutral',
-          icon: '📱',
-          title: 'Insights Temporarily Unavailable',
-          description: 'We\'re working to restore insight generation. Keep logging your data for better analysis.',
+          icon: '📊',
+          title: 'Data Loading',
+          description: 'We\'re working on generating your personalized insights. Please check back in a moment.',
           priority: 1,
           isAIGenerated: false,
           fallbackUsed: true
@@ -794,12 +988,17 @@ export default function PredictionDashboard(){
 
   // Function to fetch injection site recommendation
   const fetchInjectionSiteRecommendation = async () => {
+    if (!currentUserId) {
+      console.log('⏳ Prediction: Waiting for user ID to fetch injection recommendation...');
+      return;
+    }
+
     try {
       setIsLoadingRecommendation(true);
       setInjectionRecommendation(null);
       
       const baseUrl = await getBaseUrl();
-      const response = await fetch(`${baseUrl}/api/injection-site-recommendation?user_id=1`, {
+      const response = await fetch(`${baseUrl}/api/injection-site-recommendation?user_id=${currentUserId}`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -914,6 +1113,7 @@ export default function PredictionDashboard(){
             if (!isNaN(glucoseValue)) {
                 // Send glucose data to backend
                 const success = await sendLogData('/api/log-glucose', {
+                    clerk_user_id: clerkUserId,
                     glucoseLevel: glucoseValue,
                     time: logDetails.time,
                 });
@@ -948,6 +1148,7 @@ export default function PredictionDashboard(){
 
             // Send meal data to backend
             const success = await sendLogData('/api/log-meal', {
+                clerk_user_id: clerkUserId,
                 meal_type: logDetails.meal_type,
                 food_description: logDetails.food_description,
                 calories: caloriesValue,
@@ -966,6 +1167,7 @@ export default function PredictionDashboard(){
                 // Background updates
                 fetchGlucosePrediction(currentGlucose, carbsValue, recentActivityMinutes, recentSleepQuality);
                 clearInsightsCacheAndRefresh();
+                fetchLastMeal(); // Update last meal after logging new meal
             }
         } else {
             Alert.alert("Missing Information", "Please fill in meal type and food description.");
@@ -981,6 +1183,7 @@ export default function PredictionDashboard(){
               if (!isNaN(durationValue) && !isNaN(stepsValue) && !isNaN(caloriesBurnedValue)) {
                   // Send activity data to backend
                   const success = await sendLogData('/api/log-activity', {
+                      clerk_user_id: clerkUserId,
                       activity_type: finalActivityType,
                       duration_minutes: durationValue,
                       steps: stepsValue,
@@ -1011,6 +1214,7 @@ export default function PredictionDashboard(){
              const dosageValue = parseFloat(medicationDetails.dosage);
              if (!isNaN(dosageValue)) {
                  const success = await sendLogData('/api/log-medication', {
+                     clerk_user_id: clerkUserId,
                      medication_type: medicationDetails.medication_type,
                      medication_name: medicationDetails.medication_name,
                      dosage: dosageValue,
@@ -1806,31 +2010,37 @@ export default function PredictionDashboard(){
         <View style={styles.topInfoContainer}>
           <View style={styles.currentGlucoseSection}>
             <Text style={styles.currentGlucoseLabel}>Current Glucose</Text>
-            <Text style={styles.currentGlucoseValue}>{currentGlucose !== null ? currentGlucose : '--'} <Text style={styles.unit}>mg/dL</Text></Text>
+            <View style={styles.glucoseValueContainer}>
+              <Text style={styles.currentGlucoseValue}>
+                {currentGlucose !== null ? currentGlucose : '--'} 
+                <Text style={styles.unit}> mg/dL</Text>
+              </Text>
+            </View>
             <Text style={styles.lastUpdated}>Last updated: Just now</Text>
           </View>
           <View style={styles.predictedGlucoseSection}>
-            <Text style={styles.predictedGlucoseLabel}>Predicted ({predictedLevels.length > 0 ? predictedLevels.length : '0'}h)</Text>
-            <Text style={styles.predictedGlucoseValue}>{predictedLevels.length > 0 ? predictedLevels[0] : '--'} <Text style={styles.unit}>mg/dL</Text></Text>
-            <Text style={styles.lastMeal}>Last meal: sandwich</Text>
+            <Text style={styles.predictedGlucoseLabel}>Predicted (2h range)</Text>
+            <View style={styles.glucoseValueContainer}>
+              <Text style={styles.predictedGlucoseValue}>
+                {predictedLevels.length > 0 ? predictedLevels[0] : '--'} 
+                <Text style={styles.unit}> mg/dL</Text>
+              </Text>
+            </View>
+            {!isLoadingLastMeal && (
+              <Text 
+                style={styles.lastMeal}
+                numberOfLines={2}
+                ellipsizeMode="tail"
+              >
+                Last meal: {lastMeal || 'No meal logged'}
+              </Text>
+            )}
           </View>
         </View>
 
         <View style={styles.chartCard}>
           {/* Modern granularity controls */}
           <View style={styles.granularityContainer}>
-            <TouchableOpacity
-              style={[
-                styles.granularityButton,
-                granularity === 'hourly' && styles.granularityButtonActive
-              ]}
-              onPress={() => setGranularity('hourly')}
-            >
-              <Text style={[
-                styles.granularityButtonText,
-                granularity === 'hourly' && styles.granularityButtonTextActive
-              ]}>Hourly</Text>
-            </TouchableOpacity>
             <TouchableOpacity
               style={[
                 styles.granularityButton,
@@ -1846,14 +2056,14 @@ export default function PredictionDashboard(){
             <TouchableOpacity
               style={[
                 styles.granularityButton,
-                granularity === '5min' && styles.granularityButtonActive
+                granularity === '30min' && styles.granularityButtonActive
               ]}
-              onPress={() => setGranularity('5min')}
+              onPress={() => setGranularity('30min')}
             >
               <Text style={[
                 styles.granularityButtonText,
-                granularity === '5min' && styles.granularityButtonTextActive
-              ]}>5 min</Text>
+                granularity === '30min' && styles.granularityButtonTextActive
+              ]}>30 min</Text>
             </TouchableOpacity>
           </View>
           

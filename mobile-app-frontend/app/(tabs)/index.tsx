@@ -1,3 +1,7 @@
+// This file has been commented out as the CGM connection screen is now only accessible from the Profile tab
+// The app now launches directly into the Dashboard screen as the default
+
+/*
 import React, { useState, useEffect } from 'react';
 import {
   View,
@@ -55,149 +59,104 @@ const CGMConnectionScreen = () => {
     setConnectionStatus(null);
 
     try {
-      if (selectedDevice.connectionType === 'bluetooth' && bluetoothManager) {
-        console.log('Attempting Bluetooth connection for:', selectedDevice.name);
-        bluetoothManager.startDeviceScan(null, null, (error: any, device: any) => {
-          if (error) {
-            console.error('Bluetooth Scan Error:', error);
-            setConnectionStatus({ success: false, message: `Bluetooth Scan Error: ${error.message}` });
-            setIsConnecting(false);
-            bluetoothManager.stopDeviceScan();
-            return;
-          }
-          if (device && device.name?.includes(selectedDevice.name.split(' ')[0])) {
-            console.log('Found device:', device.name);
-            bluetoothManager.stopDeviceScan();
-            device.connect()
-              .then((connectedDevice: any) => {
-                console.log('Connected to:', connectedDevice.name);
-                setConnectionStatus({ success: true, message: `${selectedDevice.name} connected successfully!` });
-              })
-              .catch((connectError: any) => {
-                console.error('Bluetooth Connect Error:', connectError);
-                setConnectionStatus({ success: false, message: `Failed to connect to ${selectedDevice.name}: ${connectError.message}` });
-              })
-              .finally(() => setIsConnecting(false));
-          }
-        });
-        setTimeout(() => {
-          if (isConnecting) {
-            bluetoothManager.stopDeviceScan();
-            setConnectionStatus({ success: false, message: 'Bluetooth scan timed out. Please try again.' });
-            setIsConnecting(false);
-          }
-        }, 15000);
-      } else if (selectedDevice.connectionType === 'web_link' && selectedDevice.authUrl) {
+      if (selectedDevice.connectionType === 'bluetooth') {
+        // Simulate connection
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        setConnectionStatus({ success: true, message: 'Connected successfully!' });
+      } else if (selectedDevice.connectionType === 'web_link') {
+        // Open web link for OAuth-based connections (like Dexcom)
         Linking.openURL(selectedDevice.authUrl);
-        setConnectionStatus({ success: null, message: `Redirecting to ${selectedDevice.name} for authorization... Please follow the instructions on the website and return to the app.` });
-        setIsConnecting(false);
+        setConnectionStatus({ success: true, message: 'Please complete authentication in the browser.' });
       } else if (selectedDevice.connectionType === 'api') {
-        console.log('Attempting API connection for:', selectedDevice.name);
-        setTimeout(() => {
-          const success = Math.random() > 0.5;
-          setConnectionStatus({ success: success, message: success ? `${selectedDevice.name} connected via API!` : `Failed to connect to ${selectedDevice.name} via API.` });
-          setIsConnecting(false);
-        }, 3000);
-      } else {
-        setConnectionStatus({ success: false, message: 'Unsupported connection type for this device.' });
-        setIsConnecting(false);
+        // API-based connection (would require user credentials)
+        setConnectionStatus({ success: false, message: 'API connection not implemented yet.' });
       }
     } catch (error) {
-      console.error('Connection Error:', error);
-      setConnectionStatus({ success: false, message: `An unexpected error occurred: ${error}` });
+      setConnectionStatus({ success: false, message: 'Connection failed. Please try again.' });
+    } finally {
       setIsConnecting(false);
     }
   };
 
+  const renderDevice = ({ item }: any) => (
+    <TouchableOpacity
+      style={[styles.deviceCard, selectedDevice?.id === item.id && styles.selectedDevice]}
+      onPress={() => handleDeviceSelection(item)}
+    >
+      <Image source={item.logo} style={styles.deviceLogo} />
+      <Text style={styles.deviceName}>{item.name}</Text>
+      {selectedDevice?.id === item.id && (
+        <Feather name="check-circle" size={24} color="#4ECDC4" style={styles.checkIcon} />
+      )}
+    </TouchableOpacity>
+  );
+
   return (
-    <View style={styles.container}>
-      <ScrollView contentContainerStyle={styles.scrollContentContainer}>
-        <View style={styles.header}>
-          <Text style={styles.title}>Connect Your CGM</Text>
-          <Text style={styles.subtitle}>Seamlessly integrate your glucose data</Text>
-        </View>
+    <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
+      <View style={styles.header}>
+        <Text style={styles.title}>Connect Your CGM</Text>
+        <Text style={styles.subtitle}>Seamlessly integrate your glucose data</Text>
+      </View>
 
-        <View style={styles.deviceListContainer}>
-          <Text style={styles.deviceListTitle}>Select Your Device</Text>
-          <FlatList
-            data={supportedCGMDevices}
-            keyExtractor={item => item.id}
-            renderItem={({ item }) => (
-              <TouchableOpacity
-                style={[styles.listItem, selectedDevice?.id === item.id && styles.selectedListItem]}
-                onPress={() => handleDeviceSelection(item)}
-              >
-                {item.logo && <Image source={item.logo} style={styles.logo} />}
-                <Text style={styles.listItemText}>{item.name}</Text>
-                {selectedDevice?.id === item.id && <Feather name="check-circle" size={20} color="#00aaff" />}
-              </TouchableOpacity>
-            )}
-          />
-        </View>
+      <View style={styles.devicesSection}>
+        <Text style={styles.sectionTitle}>Select Your Device</Text>
+        <FlatList
+          data={supportedCGMDevices}
+          renderItem={renderDevice}
+          keyExtractor={(item) => item.id}
+          scrollEnabled={false}
+        />
+      </View>
 
-        {selectedDevice && (
-          <View style={styles.instructionsContainer}>
-            <Text style={styles.instructionsTitle}>Connecting to {selectedDevice.name}</Text>
-            {selectedDevice.connectionType === 'bluetooth' && (
-              <Text style={styles.instructionsText}>
-                <Feather name="bluetooth" size={16} color="#555" style={styles.icon} />
-                Ensure Bluetooth is enabled and your {selectedDevice.name} is in pairing mode.
-              </Text>
-            )}
-            {selectedDevice.connectionType === 'web_link' && (
-              <Text style={styles.instructionsText}>
-                <Feather name="link" size={16} color="#555" style={styles.icon} />
-                You will be redirected to the {selectedDevice.name} website for authorization.
-              </Text>
-            )}
-            {selectedDevice.connectionType === 'api' && (
-              <Text style={styles.instructionsText}>
-                <Feather name="key" size={16} color="#555" style={styles.icon} />
-                The application will attempt to connect using your API credentials.
-              </Text>
-            )}
-            <TouchableOpacity
-              style={[
-                styles.connectButton,
-                isConnecting && styles.connectingButton,
-                connectionStatus?.success === true && styles.connectedButton,
-              ]}
-              onPress={handleConnectDevice}
-              disabled={isConnecting || connectionStatus?.success === true}
-            >
-              <Text style={styles.connectButtonText}>
-                {isConnecting ? <ActivityIndicator size="small" color="#fff" /> : connectionStatus?.success === true ? 'Connected' : 'Connect'}
-              </Text>
-            </TouchableOpacity>
-          </View>
+      <TouchableOpacity
+        style={[styles.connectButton, !selectedDevice && styles.disabledButton]}
+        onPress={handleConnectDevice}
+        disabled={!selectedDevice || isConnecting}
+      >
+        {isConnecting ? (
+          <ActivityIndicator color="white" />
+        ) : (
+          <Text style={styles.connectButtonText}>Connect Device</Text>
         )}
+      </TouchableOpacity>
 
-        {connectionStatus && (
-          <View style={styles.statusContainer}>
-            <Text style={styles.statusTitle}>Connection Status</Text>
-            {connectionStatus.success === true && (
-              <Text style={styles.successText}>
-                <Feather name="check-circle" size={16} color="#28a745" style={styles.icon} />
-                {connectionStatus.message}
-              </Text>
-            )}
-            {connectionStatus.success === false && (
-              <Text style={styles.errorText}>
-                <Feather name="alert-triangle" size={16} color="#dc3545" style={styles.icon} />
-                {connectionStatus.message}
-              </Text>
-            )}
-            {connectionStatus.success === null && (
-              <Text style={{ fontSize: 15, color: '#777' }}>
-                <Feather name="info" size={16} color="#777" style={styles.icon} />
-                {connectionStatus.message}
-              </Text>
-            )}
-          </View>
-        )}
-      </ScrollView>
-    </View>
+      {connectionStatus && (
+        <View style={[styles.statusMessage, connectionStatus.success ? styles.successMessage : styles.errorMessage]}>
+          <Feather name={connectionStatus.success ? "check-circle" : "alert-circle"} size={20} color={connectionStatus.success ? "#4ECDC4" : "#FF6B6B"} />
+          <Text style={[styles.statusText, connectionStatus.success ? styles.successText : styles.errorText]}>
+            {connectionStatus.message}
+          </Text>
+        </View>
+      )}
+
+      <View style={styles.infoSection}>
+        <Text style={styles.infoTitle}>Why Connect Your CGM?</Text>
+        <View style={styles.infoItem}>
+          <Feather name="trending-up" size={20} color="#4ECDC4" />
+          <Text style={styles.infoText}>Real-time glucose monitoring and trends</Text>
+        </View>
+        <View style={styles.infoItem}>
+          <Feather name="bar-chart-2" size={20} color="#4ECDC4" />
+          <Text style={styles.infoText}>Comprehensive data analysis and insights</Text>
+        </View>
+        <View style={styles.infoItem}>
+          <Feather name="bell" size={20} color="#4ECDC4" />
+          <Text style={styles.infoText}>Smart alerts and predictions</Text>
+        </View>
+      </View>
+
+      <TouchableOpacity style={styles.skipButton}>
+        <Text style={styles.skipButtonText}>I'll connect later</Text>
+      </TouchableOpacity>
+    </ScrollView>
   );
 };
 
 export default CGMConnectionScreen;
+*/
+
+// Export a placeholder component to prevent any import errors
+export default function Index() {
+  // This screen is no longer used - CGM connection is available in Profile tab
+  return null;
+}

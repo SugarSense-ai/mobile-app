@@ -248,6 +248,11 @@ export async function fetchTodaysInsights(forceRefresh: boolean = false, clerkUs
       params.append('clerk_user_id', clerkUserId);
     }
     
+    // Add cache-busting parameter if force refresh is requested
+    if (forceRefresh) {
+      params.append('_t', Date.now().toString());
+    }
+    
     const url = `${baseUrl}/api/insights${params.toString() ? '?' + params.toString() : ''}`;
     const response = await fetch(url, {
       method: 'GET',
@@ -458,7 +463,11 @@ function getEmptyMetrics(): UserMetrics {
  * Clear insights cache (useful after logging new data)
  */
 export function clearInsightsCache(): void {
-  insightsCache.isValid = false;
+  insightsCache = {
+    data: null,
+    timestamp: 0,
+    isValid: false
+  };
   console.log('🗑️ Insights cache cleared');
 }
 

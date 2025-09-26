@@ -12,17 +12,20 @@ export default function login() {
 
     const handleGoogleSignIn = async () => {
         try {
-            const { createdSessionId, setActive } = await startSSOFlow({ strategy: "oauth_google" });
+            const { createdSessionId, setActive } = await startSSOFlow({ 
+                strategy: "oauth_google",
+                redirectUrl: "sugarsenseai://oauth-callback"
+            });
             if (setActive && createdSessionId) {
                 setActive({ session: createdSessionId });
-                // Let InitialLayout handle the routing based on onboarding status
                 console.log("✅ Successfully signed in with Google");
             }
 
         } catch (error) {
-            console.log("Outh Error",error);
+            console.log("OAuth Error", error);
         }
     }
+
     return (
         <View style={styles.container}>
             <View style={styles.brandSection}>
@@ -50,9 +53,8 @@ export default function login() {
                     </View>
                     <Text style={styles.googleButtonText}>Continue with Google</Text>
                 </TouchableOpacity>
-                <Text style={styles.termsText}>
-                    By continuing, you agree to our Terms and Privacy Policy
-                </Text>
+                
+                <Text style={styles.termsText}>By continuing, you agree to our Terms and{'\n'}Privacy Policy</Text>
             </View>
         </View>
     )

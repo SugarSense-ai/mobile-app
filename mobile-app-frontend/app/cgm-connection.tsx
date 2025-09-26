@@ -5,7 +5,9 @@ import { Icon } from 'react-native-elements';
 import { COLORS } from '@/constants/theme';
 import { StyleSheet } from 'react-native';
 import { useUser } from '@clerk/clerk-expo';
-import config from '@/constants/config';
+import { connectCGM } from '@/services/cgmService';
+import { testNetworkConnectivity } from '@/constants/networkUtils';
+import { BACKEND_URL, FALLBACK_URLS } from '@/constants/config';
 
 interface CGMOption {
   id: string;
@@ -46,6 +48,55 @@ const CGMConnectionScreen = () => {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
 
+  // Network status states
+  const [networkStatus, setNetworkStatus] = useState<{
+    isConnected: boolean;
+    workingUrl: string | null;
+    isChecking: boolean;
+    lastChecked: Date | null;
+  }>({
+    isConnected: false,
+    workingUrl: null,
+    isChecking: true,
+    lastChecked: null,
+  });
+
+  // Check network connectivity on component mount
+  useEffect(() => {
+    const checkNetworkConnectivity = async () => {
+      console.log('🔍 CGM Connection: Checking network connectivity...');
+      setNetworkStatus(prev => ({ ...prev, isChecking: true }));
+      
+      try {
+        const urlsToTest = [BACKEND_URL, ...FALLBACK_URLS.filter(url => url !== BACKEND_URL)];
+        const networkInfo = await testNetworkConnectivity(urlsToTest, 1);
+        
+        setNetworkStatus({
+          isConnected: networkInfo.workingUrl !== null,
+          workingUrl: networkInfo.workingUrl,
+          isChecking: false,
+          lastChecked: new Date(),
+        });
+        
+        if (networkInfo.workingUrl) {
+          console.log(`✅ CGM Connection: Network connectivity OK - using ${networkInfo.workingUrl}`);
+        } else {
+          console.log('❌ CGM Connection: No working backend URLs found');
+        }
+      } catch (error) {
+        console.error('❌ CGM Connection: Network check failed:', error);
+        setNetworkStatus({
+          isConnected: false,
+          workingUrl: null,
+          isChecking: false,
+          lastChecked: new Date(),
+        });
+      }
+    };
+    
+    checkNetworkConnectivity();
+  }, []);
+
   // Reset credentials when CGM selection changes
   useEffect(() => {
     setUsername('');
@@ -67,41 +118,94 @@ const CGMConnectionScreen = () => {
       return;
     }
 
-    // Check if credentials are required and provided
-    if (selectedCGM && (!username || !password)) {
+    // Check network connectivity first
+    if (!networkStatus.isConnected) {
+      Alert.alert(
+        'Network Error', 
+        'Cannot connect to backend server. Please check your WiFi connection and ensure the backend server is running.',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
+
+    // Require credentials for both Dexcom and LibreLinkUp
+    if (!username || !password) {
       Alert.alert('Missing Credentials', 'Please enter your username and password to connect.');
       return;
     }
 
     const selectedOption = cgmOptions.find(option => option.id === selectedCGM);
-    if (!selectedOption) return;
+    if (!selectedOption || !user?.id) return;
 
     setIsConnecting(true);
 
     try {
-      // Simulate connection process
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Use the new CGM service for mobile-optimized connection
+      const result = await connectCGM(
+        user.id,
+        username,
+        password,
+        selectedCGM,
+        'us', // Default to US region
+        45000 // 45 second timeout for mobile
+      );
 
-      // In a real implementation, you would:
-      // 1. Make API call to initiate CGM connection
-      // 2. Handle OAuth flow if needed
-      // 3. Store connection details
+      if (!result.success) {
+        // Handle specific error types with appropriate alerts
+        let alertTitle = 'Connection Failed';
+        let errorMessage = result.error || 'Failed to connect to CGM device.';
+        
+        if (result.error?.includes('timeout')) {
+          alertTitle = 'Connection Timeout';
+          errorMessage = result.message || 'Connection timed out. Try connecting to WiFi for better connectivity.';
+        } else if (result.error?.includes('Invalid credentials')) {
+          alertTitle = 'Invalid Credentials';
+          errorMessage = result.message || 'Please check your username and password and try again.';
+        } else if (result.error?.includes('Network')) {
+          alertTitle = 'Network Error';
+          errorMessage = result.message || 'Unable to reach CGM servers. Please check your internet connection.';
+        } else if (result.message) {
+          errorMessage = result.message;
+        }
+        
+        Alert.alert(alertTitle, errorMessage, [{ text: 'OK' }]);
+        return;
+      }
+
+      // Success! Show connection confirmation with glucose data if available
+      let successMessage = `Your ${selectedOption.name} is now connected!`;
+      
+      if (result.currentGlucose) {
+        const glucose = result.currentGlucose;
+        successMessage += `\n\nCurrent glucose: ${glucose.value} mg/dL ${glucose.trendArrow || ''}`;
+        
+        console.log('📊 Current glucose data received:', {
+          value: glucose.value,
+          trend: glucose.trend,
+          timestamp: glucose.timestamp
+        });
+      }
+      
+      if (result.region) {
+        successMessage += `\n(Region: ${result.region.toUpperCase()})`;
+      }
 
       Alert.alert(
-        'Connection Initiated',
-        `We're setting up your connection to ${selectedOption.name}. You'll receive instructions via email shortly.`,
+        'Connection Successful',
+        successMessage,
         [
           {
             text: 'OK',
-            onPress: () => router.back()
-          }
+            onPress: () => router.back(),
+          },
         ]
       );
-    } catch (error) {
-      console.error('Error connecting CGM:', error);
+
+    } catch (error: any) {
+      console.error('Unexpected error connecting CGM:', error);
       Alert.alert(
-        'Connection Failed',
-        'Unable to connect to your CGM device. Please try again later.',
+        'Connection Error',
+        'An unexpected error occurred. Please try again.',
         [{ text: 'OK' }]
       );
     } finally {
@@ -141,6 +245,30 @@ const CGMConnectionScreen = () => {
             Select your CGM device to connect and sync your glucose data automatically.
           </Text>
 
+          {/* Network Status Indicator */}
+          <View style={styles.networkStatusContainer}>
+            {networkStatus.isChecking ? (
+              <View style={styles.networkStatusRow}>
+                <ActivityIndicator size="small" color={COLORS.mediumGray} />
+                <Text style={styles.networkStatusText}>Checking backend connection...</Text>
+              </View>
+            ) : networkStatus.isConnected ? (
+              <View style={styles.networkStatusRow}>
+                <Icon name="checkmark-circle" type="ionicon" color="#28a745" size={16} />
+                <Text style={[styles.networkStatusText, { color: '#28a745' }]}>
+                  Backend connected ({networkStatus.workingUrl?.replace('http://', '').replace(':3001', '')})
+                </Text>
+              </View>
+            ) : (
+              <View style={styles.networkStatusRow}>
+                <Icon name="warning" type="ionicon" color="#dc3545" size={16} />
+                <Text style={[styles.networkStatusText, { color: '#dc3545' }]}>
+                  Backend not reachable. Check WiFi and server status.
+                </Text>
+              </View>
+            )}
+          </View>
+
           <View style={styles.optionsContainer}>
             {cgmOptions.map((option) => (
               <TouchableOpacity
@@ -175,8 +303,8 @@ const CGMConnectionScreen = () => {
             ))}
           </View>
 
-          {/* Enhanced Login Box - visible only when a CGM is selected */}
-          {selectedCGM && (
+          {/* Enhanced Login Box - visible for Dexcom and LibreLinkUp */}
+          {selectedCGM && (selectedCGM.startsWith('dexcom') || selectedCGM === 'freestyle-libre-2') && (
             <View style={styles.loginBox}>
               <Text style={styles.loginBoxTitle}>
                 {selectedCGM === 'freestyle-libre-2' ? 'LibreLinkUp Account' : 'Dexcom Share Account'}
@@ -229,10 +357,10 @@ const CGMConnectionScreen = () => {
               <TouchableOpacity
                 style={[
                   styles.connectBoxButton, 
-                  (!username || !password || isConnecting) && styles.connectBoxButtonDisabled
+                  (((selectedCGM?.startsWith('dexcom') || selectedCGM === 'freestyle-libre-2') && (!username || !password)) || isConnecting || !networkStatus.isConnected) && styles.connectBoxButtonDisabled
                 ]}
                 onPress={handleConnect}
-                disabled={!username || !password || isConnecting}
+                disabled={((selectedCGM?.startsWith('dexcom') || selectedCGM === 'freestyle-libre-2') && (!username || !password)) || isConnecting || !networkStatus.isConnected}
               >
                 {isConnecting ? (
                   <ActivityIndicator size="small" color={COLORS.white} />
@@ -258,10 +386,10 @@ const CGMConnectionScreen = () => {
         <TouchableOpacity
           style={[
             styles.connectButton,
-            (!selectedCGM || isConnecting) && styles.connectButtonDisabled
+            (!selectedCGM || isConnecting || ((selectedCGM?.startsWith('dexcom') || selectedCGM === 'freestyle-libre-2') && (!username || !password)) || !networkStatus.isConnected) && styles.connectButtonDisabled
           ]}
           onPress={handleConnect}
-          disabled={!selectedCGM || isConnecting}
+          disabled={!selectedCGM || isConnecting || ((selectedCGM?.startsWith('dexcom') || selectedCGM === 'freestyle-libre-2') && (!username || !password)) || !networkStatus.isConnected}
         >
           {isConnecting ? (
             <ActivityIndicator size="small" color={COLORS.white} />
@@ -323,8 +451,23 @@ const styles = StyleSheet.create({
   subtitle: {
     fontSize: 16,
     color: COLORS.textSecondary,
-    marginBottom: 24,
+    marginBottom: 16,
     lineHeight: 22,
+  },
+  networkStatusContainer: {
+    marginBottom: 24,
+    paddingHorizontal: 4,
+  },
+  networkStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  networkStatusText: {
+    fontSize: 14,
+    marginLeft: 8,
+    color: COLORS.textSecondary,
+    fontWeight: '500',
   },
   optionsContainer: {
     marginBottom: 24,

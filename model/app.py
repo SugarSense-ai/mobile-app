@@ -23,9 +23,114 @@ import json
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import random
 import numpy as np
+from cryptography.fernet import Fernet
+from pydexcom import Dexcom
+from pylibrelinkup import PyLibreLinkUp
+import threading
+import time
 
 # Load environment variables from .env file
 load_dotenv()
+
+# --- CGM Security and Configuration Classes ---
+
+class CGMSecurity:
+    """Handles encryption and decryption of CGM credentials"""
+    
+    @staticmethod
+    def get_encryption_key():
+        """Get or generate encryption key for CGM credentials"""
+        # First try to get from environment variable
+        key = os.environ.get('CGM_ENCRYPTION_KEY')
+        
+        if key:
+            # If key exists in environment, decode it
+            try:
+                return base64.urlsafe_b64decode(key.encode())
+            except Exception as e:
+                print(f"⚠️ Error decoding encryption key from environment: {e}")
+        
+        # Check if key file exists
+        key_file = '.encryption_key'
+        if os.path.exists(key_file):
+            try:
+                with open(key_file, 'rb') as f:
+                    return f.read()
+            except Exception as e:
+                print(f"⚠️ Error reading encryption key file: {e}")
+        
+        # Generate new key and save to file
+        new_key = Fernet.generate_key()
+        try:
+            with open(key_file, 'wb') as f:
+                f.write(new_key)
+            print(f"🔐 Generated new CGM encryption key and saved to {key_file}")
+            
+            # Also provide environment variable format for production
+            encoded_key = base64.urlsafe_b64encode(new_key).decode()
+            print(f"🔑 For production, set environment variable: CGM_ENCRYPTION_KEY={encoded_key}")
+            
+            return new_key
+        except Exception as e:
+            print(f"❌ Error saving encryption key: {e}")
+            # Return the key anyway for this session
+            return new_key
+    
+    @staticmethod
+    def encrypt_password(password: str) -> bytes:
+        """Encrypt a password for storage"""
+        try:
+            key = CGMSecurity.get_encryption_key()
+            cipher_suite = Fernet(key)
+            return cipher_suite.encrypt(password.encode())
+        except Exception as e:
+            print(f"❌ Error encrypting password: {e}")
+            raise Exception("Failed to encrypt password")
+    
+    @staticmethod
+    def decrypt_password(encrypted_password: bytes) -> str:
+        """Decrypt a password from storage"""
+        try:
+            key = CGMSecurity.get_encryption_key()
+            cipher_suite = Fernet(key)
+            return cipher_suite.decrypt(encrypted_password).decode()
+        except Exception as e:
+            print(f"❌ Error decrypting password: {e}")
+            raise Exception("Failed to decrypt password")
+
+class DexcomConfig:
+    """Configuration constants for Dexcom CGM integration"""
+    
+    REGIONS = {
+        'us': 'United States',
+        'ous': 'Outside United States', 
+        'jp': 'Japan'
+    }
+    
+    CGM_TYPES = {
+        'dexcom-g6-g5-one-plus': 'Dexcom G6/G5/One+',
+        'dexcom-g7': 'Dexcom G7',
+        'freestyle-libre-2': 'Abbott Freestyle Libre 2'
+    }
+    
+    DEFAULT_SYNC_FREQUENCY = 15  # minutes
+    MAX_READINGS_PER_SYNC = 100
+    CONNECTION_TIMEOUT = 30  # seconds
+    RETRY_ATTEMPTS = 3
+    
+    # Rate limiting
+    MIN_SYNC_INTERVAL = 5  # minimum minutes between syncs
+    MAX_DAILY_SYNCS = 96  # 24 hours * 4 syncs per hour
+    
+    @staticmethod
+    def get_region_endpoint(region: str) -> str:
+        """Get the appropriate Dexcom endpoint for region"""
+        endpoints = {
+            'us': 'share2.dexcom.com',
+            'ous': 'shareous1.dexcom.com',
+            'jp': 'share.dexcom.jp'
+        }
+        return endpoints.get(region, endpoints['us'])
 
 # --- Configuration ---
 app = Flask(__name__)
@@ -55,9 +160,32 @@ else:
     print("GEMINI_API_KEY not found in .env. Gemini functionality will be disabled.")
     gemini_model = None
 
-# MySQL connection
-MYSQL_URL = os.getenv("MYSQL_URL", "mysql+pymysql://root:Alex%4012345@localhost/sugarsense")
-engine = create_engine(MYSQL_URL)
+# MySQL connection using individual environment variables
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_PORT = os.getenv("MYSQL_PORT", "3306")
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "Alex%4012345")
+MYSQL_DB = os.getenv("MYSQL_DB", "sugarsense")
+
+# Construct the MySQL URL from individual components with better connection settings
+MYSQL_URL = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
+
+# Create engine with improved settings for lock timeout handling
+engine = create_engine(
+    MYSQL_URL,
+    pool_size=20,
+    max_overflow=30,
+    pool_timeout=30,
+    pool_recycle=3600,
+    pool_pre_ping=True,
+    connect_args={
+        "autocommit": False,
+        "connect_timeout": 60,
+        "read_timeout": 60,
+        "write_timeout": 60,
+        "charset": "utf8mb4"
+    }
+)
 
 def create_activity_log_table():
     """Create the activity_log table for manual activity entries"""
@@ -188,7 +316,7 @@ def create_verification_health_data_table():
 
 # --- Database Initialization ---
 def create_glucose_log_table():
-    """Create the glucose_log table for glucose readings"""
+    """Create the glucose_log table for glucose readings with unique constraint to prevent duplicates"""
     try:
         with engine.connect() as conn:
             conn.execute(text("""
@@ -198,10 +326,27 @@ def create_glucose_log_table():
                     timestamp DATETIME NOT NULL,
                     glucose_level DECIMAL(5,1) NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_user_timestamp (user_id, timestamp)
+                    INDEX idx_user_timestamp (user_id, timestamp),
+                    UNIQUE KEY unique_user_timestamp (user_id, timestamp)
                 )
             """))
             conn.commit()
+            
+            # Add unique constraint to existing table if it doesn't exist
+            try:
+                conn.execute(text("""
+                    ALTER TABLE glucose_log 
+                    ADD UNIQUE KEY unique_user_timestamp (user_id, timestamp)
+                """))
+                conn.commit()
+                print("✅ Added unique constraint to glucose_log table")
+            except Exception as alter_error:
+                # Constraint might already exist, which is fine
+                if "Duplicate key name" in str(alter_error):
+                    print("ℹ️ Unique constraint already exists on glucose_log table")
+                else:
+                    print(f"⚠️  Note: Could not add unique constraint: {alter_error}")
+            
             print("✅ Glucose log table created/verified successfully")
     except Exception as e:
         print(f"Error creating glucose_log table: {e}")
@@ -327,6 +472,10 @@ def create_users_table():
                     daily_basal_dose DECIMAL(5,2),
                     insulin_to_carb_ratio DECIMAL(5,2),
                     
+                    -- Target Glucose Range (customizable by user)
+                    target_glucose_min INT DEFAULT 70,
+                    target_glucose_max INT DEFAULT 140,
+                    
                     -- Device Preferences (from onboarding)
                     cgm_status ENUM('No – Decided against it', 'No – Still deciding', 'No – Trying to get one', 'Yes – I already use one'),
                     cgm_model ENUM('Dexcom G7 / One+', 'Dexcom G6 / G5 / One', 'Abbott Freestyle Libre'),
@@ -348,6 +497,36 @@ def create_users_table():
                 )
             """))
             conn.commit()
+            
+            # Add target glucose columns if they don't exist (for existing databases)
+            try:
+                conn.execute(text("""
+                    ALTER TABLE users 
+                    ADD COLUMN target_glucose_min INT DEFAULT 70
+                """))
+                conn.commit()
+                print("✅ Added target_glucose_min column to users table")
+            except Exception as alter_error:
+                # Column might already exist, which is fine
+                if "Duplicate column name" in str(alter_error):
+                    pass
+                else:
+                    print(f"⚠️  Note: Could not add target_glucose_min column: {alter_error}")
+            
+            try:
+                conn.execute(text("""
+                    ALTER TABLE users 
+                    ADD COLUMN target_glucose_max INT DEFAULT 140
+                """))
+                conn.commit()
+                print("✅ Added target_glucose_max column to users table")
+            except Exception as alter_error:
+                # Column might already exist, which is fine
+                if "Duplicate column name" in str(alter_error):
+                    pass
+                else:
+                    print(f"⚠️  Note: Could not add target_glucose_max column: {alter_error}")
+                    
             print("✅ Users table created/verified successfully")
     except Exception as e:
         print(f"Error creating users table: {e}")
@@ -376,6 +555,78 @@ def create_basal_dose_logs_table():
         print(f"Error creating basal_dose_logs table: {e}")
         raise
 
+def create_cgm_connections_table():
+    """Create the cgm_connections table for storing CGM device credentials and connection status"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS cgm_connections (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    cgm_type ENUM('dexcom-g6-g5-one-plus', 'dexcom-g7', 'freestyle-libre-2') NOT NULL,
+                    region ENUM('us', 'ous', 'jp') DEFAULT 'us',
+                    username VARCHAR(255) NOT NULL,
+                    password_encrypted BLOB NOT NULL,
+                    account_id VARCHAR(255) NULL,
+                    connection_status ENUM('connected', 'failed', 'expired', 'testing') DEFAULT 'testing',
+                    active INT DEFAULT 1,
+                    last_sync_at TIMESTAMP NULL,
+                    last_error_message TEXT NULL,
+                    sync_frequency_minutes INT DEFAULT 15,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    
+                    UNIQUE KEY unique_user_cgm (user_id, cgm_type),
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    INDEX idx_user_status (user_id, connection_status),
+                    INDEX idx_last_sync (last_sync_at),
+                    INDEX idx_status_sync (connection_status, last_sync_at)
+                )
+            """))
+            
+            # Check if 'active' column exists and add it if not (for existing databases)
+            result = conn.execute(text("SHOW COLUMNS FROM cgm_connections LIKE 'active'"))
+            if not result.fetchone():
+                conn.execute(text("ALTER TABLE cgm_connections ADD COLUMN active INT DEFAULT 1"))
+                print("✅ Added 'active' column to existing cgm_connections table")
+            
+            conn.commit()
+            print("✅ CGM connections table created/verified successfully")
+    except Exception as e:
+        print(f"Error creating cgm_connections table: {e}")
+        raise
+
+def create_cgm_sync_logs_table():
+    """Create the cgm_sync_logs table for monitoring and debugging CGM sync operations"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS cgm_sync_logs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    cgm_connection_id INT NOT NULL,
+                    sync_start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    sync_end_time TIMESTAMP NULL,
+                    readings_fetched INT DEFAULT 0,
+                    readings_inserted INT DEFAULT 0,
+                    readings_duplicated INT DEFAULT 0,
+                    sync_status ENUM('in_progress', 'completed', 'failed') DEFAULT 'in_progress',
+                    error_message TEXT NULL,
+                    api_response_time_ms INT NULL,
+                    
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY (cgm_connection_id) REFERENCES cgm_connections(id) ON DELETE CASCADE,
+                    INDEX idx_user_sync_time (user_id, sync_start_time),
+                    INDEX idx_status_time (sync_status, sync_start_time),
+                    INDEX idx_connection_status (cgm_connection_id, sync_status)
+                )
+            """))
+            conn.commit()
+            print("✅ CGM sync logs table created/verified successfully")
+    except Exception as e:
+        print(f"Error creating cgm_sync_logs table: {e}")
+        raise
+
 def initialize_database():
     """Creates all necessary database tables if they don't exist."""
     print("--- Initializing Database ---")
@@ -386,6 +637,8 @@ def initialize_database():
     create_medication_log_table()
     create_sleep_log_table()
     create_basal_dose_logs_table()  # Add basal dose logs table
+    create_cgm_connections_table()  # CGM connections table
+    create_cgm_sync_logs_table()  # CGM sync monitoring table
     create_health_data_archive_table()
     create_health_data_display_table()
     create_verification_health_data_table()
@@ -393,6 +646,13 @@ def initialize_database():
 
 # Run initialization at startup
 initialize_database()
+
+# Clean up any existing duplicates on startup
+print("🧪 Cleaning up any existing duplicate glucose readings...")
+try:
+    cleanup_duplicate_glucose_readings()
+except Exception as e:
+    print(f"⚠️ Could not clean up duplicates on startup: {e}")
 
 # --- User Management Helper Functions ---
 
@@ -412,13 +672,13 @@ def get_user_id_from_clerk(clerk_user_id: str) -> int:
     try:
         with engine.connect() as conn:
             result = conn.execute(text("""
-                SELECT user_id FROM users WHERE clerk_user_id = :clerk_user_id
+                SELECT id FROM users WHERE clerk_user_id = :clerk_user_id
             """), {'clerk_user_id': clerk_user_id}).fetchone()
             
             if not result:
                 raise ValueError(f"User not found for clerk_user_id: {clerk_user_id}")
             
-            return result.user_id
+            return result.id
     except Exception as e:
         print(f"Error getting user_id for clerk_user_id {clerk_user_id}: {e}")
         raise
@@ -440,7 +700,7 @@ def get_or_create_user(clerk_user_id: str, email: str, full_name: str = None, pr
         with engine.connect() as conn:
             # Check if user already exists
             existing_user = conn.execute(text("""
-                SELECT user_id, onboarding_completed FROM users WHERE clerk_user_id = :clerk_user_id
+                SELECT id, onboarding_completed FROM users WHERE clerk_user_id = :clerk_user_id
             """), {'clerk_user_id': clerk_user_id}).fetchone()
             
             if existing_user:
@@ -452,7 +712,7 @@ def get_or_create_user(clerk_user_id: str, email: str, full_name: str = None, pr
                 conn.commit()
                 
                 return {
-                    "user_id": existing_user.user_id,
+                    "user_id": existing_user.id,
                     "onboarding_completed": bool(existing_user.onboarding_completed),
                     "created": False
                 }
@@ -483,6 +743,342 @@ def get_or_create_user(clerk_user_id: str, email: str, full_name: str = None, pr
         print(f"Error in get_or_create_user for clerk_user_id {clerk_user_id}: {e}")
         raise
 
+# --- CGM Helper Functions ---
+
+def test_dexcom_connection(username: str, password: str, region: str = 'us') -> dict:
+    """
+    Test Dexcom connection without storing credentials
+    
+    Args:
+        username: Dexcom Share username
+        password: Dexcom Share password  
+        region: Dexcom region ('us', 'ous', 'jp')
+        
+    Returns:
+        dict: Connection test result with success status and current glucose if available
+    """
+    try:
+        print(f"🔗 Testing Dexcom connection for username: {username[:3]}*** in region: {region}")
+        
+        # Initialize Dexcom client with updated API
+        from pydexcom import Region
+        region_enum = Region.US if region == 'us' else (Region.OUS if region == 'ous' else Region.JP)
+        dexcom = Dexcom(username=username, password=password, region=region_enum)
+        
+        # Test connection by fetching current glucose reading
+        current_glucose = dexcom.get_current_glucose_reading()
+        
+        if current_glucose is not None:
+            return {
+                "success": True,
+                "message": "Connection successful",
+                "current_glucose": {
+                    "value": current_glucose.value,
+                    "trend": current_glucose.trend_description,
+                    "trend_arrow": current_glucose.trend_arrow,
+                    "timestamp": current_glucose.datetime.isoformat() if current_glucose.datetime else None
+                }
+            }
+        else:
+            # Connection worked but no current reading available
+            return {
+                "success": True,
+                "message": "Connection successful, but no current glucose reading available",
+                "current_glucose": None
+            }
+            
+    except Exception as e:
+        error_msg = str(e).lower()
+        
+        # Provide specific error messages based on common issues
+        if "invalid" in error_msg or "unauthorized" in error_msg:
+            return {
+                "success": False,
+                "error": "Invalid username or password",
+                "message": "Please check your Dexcom Share credentials and try again"
+            }
+        elif "network" in error_msg or "connection" in error_msg:
+            return {
+                "success": False,
+                "error": "Network connection failed",
+                "message": "Unable to connect to Dexcom servers. Please check your internet connection"
+            }
+        elif "region" in error_msg:
+            return {
+                "success": False,
+                "error": "Incorrect region",
+                "message": f"Region '{region}' may be incorrect. Try 'us' for United States, 'ous' for outside US, or 'jp' for Japan"
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Connection failed: {str(e)}",
+                "message": "Unable to connect to Dexcom. Please verify your credentials and region"
+            }
+
+
+def test_librelink_connection(username: str, password: str) -> dict:
+    """
+    Test LibreLinkUp connection without storing credentials
+    
+    Args:
+        username: LibreLinkUp email
+        password: LibreLinkUp password
+        
+    Returns:
+        dict: Connection test result with success status and current glucose if available
+    """
+    try:
+        print(f"🔗 Testing LibreLinkUp connection for username: {username[:3]}***")
+        
+        # Initialize LibreLinkUp client
+        client = PyLibreLinkUp(email=username, password=password)
+        client.authenticate()
+        
+        # Get patient list
+        patients = client.get_patients()
+        if not patients:
+            return {
+                "success": False,
+                "error": "No patients found",
+                "message": "No patients associated with this LibreLinkUp account"
+            }
+        
+        # Get current glucose reading from first patient
+        current_glucose = client.latest(patient_identifier=patients[0])
+        
+        if current_glucose is not None:
+            return {
+                "success": True,
+                "message": "Connection successful",
+                "current_glucose": {
+                    "value": current_glucose.value,
+                    "timestamp": current_glucose.timestamp.isoformat() if current_glucose.timestamp else None,
+                    "trend": getattr(current_glucose, 'trend', None)
+                }
+            }
+        else:
+            # Connection worked but no current reading available
+            return {
+                "success": True,
+                "message": "Connection successful, but no current glucose reading available",
+                "current_glucose": None
+            }
+            
+    except Exception as e:
+        error_msg = str(e).lower()
+        
+        # Provide specific error messages based on common issues
+        if "invalid" in error_msg or "unauthorized" in error_msg or "authentication" in error_msg:
+            return {
+                "success": False,
+                "error": "Invalid username or password",
+                "message": "Please check your LibreLinkUp credentials and try again"
+            }
+        elif "network" in error_msg or "connection" in error_msg:
+            return {
+                "success": False,
+                "error": "Network connection failed",
+                "message": "Unable to connect to LibreLinkUp servers. Please check your internet connection"
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Connection failed: {str(e)}",
+                "message": "Unable to connect to LibreLinkUp. Please verify your credentials"
+            }
+
+def validate_cgm_credentials(username: str, password: str, cgm_type: str, region: str = 'us') -> dict:
+    """
+    Validate CGM credentials and return detailed validation result
+    
+    Args:
+        username: CGM username
+        password: CGM password
+        cgm_type: Type of CGM device
+        region: Region for Dexcom devices
+        
+    Returns:
+        dict: Validation result with success status and details
+    """
+    try:
+        # Validate inputs
+        if not username or not password:
+            return {
+                "success": False,
+                "error": "Missing credentials",
+                "message": "Username and password are required"
+            }
+
+        # Handle LibreLinkUp devices
+        if cgm_type == 'freestyle-libre-2':
+            connection_result = test_librelink_connection(username, password)
+            if connection_result["success"]:
+                return {
+                    "success": True,
+                    "message": "Credentials validated successfully",
+                    "connection_test": connection_result
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": connection_result["error"],
+                    "message": connection_result["message"],
+                    "connection_test": connection_result
+                }
+
+        # Handle Dexcom devices
+        elif cgm_type.startswith('dexcom'):
+            # Validate region
+            if region not in DexcomConfig.REGIONS:
+                return {
+                    "success": False,
+                    "error": "Invalid region",
+                    "message": f"Region must be one of: {', '.join(DexcomConfig.REGIONS.keys())}"
+                }
+            
+            # Test the connection
+            connection_result = test_dexcom_connection(username, password, region)
+            
+            if connection_result["success"]:
+                return {
+                    "success": True,
+                    "message": "Credentials validated successfully",
+                    "connection_test": connection_result
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": connection_result["error"],
+                    "message": connection_result["message"],
+                    "connection_test": connection_result
+                }
+        
+        # Unsupported CGM type
+        else:
+            return {
+                "success": False,
+                "error": "Unsupported CGM type",
+                "message": f"CGM type '{cgm_type}' is not yet supported."
+            }
+        
+
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Validation failed: {str(e)}",
+            "message": "Unable to validate credentials"
+        }
+
+def get_user_cgm_connections(user_id: int) -> list:
+    """
+    Get all CGM connections for a user
+    
+    Args:
+        user_id: Database user ID
+        
+    Returns:
+        list: List of CGM connections with status
+    """
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT id, cgm_type, region, username, connection_status, 
+                       last_sync_at, last_error_message, sync_frequency_minutes,
+                       created_at, updated_at
+                FROM cgm_connections 
+                WHERE user_id = :user_id
+                ORDER BY created_at DESC
+            """), {'user_id': user_id}).fetchall()
+            
+            connections = []
+            for row in result:
+                connections.append({
+                    "id": row.id,
+                    "cgm_type": row.cgm_type,
+                    "region": row.region,
+                    "username": row.username,
+                    "connection_status": row.connection_status,
+                    "last_sync_at": row.last_sync_at.isoformat() if row.last_sync_at else None,
+                    "last_error_message": row.last_error_message,
+                    "sync_frequency_minutes": row.sync_frequency_minutes,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "updated_at": row.updated_at.isoformat() if row.updated_at else None
+                })
+            
+            return connections
+            
+    except Exception as e:
+        print(f"❌ Error getting CGM connections for user {user_id}: {e}")
+        return []
+
+def log_cgm_sync_attempt(user_id: int, cgm_connection_id: int, sync_start_time: datetime) -> int:
+    """
+    Log the start of a CGM sync attempt
+    
+    Args:
+        user_id: Database user ID
+        cgm_connection_id: CGM connection ID
+        sync_start_time: When the sync started
+        
+    Returns:
+        int: Sync log ID for updating later
+    """
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                INSERT INTO cgm_sync_logs 
+                (user_id, cgm_connection_id, sync_start_time, sync_status)
+                VALUES (:user_id, :cgm_connection_id, :sync_start_time, 'in_progress')
+            """), {
+                'user_id': user_id,
+                'cgm_connection_id': cgm_connection_id,
+                'sync_start_time': sync_start_time
+            })
+            
+            sync_log_id = result.lastrowid
+            conn.commit()
+            return sync_log_id
+            
+    except Exception as e:
+        print(f"❌ Error logging CGM sync attempt: {e}")
+        return None
+
+def update_cgm_sync_result(sync_log_id: int, success: bool, readings_fetched: int = 0, 
+                          readings_inserted: int = 0, error_message: str = None) -> None:
+    """
+    Update CGM sync log with results
+    
+    Args:
+        sync_log_id: Sync log ID to update
+        success: Whether sync was successful
+        readings_fetched: Number of readings fetched from CGM
+        readings_inserted: Number of readings inserted to database
+        error_message: Error message if sync failed
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                UPDATE cgm_sync_logs 
+                SET sync_end_time = CURRENT_TIMESTAMP,
+                    sync_status = :status,
+                    readings_fetched = :readings_fetched,
+                    readings_inserted = :readings_inserted,
+                    error_message = :error_message
+                WHERE id = :sync_log_id
+            """), {
+                'sync_log_id': sync_log_id,
+                'status': 'completed' if success else 'failed',
+                'readings_fetched': readings_fetched,
+                'readings_inserted': readings_inserted,
+                'error_message': error_message
+            })
+            conn.commit()
+            
+    except Exception as e:
+        print(f"❌ Error updating CGM sync result: {e}")
+
 # Setup persistent ChromaDB memory
 try:
     embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
@@ -505,29 +1101,9 @@ except Exception as e:
     print("Please ensure 'chroma_db' directory exists and sentence-transformers is installed (`pip install sentence-transformers chromadb`)")
     collection = None
 
-# Placeholder for MySQL data (as discussed, this would come from a real DB)
-# USER_HEALTH_SUMMARY = """
-# User is a 35-year-old male with Type 2 Diabetes.
-# Average glucose level over the last 7 days: 145 mg/dL.
-# Time in range (70-180 mg/dL) today: 70%.
-# Last meal: 3 hours ago, rice and chicken.
-# Last activity: 1 hour ago, 30-minute walk.
-# Current medications: Metformin 500mg twice daily.
-# Recent trend: Glucose levels tend to spike after high-carb meals.
-# """
-
-# def generate_rag_prompt(query: str) -> str:
-#     # This function is now mostly for the Gemini text-only path, or can be adapted for RAG with Gemini.
-#     rag_context = f"User health summary: {USER_HEALTH_SUMMARY}\n\n"
-#     prompt = f"Using the following context and health summary, answer the user's question:\n\n" \
-#              f"{rag_context}" \
-#              f"Question: {query}\n\n" \
-#              f"Provide a concise answer, ideally under 60 words, and directly address the user's question. " \
-#              f"If the information is not available in the provided context, state that clearly."
-#     return prompt
-
 # --- Flask Route for Chat API ---
 @app.route('/api/chat', methods=['POST'])
+
 def chat():
     data = request.json
     user_message = data.get('message', '')
@@ -660,6 +1236,127 @@ def chat():
     except Exception as e:
         print(f"Error fetching recent meals: {e}")
 
+    # Fetch step data from database (last 30 days for comprehensive coverage)
+    try:
+        if user_id:
+            with engine.connect() as conn:
+                # Prioritize display table and fallback to archive to prevent double counting
+                step_data_query = text("""
+                    SELECT DATE(start_date) as date, SUM(value) as total_steps
+                    FROM health_data_display
+                    WHERE user_id = :user_id AND data_type = 'StepCount'
+                      AND start_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                      AND value > 0
+                    GROUP BY DATE(start_date)
+                    UNION
+                    SELECT DATE(start_date) as date, SUM(value) as total_steps
+                    FROM health_data_archive
+                    WHERE user_id = :user_id AND data_type = 'StepCount'
+                      AND start_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                      AND value > 0
+                      AND DATE(start_date) NOT IN (
+                          SELECT DISTINCT DATE(start_date)
+                          FROM health_data_display
+                          WHERE user_id = :user_id AND data_type = 'StepCount'
+                            AND start_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                      )
+                    GROUP BY DATE(start_date)
+                    ORDER BY date DESC
+                """)
+                step_records = conn.execute(step_data_query, {'user_id': user_id}).fetchall()
+        else:
+            step_records = []
+
+        if step_records:
+            step_data_str = "Step data for last 30 days:"
+            print(f"📊 Retrieved {len(step_records)} days of step data")
+            for record in step_records:
+                step_data_str += f"\n- {record.date}: {int(record.total_steps)} steps"
+            health_snapshot_str += f"\n{step_data_str}"
+        else:
+            health_snapshot_str += "\nNo step data available for the last 30 days."
+            print(f"⚠️ No step data found for user {user_id}")
+    except Exception as e:
+        print(f"Error fetching step data: {e}")
+
+    # Fetch sleep data from database (last 30 days for comprehensive coverage)
+    try:
+        if user_id:
+            with engine.connect() as conn:
+                # Get sleep data from archive table as the main source of truth
+                # FIX: Use MAX to get the longest sleep session per day, not total
+                sleep_data_query = text("""
+                    SELECT
+                        DATE(end_date) as date,
+                        MAX(TIMESTAMPDIFF(MINUTE, start_date, end_date) / 60.0) as total_hours
+                    FROM
+                        health_data_archive
+                    WHERE
+                        user_id = :user_id AND data_type = 'SleepAnalysis'
+                        AND end_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                    GROUP BY DATE(end_date)
+                    ORDER BY DATE(end_date) DESC
+                """)
+                sleep_records = conn.execute(sleep_data_query, {'user_id': user_id}).fetchall()
+        else:
+            sleep_records = []
+        
+        if sleep_records:
+            sleep_data_str = "Sleep data for last 30 days:"
+            print(f"🛏️ Retrieved {len(sleep_records)} days of sleep data")
+            for record in sleep_records:
+                sleep_data_str += f"\n- {record.date}: {record.total_hours:.1f} hours"
+            health_snapshot_str += f"\n{sleep_data_str}"
+        else:
+            health_snapshot_str += "\nNo sleep data available for the last 30 days."
+            print(f"⚠️ No sleep data found for user {user_id}")
+    except Exception as e:
+        print(f"Error fetching sleep data: {e}")
+
+    # Fetch activity/calories data from database (last 30 days for comprehensive coverage)
+    try:
+        if user_id:
+            with engine.connect() as conn:
+                # Get active calories data from display table with fallback to archive
+                calories_data_query = text("""
+                    SELECT DATE(start_date) as date, SUM(CAST(value AS DECIMAL(10,2))) as total_calories 
+                    FROM health_data_display
+                    WHERE user_id = :user_id AND data_type = 'ActiveEnergyBurned'
+                      AND start_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                      AND CAST(value AS DECIMAL(10,2)) > 0
+                    GROUP BY DATE(start_date)
+                    ORDER BY DATE(start_date) DESC
+                """)
+                calories_records = conn.execute(calories_data_query, {'user_id': user_id}).fetchall()
+                
+                # Fallback to archive if no display data found
+                if not calories_records:
+                    print(f"⚠️ No calories data in display table, falling back to archive table")
+                    calories_archive_query = text("""
+                        SELECT DATE(start_date) as date, SUM(CAST(value AS DECIMAL(10,2))) as total_calories 
+                        FROM health_data_archive
+                        WHERE user_id = :user_id AND data_type = 'ActiveEnergyBurned'
+                          AND start_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                          AND CAST(value AS DECIMAL(10,2)) > 0
+                        GROUP BY DATE(start_date)
+                        ORDER BY DATE(start_date) DESC
+                    """)
+                    calories_records = conn.execute(calories_archive_query, {'user_id': user_id}).fetchall()
+        else:
+            calories_records = []
+        
+        if calories_records:
+            calories_data_str = "Active calories for last 30 days:"
+            print(f"🔥 Retrieved {len(calories_records)} days of calories data")
+            for record in calories_records:
+                calories_data_str += f"\n- {record.date}: {int(record.total_calories)} calories"
+            health_snapshot_str += f"\n{calories_data_str}"
+        else:
+            health_snapshot_str += "\nNo active calories data available for the last 30 days."
+            print(f"⚠️ No calories data found for user {user_id}")
+    except Exception as e:
+        print(f"Error fetching calories data: {e}")
+
     # 4. Construct the comprehensive prompt for Gemini
     system_instructions = """
 # Your Role: SugarSense.ai - Advanced AI Health Assistant
@@ -668,7 +1365,7 @@ You are an expert AI assistant specializing in diabetes management, nutrition, a
 # Core Instructions:
 1. **Analyze Holistically:** Use all contexts: question, health snapshot, history, RAG data.
 2. **Handle Incomplete Data:** Use available data; state what's missing clearly. If no data for a metric (e.g., today's average), skip it or note absence - NEVER fabricate values.
-3. **Timeframes:** Default to last 90 days if unspecified; use specified periods otherwise.
+3. **Timeframes:** You have access to up to 30 days of comprehensive health data. When users ask about specific time periods (e.g., "last 7 days", "last 15 days", "last week"), calculate averages and trends from the available data within that timeframe. If they don't specify a timeframe, default to the most recent relevant period.
 4. **Concise & Factual:** Short responses, no verbose paragraphs or repeated disclaimers.
 5. **Avoid Hallucination:** Stick strictly to provided data; say "I'm not sure" or "Based on available info..." if uncertain. For trends/predictions, base on historical patterns and meal composition only.
 6. **Interactive & Contextual:** Build on history and recent interactions intelligently.
@@ -676,6 +1373,8 @@ You are an expert AI assistant specializing in diabetes management, nutrition, a
 8. **Meal Queries:** Provide detailed descriptions and summaries of meals from logs, including ingredients if available.
 9. **Disclaimers:** Only include medical disclaimers if providing specific medical guidance.
 10. **Trend Inference:** For future glucose trends, infer from real historical data and meal analysis; be vague if insufficient data (e.g., "Based on similar meals...").
+11. **Dynamic Time Periods:** When users ask about averages or trends for specific time periods, use the available data to calculate accurate statistics. For example, if they ask about "last 7 days" and you have data for 5 of those days, calculate the average from those 5 days and mention the missing days.
+12. **Source of Truth:** The "Real-time Health Snapshot" is your primary source of truth for specific data points and logs. Use "Relevant Health Memories (RAG)" for general context, but the Snapshot is authoritative. If there's a conflict, the Snapshot wins.
 
 # Task: Reason step-by-step internally, then provide a clean response.
 """
@@ -683,10 +1382,10 @@ You are an expert AI assistant specializing in diabetes management, nutrition, a
     # Prepare the content parts for the Gemini API call
     prompt_content = [
         system_instructions,
-        "\n--- Relevant Health Memories (RAG) ---\n",
-        retrieved_context,
-        "\n--- Real-time Health Snapshot ---\n",
+        "\n--- Real-time Health Snapshot (Source of Truth) ---\n",
         health_snapshot_str,
+        "\n--- Relevant Health Memories (for context) ---\n",
+        retrieved_context,
         "\n--- User's Current Question ---\n",
         user_message
     ]
@@ -1727,65 +2426,394 @@ def map_healthkit_data_type(healthkit_type: str) -> str:
     }
     return mapping.get(healthkit_type, healthkit_type)
 
+def is_record_within_display_window(record: Dict[str, Any], days_back: int = 7) -> bool:
+    """Check if a health record is within the display window (default: today + 7 previous days = 8 total days)"""
+    try:
+        # Get the record's date (prefer start_date, fallback to end_date)
+        record_date = record.get('start_date') or record.get('end_date')
+        if not record_date:
+            print(f"⚠️ Display window check: No date found in record")
+            return False  # No date, exclude from display
+        
+        original_record_date = record_date  # Keep for debugging
+        
+        # Handle both datetime objects and strings
+        if isinstance(record_date, str):
+            record_date = parse_iso_datetime(record_date)
+        
+        if not record_date:
+            print(f"⚠️ Display window check: Failed to parse date '{original_record_date}'")
+            return False
+        
+        # Convert to date for comparison (remove time component)
+        if hasattr(record_date, 'date'):
+            record_date = record_date.date()
+        
+        # Calculate cutoff date - FIXED: Include today + 7 previous days (8 total days)
+        # Use same logic as main dashboard: today - days_back gives us the start date
+        cutoff_date = (datetime.now() - timedelta(days=days_back)).date()
+        today = datetime.now().date()
+        
+        # Include if record is within the display window (today + previous 7 days)
+        is_within_window = record_date >= cutoff_date and record_date <= today
+        
+        # Enhanced debugging for current and recent dates
+        data_type = record.get('data_type', 'Unknown')
+        if record_date >= today - timedelta(days=2):  # Today or last 2 days
+            print(f"🔍 Display window check: {data_type} record from {record_date} - {'✅ INCLUDED' if is_within_window else '❌ EXCLUDED'} (cutoff: {cutoff_date}, today: {today})")
+        
+        return is_within_window
+        
+    except Exception as e:
+        print(f"⚠️ Error checking display window for record: {e}")
+        return False  # Default to excluding on error
+
+def check_if_first_time_sync_internal(user_id: int) -> bool:
+    """Check if this is the first time syncing Apple Health data for this user"""
+    try:
+        with engine.connect() as conn:
+            # Check if user has any health data in archive table
+            result = conn.execute(text("""
+                SELECT COUNT(*) as count 
+                FROM health_data_archive 
+                WHERE user_id = :user_id 
+                LIMIT 1
+            """), {'user_id': user_id}).fetchone()
+            
+            count = result.count if result else 0
+            is_first_time = count == 0
+            
+            print(f"{'🆕' if is_first_time else '🔄'} First-time sync check for user {user_id}: {is_first_time} (found {count} existing records)")
+            return is_first_time
+            
+    except Exception as e:
+        print(f"❌ Error checking first-time sync status: {e}")
+        return False  # Default to assuming not first-time to be safe
+
+@app.route('/api/check-first-time-sync', methods=['GET'])
+def check_first_time_sync():
+    """API endpoint to check if this is the first time syncing Apple Health data for a user"""
+    try:
+        user_id = request.args.get('user_id', type=int)
+        
+        if not user_id:
+            return jsonify({
+                "success": False,
+                "error": "user_id parameter is required"
+            }), 400
+        
+        is_first_time = check_if_first_time_sync_internal(user_id)
+        
+        return jsonify({
+            "success": True,
+            "is_first_time": is_first_time,
+            "user_id": user_id,
+            "recommended_days": 365 if is_first_time else 7
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error checking first-time sync status: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "is_first_time": False  # Default to false on error
+        }), 500
+
 @app.route('/api/sync-dashboard-health-data', methods=['POST'])
 def sync_dashboard_health_data():
     """
-    New two-table sync endpoint for dashboard data (Steps, Distance, Calories, etc.)
-    - All incoming data is safely UPSERTED into `health_data_archive` to maintain a permanent, de-duplicated log.
-    - The `health_data_display` table is wiped for the user/data types and completely rebuilt with the new data.
-    This ensures the dashboard is always fast, accurate, and de-duplicated without data loss.
+    Smart two-table sync endpoint for Apple Health data with dual sync modes:
+    
+    🔄 FIRST-TIME SYNC (Full Historical):
+    - Detects if user has no existing health data
+    - Syncs ALL available Apple Health data (complete history)
+    - Stores everything in health_data_archive for permanent record
+    - Populates health_data_display with latest 7 days for dashboard
+    
+    🔄 PULL-TO-REFRESH SYNC (Delta Only):
+    - Syncs only last 7 days of Apple Health data
+    - Updates archive with any new/changed records
+    - Refreshes display table with latest 7-day snapshot
+    - Lightweight and fast for regular dashboard updates
     """
     data = request.json
     user_id = data.get('user_id', 1)
     health_data = data.get('health_data', {})
+    sync_type = data.get('sync_type', 'regular_sync')
+    is_initial_sync = data.get('is_initial_sync', False)
+    total_records = data.get('total_records', 0)
+    
+    # 🧠 Smart sync mode detection
+    if sync_type == 'auto_detect':
+        is_first_time = check_if_first_time_sync_internal(user_id)
+        if is_first_time:
+            sync_type = 'full_historical_sync'
+            is_initial_sync = True
+            print(f"🆕 AUTO-DETECTED: First-time sync for user {user_id} - switching to full historical sync")
+        else:
+            sync_type = 'pull_to_refresh'
+            print(f"🔄 AUTO-DETECTED: Existing user {user_id} - using delta refresh sync")
+    
+    # Log sync parameters for debugging
+    print(f"🔄 SYNC INITIATED: User {user_id}, Type: {sync_type}, Records: {total_records}, Initial: {is_initial_sync}")
     
     if not health_data:
         return jsonify({"error": "No health data provided"}), 400
     
-    try:
-        # Ensure all tables exist
-        create_health_data_archive_table()
-        create_health_data_display_table()
+    # Adjust batch sizes and retry limits based on sync type
+    no_batching = data.get('no_batching', False)
+    
+    if sync_type == 'full_historical_sync_no_batching' or no_batching:
+        print(f"🔄 COMPLETE HISTORICAL SYNC (NO BATCHING) detected for user {user_id}: {total_records} total records")
+        max_retries = 2  # Fewer retries since we're doing single transaction
+        use_batching = False
+        batch_size = total_records  # Process all at once
+        sleep_batch_size = total_records  # Process all at once
+    elif sync_type == 'full_historical_sync':
+        print(f"🔄 HISTORICAL SYNC detected for user {user_id}: {total_records} total records")
+        max_retries = 5  # More retries for historical sync
+        use_batching = True
+        batch_size = 50  # Smaller batches for stability
+        sleep_batch_size = 25  # Even smaller for sleep data
+    elif sync_type == 'pull_to_refresh':
+        print(f"🔄 PULL-TO-REFRESH SYNC detected for user {user_id}: {total_records} total records")
+        max_retries = 2  # Fewer retries for faster feedback
+        use_batching = True
+        batch_size = 100  # Standard batch size
+        sleep_batch_size = 10  # Moderate sleep batch size
+    else:
+        max_retries = 3
+        use_batching = True
+        batch_size = 100
+        sleep_batch_size = 5
+    for attempt in range(max_retries):
+        try:
+            # Ensure all tables exist
+            create_health_data_archive_table()
+            create_health_data_display_table()
 
-        records_archived = 0
-        records_displayed = 0
-        
-        with engine.begin() as conn: # Use a single transaction
+            records_archived = 0
+            records_displayed = 0
             
             # Get a list of all data types in this sync
             data_types_in_sync = [map_healthkit_data_type(dt) for dt in health_data.keys()]
 
-            # 1. Clear the DISPLAY table for the data types being synced
-            if data_types_in_sync:
-                clear_health_data_display_for_sync(conn, user_id, data_types_in_sync)
+            # Use separate transactions for better lock management
+            # First: Clear display table for all sync types to ensure 7-day snapshot
+            with engine.begin() as conn:
+                if data_types_in_sync:
+                    clear_health_data_display_for_sync(conn, user_id, data_types_in_sync)
+                    print(f"🧹 Cleared display data for {len(data_types_in_sync)} data types (will populate with 7-day snapshot)")
 
-            # 2. Process each entry: ARCHIVE it and then add to DISPLAY
+            # Second: Process data in smaller batches to avoid long-running transactions
+            all_records = []
+            
+            # Separate sleep data processing to avoid deadlocks
+            sleep_records = []
+            non_sleep_records = []
+            
+            # Collect all records first, separating sleep data
             for data_type, entries in health_data.items():
                 internal_data_type = map_healthkit_data_type(data_type)
+                
+                # DEBUG: Log distance data during sync
+                if data_type == 'distance' and isinstance(entries, list):
+                    print(f"🔍 SYNC DEBUG: Processing {len(entries)} distance entries from Apple Health")
+                    # Show sample of distance values and dates
+                    for i, entry in enumerate(entries[:10]):  # Show first 10
+                        quantity = entry.get('quantity', 'N/A')
+                        start_date = entry.get('startDate', 'N/A')
+                        sample_id = entry.get('uuid', 'N/A')[:20] + '...' if entry.get('uuid') else 'N/A'
+                        print(f"  📅 Sample {i+1}: {quantity}m at {start_date} (ID: {sample_id})")
+                    
+                    if len(entries) > 10:
+                        print(f"  ... and {len(entries)-10} more entries")
                 
                 if isinstance(entries, list) and entries:
                     for entry in entries:
                         record = process_health_entry(user_id, internal_data_type, entry)
                         if record:
-                            # Upsert into permanent archive (idempotent)
-                            upsert_health_record(conn, record)
-                            records_archived += 1
-                            
-                            # Insert into the clean display table
-                            insert_health_data_display(conn, record)
-                            records_displayed += 1
-        
-        print(f"✅ DISPLAY SYNC COMPLETE: Archived {records_archived} records, Displayed {records_displayed} records.")
-        
-        return jsonify({
-            "message": "Successfully synced display data",
-            "records_archived": records_archived,
-            "records_displayed": records_displayed
-        }), 200
-        
-    except Exception as e:
-        print(f"Error during two-table sync: {e}")
-        return jsonify({"error": f"Failed to sync display health data: {str(e)}"}), 500
+                            if internal_data_type == 'SleepAnalysis':
+                                sleep_records.append(record)
+                            else:
+                                non_sleep_records.append(record)
+
+            all_records = non_sleep_records
+
+            # ================= IMPROVED BATCH UPSERT =================
+            # The original per-record transaction loop was extremely slow when
+            # hundreds of records (e.g. 750 calorie samples) were sent – the
+            # mobile client would hit its 120 s HTTP timeout. We now process
+            # the non-sleep records in small batches (~100) inside a single
+            # transaction which is fast enough yet still avoids deadlocks.
+
+            if all_records:
+                if use_batching:
+                    print(f"📊 Processing {len(all_records)} non-sleep records in batches of {batch_size}")
+                    for i in range(0, len(all_records), batch_size):
+                        batch = all_records[i : i + batch_size]
+                        batch_attempt = 0
+                        max_batch_retries = 3
+                        
+                        while batch_attempt < max_batch_retries:
+                            try:
+                                with engine.begin() as conn:
+                                    for record in batch:
+                                        upsert_health_record(conn, record)  # Archive all records
+                                        records_archived += 1
+                                        
+                                        # Only add to display table if within last 7 days
+                                        if is_record_within_display_window(record):
+                                            insert_health_data_display(conn, record)
+                                            records_displayed += 1
+                                break  # Success, exit retry loop
+                            except Exception as batch_err:
+                                batch_attempt += 1
+                                if batch_attempt >= max_batch_retries:
+                                    print(f"⚠️ Batch upsert failed after {max_batch_retries} attempts (records {i}-{i+len(batch)-1}): {batch_err}")
+                                    continue
+                                else:
+                                    print(f"⚠️ Batch attempt {batch_attempt}/{max_batch_retries} failed, retrying...")
+                                    time.sleep(0.5)  # Brief pause before retry
+                else:
+                    # NO BATCHING - Single transaction for all records (optimal for historical sync)
+                    print(f"🚀 Processing ALL {len(all_records)} non-sleep records in SINGLE TRANSACTION (no batching)")
+                    try:
+                        with engine.begin() as conn:
+                            for record in all_records:
+                                upsert_health_record(conn, record)
+                                records_archived += 1
+                                
+                                # Only add to display table if within last 7 days
+                                if is_record_within_display_window(record):
+                                    insert_health_data_display(conn, record)
+                                    records_displayed += 1
+                        print(f"✅ Single transaction completed successfully for {len(all_records)} records")
+                    except Exception as single_err:
+                        print(f"❌ Single transaction failed: {single_err}")
+                        # Fallback to batching if single transaction fails
+                        print("🔄 Falling back to batching approach...")
+                        use_batching = True
+                        batch_size = 1000  # Use larger batches for fallback
+            
+            # Process sleep records separately to avoid deadlocks
+            if sleep_records:
+                if use_batching:
+                    print(f"🛏️ Processing {len(sleep_records)} sleep records separately in batches of {sleep_batch_size}...")
+                    
+                    for i in range(0, len(sleep_records), sleep_batch_size):
+                        sleep_batch = sleep_records[i:i + sleep_batch_size]
+                        sleep_attempt = 0
+                        max_sleep_retries = 3
+                        
+                        while sleep_attempt < max_sleep_retries:
+                            try:
+                                with engine.begin() as conn:
+                                    for record in sleep_batch:
+                                        try:
+                                            # SAFE UPSERT (replace bulky SQL)
+                                            upsert_health_record(conn, record)
+                                            records_archived += 1
+                                            
+                                            # Only add to display table if within last 7 days
+                                            if is_record_within_display_window(record):
+                                                insert_health_data_display(conn, record)
+                                                records_displayed += 1
+                                        except Exception as sleep_error:
+                                            print(f"⚠️ Failed to process sleep record: {sleep_error}")
+                                            continue
+                                break  # Success, exit retry loop
+                            except Exception as batch_error:
+                                sleep_attempt += 1
+                                if sleep_attempt >= max_sleep_retries:
+                                    print(f"⚠️ Sleep batch failed after {max_sleep_retries} attempts: {batch_error}")
+                                    continue
+                                else:
+                                    print(f"⚠️ Sleep batch attempt {sleep_attempt}/{max_sleep_retries} failed, retrying...")
+                                    time.sleep(0.5)
+                else:
+                    # NO BATCHING - Single transaction for all sleep records
+                    print(f"🛏️ Processing ALL {len(sleep_records)} sleep records in SINGLE TRANSACTION (no batching)")
+                    try:
+                        with engine.begin() as conn:
+                            for record in sleep_records:
+                                try:
+                                    upsert_health_record(conn, record)
+                                    records_archived += 1
+                                    
+                                    # Only add to display table if within last 7 days
+                                    if is_record_within_display_window(record):
+                                        insert_health_data_display(conn, record)
+                                        records_displayed += 1
+                                except Exception as sleep_error:
+                                    print(f"⚠️ Failed to process sleep record: {sleep_error}")
+                                    continue
+                        print(f"✅ Single sleep transaction completed for {len(sleep_records)} records")
+                    except Exception as sleep_error:
+                        print(f"❌ Single sleep transaction failed: {sleep_error}")
+                        # Continue processing without failing the entire sync
+            
+            # Refresh sleep summary ONLY if sleep records were received to avoid slow quick-syncs
+            if sleep_records:
+                try:
+                    create_sleep_summary_table()
+                    refresh_sleep_summary(user_id)
+                except Exception as e:
+                    print(f"⚠️ Could not refresh sleep_summary table: {e}")
+            
+            # Auto-clean duplicates for historical syncs
+            duplicates_cleaned = 0
+            if sync_type == 'full_historical_sync':
+                print(f"🧹 Running duplicate cleanup for historical sync...")
+                duplicates_cleaned = auto_clean_health_data_duplicates(user_id)
+                print(f"🧹 Cleaned {duplicates_cleaned} duplicate records")
+            
+            print(f"✅ DISPLAY SYNC COMPLETE: Archived {records_archived} records, Displayed {records_displayed} records.")
+            
+            # Create intelligent sync response message
+            sync_description = {
+                'full_historical_sync': f"Full Historical Sync - Archived {records_archived} records, displaying latest {records_displayed}",
+                'pull_to_refresh': f"Delta Refresh - Updated {records_archived} records, refreshed {records_displayed} for dashboard",
+                'regular_sync': f"Regular Sync - Processed {records_archived} records"
+            }.get(sync_type, f"Sync completed - {records_archived} records processed")
+            
+            response_data = {
+                "message": sync_description,
+                "records_archived": records_archived,
+                "records_displayed": records_displayed,
+                "sync_type": sync_type,
+                "is_initial_sync": is_initial_sync,
+                "duplicates_cleaned": duplicates_cleaned,
+                "sync_summary": {
+                    "total_processed": records_archived,
+                    "dashboard_records": records_displayed,
+                    "archive_growth": records_archived - duplicates_cleaned,
+                    "first_time_user": is_initial_sync
+                }
+            }
+            
+            return jsonify(response_data), 200
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Check for database lock issues
+            is_deadlock = any(keyword in error_msg for keyword in [
+                "deadlock", "lock wait timeout", "try restarting transaction",
+                "1213", "1205"  # MySQL error codes for deadlock and lock timeout
+            ])
+            
+            if is_deadlock and attempt < max_retries - 1:
+                import time
+                import random
+                wait_time = (1.0 * (2 ** attempt)) + random.uniform(0, 0.5)
+                print(f"⚠️ Database lock issue during sync, retrying attempt {attempt + 2}/{max_retries} after {wait_time:.2f}s")
+                time.sleep(wait_time)
+                continue
+            
+            print(f"Error during two-table sync: {e}")
+            return jsonify({"error": f"Failed to sync display health data: {str(e)}"}), 500
+    
+    return jsonify({"error": "Failed to sync after multiple retries due to database lock issues"}), 500
 
 def check_and_add_missing_columns():
     """Dynamically check for and add any missing columns to accommodate new data types"""
@@ -1873,13 +2901,37 @@ def process_health_entry(user_id, data_type, entry):
         # ------------------------------------------------------------------
         # 2. Handle different value types
         # ------------------------------------------------------------------
+        # HealthKit sometimes returns quantities as strings that include the unit
+        # (e.g. "0.85m" or "12.3kcal"). Attempt to safely extract the numeric
+        # portion so we can store it as a float. Fallback to value_string if the
+        # numeric part cannot be determined.
         if 'quantity' in entry:
-            record['value'] = float(entry['quantity'])
-        elif 'value' in entry:
-            if isinstance(entry['value'], (int, float)):
-                record['value'] = float(entry['value'])
+            q = entry['quantity']
+            if isinstance(q, (int, float)):
+                record['value'] = float(q)
             else:
-                record['value_string'] = str(entry['value'])
+                # Extract the first numeric substring (handles optional negative sign and decimals)
+                num_match = re.search(r"-?\d+\.\d+|-?\d+", str(q))
+                if num_match:
+                    try:
+                        record['value'] = float(num_match.group())
+                    except ValueError:
+                        record['value_string'] = str(q)
+                else:
+                    record['value_string'] = str(q)
+        elif 'value' in entry:
+            v = entry['value']
+            if isinstance(v, (int, float)):
+                record['value'] = float(v)
+            else:
+                num_match = re.search(r"-?\d+\.\d+|-?\d+", str(v))
+                if num_match:
+                    try:
+                        record['value'] = float(num_match.group())
+                    except ValueError:
+                        record['value_string'] = str(v)
+                else:
+                    record['value_string'] = str(v)
         
         # ------------------------------------------------------------------
         # 3. Capture additional numeric aggregate fields if present
@@ -1962,89 +3014,56 @@ def parse_iso_datetime(iso_string: str | None) -> datetime | None:
         print(f"⚠️ Could not parse datetime: {iso_string}")
         return None
 
-# def insert_health_record(conn, record):
-#     """Insert a health record into the database with enhanced field support"""
-#     try:
-#         conn.execute(text("""
-#             INSERT INTO health_data_archive (
-#                 user_id, data_type, data_subtype, value, value_string, unit,
-#                 start_date, end_date, source_name, source_bundle_id, device_name, 
-#                 sample_id, category_type, workout_activity_type, total_energy_burned,
-#                 total_distance, average_quantity, minimum_quantity, maximum_quantity, metadata
-#             ) VALUES (
-#                 :user_id, :data_type, :data_subtype, :value, :value_string, :unit,
-#                 :start_date, :end_date, :source_name, :source_bundle_id, :device_name,
-#                 :sample_id, :category_type, :workout_activity_type, :total_energy_burned,
-#                 :total_distance, :average_quantity, :minimum_quantity, :maximum_quantity, :metadata
-#             )
-#         """), record)
-#     except Exception as e:
-#         print(f"Error inserting health record: {e}")
-#         print(f"Record data: {record}")
-#         raise
-
 def upsert_health_record(conn, record):
     """
     Insert or update a health record in the ARCHIVE table.
     Now strictly enforces upsert based on sample_id.
     """
-    try:
-        # Every record is now guaranteed to have a sample_id.
-        conn.execute(text("""
-            INSERT INTO health_data_archive (
-                user_id, data_type, data_subtype, value, value_string, unit,
-                start_date, end_date, source_name, source_bundle_id, device_name, 
-                sample_id, category_type, workout_activity_type, total_energy_burned,
-                total_distance, average_quantity, minimum_quantity, maximum_quantity, metadata
-            ) VALUES (
-                :user_id, :data_type, :data_subtype, :value, :value_string, :unit,
-                :start_date, :end_date, :source_name, :source_bundle_id, :device_name,
-                :sample_id, :category_type, :workout_activity_type, :total_energy_burned,
-                :total_distance, :average_quantity, :minimum_quantity, :maximum_quantity, :metadata
-            ) ON DUPLICATE KEY UPDATE
-                value = VALUES(value),
-                value_string = VALUES(value_string),
-                unit = VALUES(unit),
-                start_date = VALUES(start_date),
-                end_date = VALUES(end_date),
-                source_name = VALUES(source_name),
-                source_bundle_id = VALUES(source_bundle_id),
-                device_name = VALUES(device_name),
-                metadata = VALUES(metadata)
-        """), record)
-    except Exception as e:
-        print(f"Error upserting health record: {e}")
-        print(f"Record data: {record}")
-        raise
-
-# def create_sync_time_period_replacement(conn, user_id, data_type, start_date, end_date):
-#     """
-#     [DEPRECATED] - This function is no longer recommended for the two-table model.
-#     Use `clear_health_data_display_for_sync` instead.
-#     It deletes existing records for a specific time period to ensure clean replacement.
-#     """
-#     try:
-#         result = conn.execute(text("""
-#             DELETE FROM health_data_archive 
-#             WHERE user_id = :user_id 
-#             AND data_type = :data_type 
-#             AND start_date >= :start_date 
-#             AND end_date <= :end_date
-#         """), {
-#             'user_id': user_id,
-#             'data_type': data_type, 
-#             'start_date': start_date,
-#             'end_date': end_date
-#         })
-        
-#         deleted_count = result.rowcount
-#         if deleted_count > 0:
-#             print(f"🗑️ Cleared {deleted_count} existing {data_type} records for time period replacement")
-#         return deleted_count
-        
-#     except Exception as e:
-#         print(f"Error clearing time period for {data_type}: {e}")
-#         return 0
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Every record is now guaranteed to have a sample_id.
+            conn.execute(text("""
+                INSERT INTO health_data_archive (
+                    user_id, data_type, data_subtype, value, value_string, unit,
+                    start_date, end_date, source_name, source_bundle_id, device_name, 
+                    sample_id, category_type, workout_activity_type, total_energy_burned,
+                    total_distance, average_quantity, minimum_quantity, maximum_quantity, metadata
+                ) VALUES (
+                    :user_id, :data_type, :data_subtype, :value, :value_string, :unit,
+                    :start_date, :end_date, :source_name, :source_bundle_id, :device_name,
+                    :sample_id, :category_type, :workout_activity_type, :total_energy_burned,
+                    :total_distance, :average_quantity, :minimum_quantity, :maximum_quantity, :metadata
+                ) ON DUPLICATE KEY UPDATE
+                    value = VALUES(value),
+                    value_string = VALUES(value_string),
+                    unit = VALUES(unit),
+                    start_date = VALUES(start_date),
+                    end_date = VALUES(end_date),
+                    source_name = VALUES(source_name),
+                    source_bundle_id = VALUES(source_bundle_id),
+                    device_name = VALUES(device_name),
+                    metadata = VALUES(metadata)
+            """), record)
+            return  # Success, exit the retry loop
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Check for various MySQL deadlock and lock timeout conditions
+            is_deadlock = any(keyword in error_msg for keyword in [
+                "deadlock", "lock wait timeout", "try restarting transaction",
+                "1213", "1205"  # MySQL error codes for deadlock and lock timeout
+            ])
+            
+            if is_deadlock and attempt < max_retries - 1:
+                import time
+                import random
+                wait_time = (0.1 * (2 ** attempt)) + random.uniform(0, 0.1)  # Exponential backoff with jitter
+                print(f"⚠️ Database lock issue detected, retrying attempt {attempt + 2}/{max_retries} after {wait_time:.2f}s")
+                time.sleep(wait_time)
+                continue
+            print(f"Error upserting health record: {e}")
+            print(f"Record data: {record}")
+            raise
 
 def clear_health_data_display_for_sync(conn, user_id: int, data_types: List[str]):
     """Wipes data for a user and specific data types from the health_data_display table."""
@@ -2069,6 +3088,58 @@ def clear_health_data_display_for_sync(conn, user_id: int, data_types: List[str]
         print(f"Error wiping display data: {e}")
         return 0
 
+def populate_display_table_from_archive(conn, user_id: int, data_types: List[str] = None, days_back: int = 7):
+    """Populate display table from archive table for recent data as a backup mechanism"""
+    try:
+        # If no specific data types provided, use common health data types
+        if not data_types:
+            data_types = ['SleepAnalysis', 'StepCount', 'ActiveEnergyBurned', 'DistanceWalkingRunning', 'Workout']
+        
+        # Calculate cutoff date
+        cutoff_date = datetime.now() - timedelta(days=days_back)
+        
+        print(f"🔄 Populating display table from archive for user {user_id}, data types: {data_types}, cutoff: {cutoff_date.date()}")
+        
+        # Insert recent records from archive to display table
+        for data_type in data_types:
+            insert_query = text("""
+                INSERT INTO health_data_display (
+                    user_id, data_type, data_subtype, value, value_string, unit,
+                    start_date, end_date, source_name, source_bundle_id, device_name,
+                    sample_id, category_type, workout_activity_type, total_energy_burned,
+                    total_distance, average_quantity, minimum_quantity, maximum_quantity, metadata
+                )
+                SELECT 
+                    user_id, data_type, data_subtype, value, value_string, unit,
+                    start_date, end_date, source_name, source_bundle_id, device_name,
+                    sample_id, category_type, workout_activity_type, total_energy_burned,
+                    total_distance, average_quantity, minimum_quantity, maximum_quantity, metadata
+                FROM health_data_archive
+                WHERE user_id = :user_id 
+                AND data_type = :data_type 
+                AND start_date >= :cutoff_date
+                AND sample_id NOT IN (
+                    SELECT sample_id FROM health_data_display 
+                    WHERE user_id = :user_id AND data_type = :data_type AND sample_id IS NOT NULL
+                )
+            """)
+            
+            result = conn.execute(insert_query, {
+                'user_id': user_id,
+                'data_type': data_type,
+                'cutoff_date': cutoff_date
+            })
+            
+            inserted_count = result.rowcount
+            if inserted_count > 0:
+                print(f"📊 Populated {inserted_count} {data_type} records in display table from archive")
+        
+        print(f"✅ Display table population from archive completed for user {user_id}")
+        
+    except Exception as e:
+        print(f"❌ Error populating display table from archive: {e}")
+        raise
+
 def insert_health_data_display(conn, record: Dict[str, Any]):
     """Inserts a processed health record into the health_data_display table."""
     try:
@@ -2089,7 +3160,7 @@ def insert_health_data_display(conn, record: Dict[str, Any]):
         print(f"Error inserting into display table: {e}")
         print(f"Record data: {record}")
         # Do not re-raise, as failure to write to display table should not stop the sync
-        
+
 # New endpoint for logging medication data
 @app.route('/api/log-medication', methods=['POST'])
 def log_medication():
@@ -2427,8 +3498,8 @@ def refresh_sleep_summary(user_id: int = 1):
                             total_sleep_minutes += session['duration'] * 60 * 0.8  # Weight additional sessions less
 
                 # Apply sleep efficiency (people don't sleep 100% of time in bed)
-                sleep_efficiency = 0.85
-                actual_sleep_hours = (total_sleep_minutes / 60) * sleep_efficiency
+                # sleep_efficiency = 0.85
+                actual_sleep_hours = (total_sleep_minutes / 60)
 
                 # Sanity check for reasonable sleep duration
                 if 2 <= actual_sleep_hours <= 15:
@@ -2459,177 +3530,7 @@ def refresh_sleep_summary(user_id: int = 1):
         print(f"❌ Error refreshing sleep_summary: {e}")
         # non-fatal
         
-# Debug endpoint to check sleep values
-# @app.route('/api/debug-sleep', methods=['GET'])
-# def debug_sleep():
-#     try:
-#         with engine.connect() as conn:
-#             result = conn.execute(text("""
-#                 SELECT 
-#                     value, 
-#                     COUNT(*) as count,
-#                     MIN(start_date) as earliest,
-#                     MAX(end_date) as latest,
-#                     ROUND(SUM(TIMESTAMPDIFF(SECOND,start_date,end_date))/3600, 2) as total_hours
-#                 FROM health_data_archive 
-#                 WHERE data_type = 'SleepAnalysis' AND user_id = 1
-#                 GROUP BY value
-#                 ORDER BY value
-#             """)).fetchall()
-            
-#             sleep_values = []
-#             for row in result:
-#                 sleep_values.append({
-#                     'value': row[0],
-#                     'count': row[1], 
-#                     'earliest': str(row[2]),
-#                     'latest': str(row[3]),
-#                     'total_hours': row[4]
-#                 })
-            
-#             return jsonify({'sleep_values': sleep_values})
-#     except Exception as e:
-#         return jsonify({'error': str(e)}), 500
 
-# Manual endpoint to refresh sleep summary
-# @app.route('/api/refresh-sleep-summary', methods=['POST'])
-# def refresh_sleep_summary_endpoint():
-#     try:
-#         user_id = request.json.get('user_id', 1) if request.json else 1
-#         refresh_sleep_summary(user_id)
-#         return jsonify({'message': 'Sleep summary refreshed successfully'})
-#     except Exception as e:
-#         return jsonify({'error': str(e)}), 500
-
-# Endpoint to check sleep_summary table contents
-# @app.route('/api/check-sleep-summary', methods=['GET'])
-# def check_sleep_summary():
-#     try:
-#         with engine.connect() as conn:
-#             result = conn.execute(text("""
-#                 SELECT 
-#                     sleep_date,
-#                     CONCAT(
-#                         FLOOR(sleep_hours), ' hr ',
-#                         LPAD(ROUND((sleep_hours - FLOOR(sleep_hours))*60),2,'0'),
-#                         ' min'
-#                     ) AS formatted_sleep,
-#                     DATE_FORMAT(sleep_start, '%H:%i') AS start_time,
-#                     DATE_FORMAT(sleep_end, '%H:%i') AS end_time,
-#                     sleep_hours
-#                 FROM sleep_summary 
-#                 WHERE user_id = 1 
-#                 ORDER BY sleep_date DESC
-#             """)).fetchall()
-            
-#             sleep_summary_data = []
-#             for row in result:
-#                 sleep_summary_data.append({
-#                     'sleep_date': str(row[0]),
-#                     'formatted_sleep': row[1],
-#                     'start_time': row[2],
-#                     'end_time': row[3],
-#                     'sleep_hours': float(row[4])
-#                 })
-            
-#             return jsonify({
-#                 'count': len(sleep_summary_data),
-#                 'sleep_summary': sleep_summary_data
-#             })
-#     except Exception as e:
-#         return jsonify({'error': str(e)}), 500
-
-# New endpoint to test Apple Health-like sleep calculation directly
-# @app.route('/api/test-apple-sleep-calculation', methods=['GET'])
-# def test_apple_sleep_calculation():
-#     try:
-#         with engine.connect() as conn:
-#             # Get raw sleep data for comparison
-#             raw_sleep_data = conn.execute(text("""
-#                 SELECT 
-#                     data_type,
-#                     data_subtype,
-#                     value,
-#                     start_date,
-#                     end_date,
-#                     source_name,
-#                     TIMESTAMPDIFF(SECOND, start_date, end_date) / 3600.0 AS duration_hours
-#                 FROM health_data_archive 
-#                 WHERE data_type = 'SleepAnalysis' AND user_id = 1
-#                 ORDER BY start_date DESC
-#                 LIMIT 50
-#             """)).fetchall()
-            
-#             # Get calculated summaries
-#             calculated_summaries = conn.execute(text("""
-#                 SELECT 
-#                     data_subtype,
-#                     value AS sleep_hours,
-#                     value_string AS formatted_sleep,
-#                     start_date,
-#                     end_date,
-#                     source_name,
-#                     metadata
-#                 FROM health_data_archive 
-#                 WHERE data_type = 'SleepAnalysis' 
-#                   AND data_subtype = 'sleep_summary'
-#                   AND user_id = 1
-#                 ORDER BY start_date DESC
-#             """)).fetchall()
-            
-#             # Get sleep_summary table data
-#             sleep_summary_data = conn.execute(text("""
-#                 SELECT 
-#                     sleep_date,
-#                     sleep_hours,
-#                     CONCAT(
-#                         FLOOR(sleep_hours), ' hr ',
-#                         LPAD(ROUND((sleep_hours - FLOOR(sleep_hours))*60),2,'0'),
-#                         ' min'
-#                     ) AS formatted_sleep,
-#                     sleep_start,
-#                     sleep_end
-#                 FROM sleep_summary 
-#                 WHERE user_id = 1 
-#                 ORDER BY sleep_date DESC
-#                 LIMIT 10
-#             """)).fetchall()
-            
-#             return jsonify({
-#                 'raw_sleep_samples': [
-#                     {
-#                         'data_type': row[0],
-#                         'data_subtype': row[1],
-#                         'value': row[2],
-#                         'start_date': str(row[3]),
-#                         'end_date': str(row[4]),
-#                         'source_name': row[5],
-#                         'duration_hours': float(row[6]) if row[6] else 0
-#                     } for row in raw_sleep_data
-#                 ],
-#                 'calculated_summaries': [
-#                     {
-#                         'data_subtype': row[0],
-#                         'sleep_hours': float(row[1]) if row[1] else 0,
-#                         'formatted_sleep': row[2],
-#                         'start_date': str(row[3]),
-#                         'end_date': str(row[4]),
-#                         'source_name': row[5],
-#                         'metadata': row[6]
-#                     } for row in calculated_summaries
-#                 ],
-#                 'sleep_summary_table': [
-#                     {
-#                         'sleep_date': str(row[0]),
-#                         'sleep_hours': float(row[1]),
-#                         'formatted_sleep': row[2],
-#                         'sleep_start': str(row[3]),
-#                         'sleep_end': str(row[4])
-#                     } for row in sleep_summary_data
-#                 ]
-#             })
-#     except Exception as e:
-#         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/diabetes-dashboard', methods=['GET'])
 def get_diabetes_dashboard():
@@ -2656,12 +3557,29 @@ def get_diabetes_dashboard():
                     "error": str(e)
                 }), 404
         
-        end_date = date.today()
-        start_date = end_date - timedelta(days=days)
-        start_of_range_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+        print(f"🔍 DASHBOARD API called with user_id={user_id}, clerk_user_id={clerk_user_id}, days={days}")
 
-        # Ensure user's data is properly migrated from display to archive table if needed
-        migrate_display_to_archive_for_user(user_id)
+        end_date = date.today()
+        # Dashboard metrics (sleep, steps, walking/running, calories) should always use today + 6 previous days (7 total)
+        DASHBOARD_METRIC_DAYS = 6  # Days to look back from today (today + 6 previous = 7 total days)
+        start_date = end_date - timedelta(days=DASHBOARD_METRIC_DAYS)
+        start_of_range_dt = datetime.combine(start_date, datetime.min.time(), tzinfo=timezone.utc)
+        
+        # Convert start_date to datetime for proper comparison with DATETIME columns
+        start_datetime = datetime.combine(start_date, datetime.min.time())
+        
+        print(f"📅 Dashboard date range: {start_date} to {end_date} (looking for user_id={user_id})")
+        
+        # DEBUG: Log user information for debugging
+        print(f"🔍 DASHBOARD DEBUG: Getting data for user_id={user_id}, clerk_user_id={clerk_user_id}")
+        print(f"📅 DASHBOARD DEBUG: Date range {start_date} to {end_date} (today + {DASHBOARD_METRIC_DAYS} previous = 7 total days)")
+        # Optional timezone offset from client (e.g., '+05:30' or '-07:00') for correct per-day grouping
+        tz_offset = request.args.get('tz_offset', '+00:00')
+        start_date_local_str = start_date.isoformat()
+        end_date_local_str = end_date.isoformat()
+
+        # Migration disabled - sync process handles both tables properly
+        # migrate_display_to_archive_for_user(user_id)
         
         with engine.connect() as conn:
             # --- 1. GLUCOSE DATA ---
@@ -2670,7 +3588,16 @@ def get_diabetes_dashboard():
                 WHERE user_id = :user_id AND timestamp >= :start_date
                 ORDER BY timestamp
             """)
-            glucose_records = conn.execute(glucose_query, {'user_id': user_id, 'start_date': start_date}).fetchall()
+            
+            query_params = {'user_id': user_id, 'start_date': start_datetime}
+            print(f"🩸 GLUCOSE DEBUG: Executing query with params: {query_params}")
+            print(f"🩸 GLUCOSE DEBUG: start_datetime type: {type(start_datetime)}, value: {start_datetime}")
+            
+            glucose_records = conn.execute(glucose_query, query_params).fetchall()
+
+            print(f"🩸 GLUCOSE DEBUG: Found {len(glucose_records)} glucose records for user {user_id} since {start_date}")
+            for record in glucose_records:
+                print(f"  📊 {record.timestamp}: {record.glucose_level} mg/dL")
 
             glucose_by_day = {}
             for r in glucose_records:
@@ -2678,6 +3605,8 @@ def get_diabetes_dashboard():
                 if day not in glucose_by_day:
                     glucose_by_day[day] = []
                 glucose_by_day[day].append(r.glucose_level)
+            
+            print(f"🩸 GLUCOSE DEBUG: Grouped into {len(glucose_by_day)} days: {list(glucose_by_day.keys())}")
             
             glucose_summary = []
             for day, readings in glucose_by_day.items():
@@ -2696,24 +3625,36 @@ def get_diabetes_dashboard():
             avg_time_in_range = sum(float(d['time_in_range_percent']) for d in glucose_summary) / len(glucose_summary) if glucose_summary else 0
 
             # --- 4. SLEEP DATA (USING IMPROVED ALGORITHM) ---
-            # Always get exactly 7 days for Sleep Patterns consistency
-            sleep_days_range = 7
-            print(f"🛏️ Dashboard: Using improved sleep analysis for {sleep_days_range} days (Sleep Patterns)")
+            # Look back further to find available sleep data, then return the most recent 7 days with data
+            sleep_days_range = 30
+            print(f"🛏️ Dashboard: Using improved sleep analysis for {sleep_days_range} days (today + 7 previous) (Sleep Patterns)")
+            print(f"📱 MOBILE DEBUG: Request from {request.remote_addr} for user {user_id}")
+            print(f"📱 MOBILE DEBUG: Request URL: {request.url}")
+            
             improved_sleep_result = get_improved_sleep_data(user_id, sleep_days_range)
             
             sleep_data = []
             if improved_sleep_result.get('success'):
                 daily_summaries = improved_sleep_result.get('daily_summaries', [])
+                print(f"📱 MOBILE DEBUG: get_improved_sleep_data returned {len(daily_summaries)} summaries")
+                
                 for summary in daily_summaries:
-                    sleep_data.append({
+                    sleep_entry = {
                         'date': summary['date'],
                         'bedtime': summary['bedtime'],
                         'wake_time': summary['wake_time'],
                         'sleep_hours': summary['sleep_hours'],
                         'formatted_sleep': summary['formatted_sleep'],
                         'has_data': summary.get('has_data', True)
-                    })
+                    }
+                    sleep_data.append(sleep_entry)
+                    
+                    # Log each entry being added
+                    status = '✅' if sleep_entry['has_data'] else '❌'
+                    print(f"📱 MOBILE DEBUG: {status} Adding {sleep_entry['date']}: {sleep_entry['formatted_sleep']}")
+                
                 print(f"✅ Dashboard: Using {len(sleep_data)} sleep summaries (including {improved_sleep_result.get('days_without_data', 0)} days with no data)")
+                print(f"📱 MOBILE DEBUG: Final sleep_data length: {len(sleep_data)}")
             else:
                 print(f"⚠️ Dashboard: Improved sleep analysis failed, using fallback")
                 # Create 7 empty days as fallback
@@ -2729,33 +3670,65 @@ def get_diabetes_dashboard():
                         'has_data': False
                     })
             
-            # Note: sleep_data is already in chronological order from the function
-            avg_sleep_hours = sum(s['sleep_hours'] for s in sleep_data if s['has_data']) / len([s for s in sleep_data if s['has_data']]) if any(s['has_data'] for s in sleep_data) else 0
+            # --- 4b. SLEEP AVERAGE (USE A FIXED 7-DAY WINDOW: TODAY + 6 PREVIOUS) ---
+            # Always divide by the full 7-day window (today + 6 previous) so that missing days contribute 0h
+            # This prevents the average from being artificially inflated when a day has
+            # no data.
+            # Filter sleep_data to last 7 days for consistency with other metrics
+            last_7_days_sleep = [(end_date - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
+            sleep_data_filtered = [s for s in sleep_data if s['date'] in last_7_days_sleep]
+            
+            avg_sleep_hours = round(
+                sum(s['sleep_hours'] for s in sleep_data_filtered) / 7,
+                2
+            )
 
             # --- 5. ACTIVITY DATA (STEPS + CALORIES FROM APPLE HEALTH + MANUAL) ---
-            # Get Apple Health step data from DISPLAY table (fast dashboard access)
+            # Always query for exactly the last 7 days from today for consistent dashboard behavior
+            dashboard_start_date = end_date - timedelta(days=DASHBOARD_METRIC_DAYS)
+            dashboard_start_local_str = dashboard_start_date.isoformat()
+            
+            print(f"🔄 DASHBOARD: Querying activity data for exact 7-day window: {dashboard_start_date} to {end_date}")
+            
             apple_steps_query = text("""
-                SELECT DATE(start_date) as date, SUM(CAST(value AS DECIMAL(10,2))) as total_steps 
-                FROM health_data_display
-                WHERE user_id = :user_id AND data_type = 'StepCount' 
-                  AND start_date >= :start_date
-                GROUP BY DATE(start_date)
-                ORDER BY DATE(start_date) DESC
+                SELECT DATE(CONVERT_TZ(end_date, '+00:00', :tz)) as date, 
+                       SUM(CAST(value AS DECIMAL(10,2))) as total_steps 
+                FROM health_data_archive
+                WHERE user_id = :user_id 
+                  AND data_type IN ('StepCount', 'Steps')
+                  AND DATE(CONVERT_TZ(end_date, '+00:00', :tz)) BETWEEN :start_local AND :end_local
+                GROUP BY DATE(CONVERT_TZ(end_date, '+00:00', :tz))
+                ORDER BY DATE(CONVERT_TZ(end_date, '+00:00', :tz)) DESC
             """)
-            apple_step_records = conn.execute(apple_steps_query, {'user_id': user_id, 'start_date': start_of_range_dt}).fetchall()
+            apple_step_records = conn.execute(apple_steps_query, {
+                'user_id': user_id, 
+                'tz': tz_offset,
+                'start_local': dashboard_start_local_str,
+                'end_local': end_date_local_str
+            }).fetchall()
             
-            # Get Apple Health active calories burned data from DISPLAY table
+            print(f"📊 Found {len(apple_step_records)} days of step data in 7-day window")
+
             apple_calories_query = text("""
-                SELECT DATE(start_date) as date, SUM(CAST(value AS DECIMAL(10,2))) as total_calories 
-                FROM health_data_display
-                WHERE user_id = :user_id AND data_type = 'ActiveEnergyBurned' 
-                  AND start_date >= :start_date
-                GROUP BY DATE(start_date)
-                ORDER BY DATE(start_date) DESC
+                SELECT DATE(CONVERT_TZ(end_date, '+00:00', :tz)) as date, 
+                       SUM(CAST(value AS DECIMAL(10,2))) as total_calories 
+                FROM health_data_archive
+                WHERE user_id = :user_id 
+                  AND data_type = 'ActiveEnergyBurned' 
+                  AND DATE(CONVERT_TZ(end_date, '+00:00', :tz)) BETWEEN :start_local AND :end_local
+                GROUP BY DATE(CONVERT_TZ(end_date, '+00:00', :tz))
+                ORDER BY DATE(CONVERT_TZ(end_date, '+00:00', :tz)) DESC
             """)
-            apple_calories_records = conn.execute(apple_calories_query, {'user_id': user_id, 'start_date': start_of_range_dt}).fetchall()
+            apple_calories_records = conn.execute(apple_calories_query, {
+                'user_id': user_id, 
+                'tz': tz_offset,
+                'start_local': dashboard_start_local_str,
+                'end_local': end_date_local_str
+            }).fetchall()
             
-            # Get manual activity data from activity_log table (include duration)
+            print(f"🔥 Found {len(apple_calories_records)} days of calories data in 7-day window")
+
+            # Get manual activity data from activity_log table (include duration) - also limit to 7 days
             manual_activity_query = text("""
                 SELECT DATE(timestamp) as date,
                        SUM(duration_minutes) as total_minutes,
@@ -2765,56 +3738,81 @@ def get_diabetes_dashboard():
                 WHERE user_id = :user_id AND DATE(timestamp) >= :start_date
                 GROUP BY DATE(timestamp)
             """)
-            manual_activity_records = conn.execute(manual_activity_query, {'user_id': user_id, 'start_date': start_date}).fetchall()
-            
-            # Get Apple Health workout durations (in minutes) from DISPLAY table
+            manual_activity_records = conn.execute(manual_activity_query, {
+                'user_id': user_id, 
+                'start_date': dashboard_start_date
+            }).fetchall()
+
+            # Get Apple Health workout durations (in minutes) from ARCHIVE table only - also limit to 7 days
             apple_workout_query = text("""
-                SELECT DATE(start_date) as date,
+                SELECT DATE(CONVERT_TZ(end_date, '+00:00', :tz)) as date,
                        SUM(TIMESTAMPDIFF(MINUTE, start_date, end_date)) as total_minutes
-                FROM health_data_display
+                FROM health_data_archive
                 WHERE user_id = :user_id AND data_type = 'Workout'
-                  AND start_date >= :start_date
-                GROUP BY DATE(start_date)
+                  AND DATE(CONVERT_TZ(end_date, '+00:00', :tz)) BETWEEN :start_local AND :end_local
+                GROUP BY DATE(CONVERT_TZ(end_date, '+00:00', :tz))
             """)
-            apple_workout_records = conn.execute(apple_workout_query, {'user_id': user_id, 'start_date': start_of_range_dt}).fetchall()
+            apple_workout_records = conn.execute(apple_workout_query, {
+                'user_id': user_id, 
+                'tz': tz_offset,
+                'start_local': dashboard_start_local_str,
+                'end_local': end_date_local_str
+            }).fetchall()
             
             # Combine Apple Health, manual logs, and workouts into daily activity dict
             daily_activity = {}
             
-            # Add Apple Health steps
+            # Add Apple Health steps (sum per day)
             for r in apple_step_records:
                 day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
                 if day_key not in daily_activity:
-                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0}
-                daily_activity[day_key]['steps'] = int(r.total_steps)
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0, 'distance_km': 0}
+                daily_activity[day_key]['steps'] = int(round(float(r.total_steps or 0)))
             
             # Add Apple Health calories
             for r in apple_calories_records:
                 day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
                 if day_key not in daily_activity:
-                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0}
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0, 'distance_km': 0}
                 daily_activity[day_key]['calories'] = int(r.total_calories)
             
             # Add manual activity data (combine with Apple Health for same day)
             for r in manual_activity_records:
                 day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
                 if day_key not in daily_activity:
-                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0}
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0, 'distance_km': 0}
                 
                 # Add manual steps to existing Apple Health steps
-                daily_activity[day_key]['steps'] += int(r.total_steps) if r.total_steps else 0
+                daily_activity[day_key]['steps'] += int(round(float(r.total_steps or 0)))
                 # Add manual calories to existing Apple Health calories
-                daily_activity[day_key]['calories'] += int(r.total_calories) if r.total_calories else 0
+                daily_activity[day_key]['calories'] += int(round(float(r.total_calories or 0)))
                 # Add manual active minutes
-                daily_activity[day_key]['active_minutes'] += int(r.total_minutes) if r.total_minutes else 0
+                daily_activity[day_key]['active_minutes'] += int(round(float(r.total_minutes or 0)))
             
             # Add Apple Health workout durations
             for r in apple_workout_records:
                 day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
                 if day_key not in daily_activity:
-                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0}
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0, 'distance_km': 0}
                 daily_activity[day_key]['active_minutes'] += int(r.total_minutes) if r.total_minutes else 0
             
+            # ------------------------------------------------------------------
+            # 🔄 FILL IN MISSING DAYS FOR EXACT 7-DAY WINDOW -------------------
+            # Always ensure we have exactly 7 days (today + 6 previous days) represented
+            # This guarantees consistent dashboard behavior and accurate averages
+            last_7_days = [(end_date - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
+            
+            for d in last_7_days:
+                if d not in daily_activity:
+                    daily_activity[d] = {
+                        'steps': 0,
+                        'calories': 0,
+                        'active_minutes': 0,
+                        'distance_km': 0,
+                    }
+                    print(f"📅 Added missing day {d} with zero values for complete 7-day window")
+
+            # ------------------------------------------------------------------
             # Create activity data structure
             activity_data = []
             for date_key, activity in daily_activity.items():
@@ -2833,62 +3831,140 @@ def get_diabetes_dashboard():
                     'calories_burned': activity['calories'],
                     'active_minutes': mins,
                     'activity_level': level,
-                    'distance_km': 0
+                    'distance_km': activity['distance_km']
                 })
             activity_data.sort(key=lambda x: x['date'], reverse=True)
+
+            # Calculate totals & averages using a FIXED 7-DAY WINDOW (today + 6 previous days) for dashboard consistency
+            # Filter activity_data to include today + last 6 days for complete view
+            today = date.today()
+            six_days_ago = today - timedelta(days=6)
+            last_7_days = [(today - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
             
-            # Calculate averages
-            total_steps = sum(a['steps'] for a in activity_data)
-            total_calories = sum(a['calories_burned'] for a in activity_data)
-            avg_daily_steps = total_steps / len(activity_data) if activity_data else 0
-            avg_daily_calories = total_calories / len(activity_data) if activity_data else 0
-            avg_daily_active_minutes = sum(a['active_minutes'] for a in activity_data) / len(activity_data) if activity_data else 0
+            # Restrict activity_data to last 7 days (today + 6 previous days) for display
+            activity_data = [a for a in activity_data if a['date'] in last_7_days]
+
+            # Filter to last 7 days for average calculations (today + 6 previous days)
+            last_7_days_activity = [a for a in activity_data if a['date'] in last_7_days]
             
-            print(f"📊 ACTIVITY SUMMARY: {len(activity_data)} days, {total_steps} total steps, {int(avg_daily_steps)} avg daily")
-            print(f"🔥 CALORIES SUMMARY: {len(activity_data)} days, {total_calories} total calories, {int(avg_daily_calories)} avg daily")
+            # Ensure we have exactly 7 days by filling missing days with zeros
+            activity_by_date = {a['date']: a for a in last_7_days_activity}
+            complete_7_days_activity = []
+            for day_str in last_7_days:
+                if day_str in activity_by_date:
+                    complete_7_days_activity.append(activity_by_date[day_str])
+                else:
+                    complete_7_days_activity.append({
+                        'date': day_str,
+                        'steps': 0,
+                        'calories_burned': 0,
+                        'active_minutes': 0,
+                        'distance_km': 0,
+                        'activity_level': 'Sedentary'
+                    })
+            
+            # Calculate totals & averages using exactly 7 days (today + 6 previous days)
+            total_steps = sum(a['steps'] for a in complete_7_days_activity)
+            total_calories = sum(a['calories_burned'] for a in complete_7_days_activity)
+            total_distance_activity = sum(a['distance_km'] for a in complete_7_days_activity)
+
+            # Always divide by 7 for consistent dashboard averages (today + 6 previous days)
+            DASHBOARD_DAYS = 7
+            avg_daily_steps = round(total_steps / DASHBOARD_DAYS, 1)
+            avg_daily_calories = round(total_calories / DASHBOARD_DAYS, 1)
+            avg_daily_active_minutes = round(
+                sum(a['active_minutes'] for a in complete_7_days_activity) / DASHBOARD_DAYS, 1
+            )
+            
+            print(f"📊 ACTIVITY SUMMARY: {DASHBOARD_DAYS} days (fixed window), {total_steps} total steps, {int(avg_daily_steps)} avg daily")
+            print(f"🔥 CALORIES SUMMARY: {DASHBOARD_DAYS} days (fixed window), {total_calories} total calories, {int(avg_daily_calories)} avg daily")
 
             # --- 6. WALKING + RUNNING DISTANCE DATA ---
-            # Get Apple Health distance data from DISPLAY table
+            # Use the same exact 7-day window for consistency
             apple_distance_query = text("""
-                SELECT DATE(start_date) as date, SUM(CAST(value AS DECIMAL(10,4))) as total_distance 
-                FROM health_data_display
-                WHERE user_id = :user_id AND data_type = 'DistanceWalkingRunning' 
-                  AND start_date >= :start_date
-                GROUP BY DATE(start_date)
-                ORDER BY DATE(start_date) DESC
+                SELECT DATE(CONVERT_TZ(end_date, '+00:00', :tz)) as date, 
+                       SUM(CAST(value AS DECIMAL(10,4))) as total_distance_mi
+                FROM health_data_archive
+                WHERE user_id = :user_id AND data_type = 'DistanceWalkingRunning'
+                  AND DATE(CONVERT_TZ(end_date, '+00:00', :tz)) BETWEEN :start_local AND :end_local
+                  AND value > 0
+                GROUP BY DATE(CONVERT_TZ(end_date, '+00:00', :tz))
+                ORDER BY DATE(CONVERT_TZ(end_date, '+00:00', :tz)) DESC
             """)
-            apple_distance_records = conn.execute(apple_distance_query, {'user_id': user_id, 'start_date': start_of_range_dt}).fetchall()
+            apple_distance_records = conn.execute(apple_distance_query, {
+                'user_id': user_id, 
+                'tz': tz_offset,
+                'start_local': dashboard_start_local_str,
+                'end_local': end_date_local_str
+            }).fetchall()
             
-            # Use only Apple Health distance data for now (manual activities don't track distance)
-            daily_distances = {}
+            print(f"📏 Found {len(apple_distance_records)} days of distance data in 7-day window")
             
-            # Add Apple Health distances (convert miles to km for consistency)
+            # Add Apple Health distance to daily_activity dictionary
             for r in apple_distance_records:
                 day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
-                daily_distances[day_key] = round(float(r.total_distance) * 1.60934, 2)  # Convert miles to km
+                if day_key not in daily_activity:
+                    daily_activity[day_key] = {'steps': 0, 'calories': 0, 'active_minutes': 0, 'distance_km': 0}
+                # Convert miles → km (1 mi = 1.60934 km)
+                daily_activity[day_key]['distance_km'] = round(float(r.total_distance_mi) * 1.60934, 2)
             
-            # Create walking + running data structure
+            # Use only Apple Health distance data (properly converted from miles to km)
+            daily_distances = {}
+            
+            for r in apple_distance_records:
+                day_key = r.date.strftime('%Y-%m-%d') if hasattr(r.date, 'strftime') else str(r.date)
+                distance_km = float(r.total_distance_mi) * 1.60934
+                daily_distances[day_key] = round(distance_km, 2)
+            
+            # Create walking + running data structure with FIXED 7-DAY WINDOW (today + 6 previous days)
             walking_running_data = []
-            for date_key, distance_km in daily_distances.items():
-                walking_running_data.append({'date': date_key, 'distance_km': round(distance_km, 2), 'distance_miles': round(distance_km / 1.60934, 2)})
+            
+            # Ensure we calculate averages over exactly 7 days (same as other metrics)
+            complete_7_days_distance = []
+            for day_str in last_7_days:
+                if day_str in daily_distances:
+                    distance_km = daily_distances[day_str]
+                    walking_running_data.append({
+                        'date': day_str, 
+                        'distance_km': round(distance_km, 2), 
+                        'distance_miles': round(distance_km / 1.60934, 2)
+                    })
+                    complete_7_days_distance.append(distance_km)
+                else:
+                    # Include zero days for accurate 7-day average (today + 6 previous days)
+                    walking_running_data.append({
+                        'date': day_str, 
+                        'distance_km': 0.0, 
+                        'distance_miles': 0.0
+                    })
+                    complete_7_days_distance.append(0.0)
+            
             walking_running_data.sort(key=lambda x: x['date'], reverse=True)
             
-            # Calculate average distance
-            total_distance_km = sum(d['distance_km'] for d in walking_running_data)
-            avg_daily_distance_km = total_distance_km / len(walking_running_data) if walking_running_data else 0
+            # Calculate average distance using exactly 7 days (including zero days)
+            total_distance_km = sum(complete_7_days_distance)
+            avg_daily_distance_km = total_distance_km / DASHBOARD_DAYS
             avg_daily_distance_miles = avg_daily_distance_km / 1.60934 if avg_daily_distance_km > 0 else 0
             
-            print(f"📏 DISTANCE SUMMARY: {len(walking_running_data)} days, {total_distance_km:.2f} km total, {avg_daily_distance_km:.2f} km avg daily")
+            print(f"📏 DISTANCE SUMMARY: {DASHBOARD_DAYS} days (fixed window), {total_distance_km:.2f} km total, {avg_daily_distance_km:.2f} km avg daily")
+
+            # MOBILE DEBUG: Log final data being sent
+            print(f"📱 MOBILE DEBUG: About to return response with:")
+            print(f"   • Glucose entries: {len(glucose_summary)}")
+            print(f"   • Activity entries: {len(activity_data)}")
+            print(f"   • Sleep entries: {len(sleep_data)}")
+            print(f"   • Sleep data sample: {sleep_data[:2] if sleep_data else 'EMPTY'}")
+            print(f"   • Average sleep hours: {avg_sleep_hours}")
 
             return jsonify({
-                "date_range": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat(), "days": days},
+                "date_range": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat(), "days": DASHBOARD_METRIC_DAYS + 1},
                 "glucose": {
                     "data": sorted(glucose_summary, key=lambda x: x['date'], reverse=True),
                     "summary": {"avg_glucose_15_days": round(avg_glucose_total, 1), "avg_glucose_7_days": round(avg_glucose_total, 1), "avg_time_in_range": f"{avg_time_in_range:.1f}", "total_readings": total_readings}
                 },
                 "activity": {
                     "data": activity_data,
-                    "summary": {"avg_daily_steps": int(avg_daily_steps), "avg_daily_calories": int(avg_daily_calories), "avg_daily_active_minutes": int(avg_daily_active_minutes), "total_distance_km": 0.0}
+                    "summary": {"avg_daily_steps": int(avg_daily_steps), "avg_daily_calories": int(avg_daily_calories), "avg_daily_active_minutes": int(avg_daily_active_minutes), "total_distance_km": round(total_distance_activity, 2)}
                 },
                 "walking_running": {
                     "data": walking_running_data,
@@ -2922,6 +3998,7 @@ def get_activity_logs():
         user_id = request.args.get('user_id', type=int)
         clerk_user_id = request.args.get('clerk_user_id', type=str)
         days_back = request.args.get('days', 30, type=int)
+        tz_offset = request.args.get('tz_offset', '+00:00')
         
         # Require either user_id or clerk_user_id
         if not user_id and not clerk_user_id:
@@ -2944,10 +4021,14 @@ def get_activity_logs():
         end_date = date.today()
         start_date = end_date - timedelta(days=days_back)
         
+        # DEBUG: Log user information for debugging
+        print(f"🔍 ACTIVITY LOGS DEBUG: Getting data for user_id={user_id}, clerk_user_id={clerk_user_id}")
+        print(f"📅 ACTIVITY LOGS DEBUG: Date range {start_date} to {end_date} ({days_back} days)")
+        
         activity_logs = []
         
-        # Ensure user's data is properly migrated from display to archive table if needed
-        migrate_display_to_archive_for_user(user_id)
+        # Migration disabled - sync process handles both tables properly
+        # migrate_display_to_archive_for_user(user_id)
         
         with engine.connect() as conn:
             # 1. MANUAL ACTIVITY LOGS from activity_log table
@@ -2996,13 +4077,13 @@ def get_activity_logs():
             
             print(f"📈 Total activities for user {user_id}: {total_activities[0]}, Latest: {total_activities[1]}")
 
-            # 2. APPLE HEALTH WORKOUT DATA from health_data_display table (fast dashboard access)
+            # 2. APPLE HEALTH WORKOUT DATA from archive table (use local day via tz)
             try:
                 apple_workouts = conn.execute(text("""
                     SELECT 
                         CONCAT('apple_workout_', id) as id,
-                        DATE(start_date) as date,
-                        TIME(start_date) as time,
+                        DATE(CONVERT_TZ(start_date, '+00:00', :tz)) as date,
+                        TIME(CONVERT_TZ(start_date, '+00:00', :tz)) as time,
                         'apple_health' as type,
                         COALESCE(workout_activity_type, data_subtype, 'Workout') as activity_type,
                         CONCAT(
@@ -3037,50 +4118,128 @@ def get_activity_logs():
                         END as distance_km,
                         'Apple Health Workout' as source,
                         start_date as sort_timestamp
-                    FROM health_data_display 
+                    FROM health_data_archive 
                     WHERE user_id = :user_id 
                       AND data_type = 'Workout'
-                      AND DATE(start_date) BETWEEN :start_date AND :end_date
+                      AND DATE(CONVERT_TZ(start_date, '+00:00', :tz)) BETWEEN :start_date AND :end_date
                     ORDER BY start_date DESC
                     LIMIT 10
-                """), {'user_id': user_id, 'start_date': start_date, 'end_date': end_date}).fetchall()
+                """), {'user_id': user_id, 'start_date': start_date, 'end_date': end_date, 'tz': tz_offset}).fetchall()
             except Exception as e:
                 print(f"⚠️ Apple Health workouts query failed: {e}")
                 apple_workouts = []
 
-            # 3. APPLE HEALTH STEP COUNT DATA (daily summaries) from DISPLAY table
+            # Fallback to archive table if no workout data found in display table
+            if not apple_workouts:
+                print(f"⚠️ No workout data in display table, falling back to archive table")
+                try:
+                    apple_workouts_archive = conn.execute(text("""
+                        SELECT 
+                            CONCAT('apple_workout_', id) as id,
+                            DATE(start_date) as date,
+                            TIME(start_date) as time,
+                            'apple_health' as type,
+                            COALESCE(workout_activity_type, data_subtype, 'Workout') as activity_type,
+                            CONCAT(
+                                COALESCE(workout_activity_type, data_subtype, 'Workout'),
+                                CASE 
+                                    WHEN value > 0 THEN CONCAT(' (', ROUND(value, 0), ' ', unit, ')')
+                                    ELSE ''
+                                END,
+                                CASE 
+                                    WHEN end_date IS NOT NULL AND start_date IS NOT NULL 
+                                    THEN CONCAT(' for ', ROUND(TIMESTAMPDIFF(MINUTE, start_date, end_date), 0), ' min')
+                                    ELSE ''
+                                END
+                            ) as description,
+                            CASE 
+                                WHEN end_date IS NOT NULL AND start_date IS NOT NULL 
+                                THEN ROUND(TIMESTAMPDIFF(MINUTE, start_date, end_date), 0)
+                                ELSE NULL
+                            END as duration_minutes,
+                            NULL as steps,
+                            CASE 
+                                WHEN unit = 'cal' THEN ROUND(value, 0)
+                                ELSE NULL
+                            END as calories_burned,
+                            CASE 
+                                WHEN unit IN ('km', 'm') THEN 
+                                    CASE 
+                                        WHEN unit = 'm' THEN ROUND(value / 1000, 2)
+                                        ELSE ROUND(value, 2)
+                                    END
+                                ELSE NULL
+                            END as distance_km,
+                            'Apple Health Workout' as source,
+                            start_date as sort_timestamp
+                        FROM health_data_archive 
+                        WHERE user_id = :user_id 
+                          AND data_type = 'Workout'
+                          AND DATE(start_date) BETWEEN :start_date AND :end_date
+                        ORDER BY start_date DESC
+                        LIMIT 10
+                    """), {'user_id': user_id, 'start_date': start_date, 'end_date': end_date}).fetchall()
+                    
+                    apple_workouts = apple_workouts_archive
+                    print(f"📊 Found {len(apple_workouts)} Apple Health workout entries from archive")
+                    
+                except Exception as e:
+                    print(f"⚠️ Apple Health workouts archive query failed: {e}")
+                    apple_workouts = []
+
+            # 3. APPLE HEALTH STEP COUNT DATA (daily summaries) from ARCHIVE table ONLY (group by local day)
             try:
-                apple_steps = conn.execute(text("""
+                apple_steps_query = text("""
                     SELECT 
-                        CONCAT('apple_steps_', date_col) as id,
-                        date_col as date,
-                        '23:59:00' as time,
+                        CONCAT('apple_steps_', DATE(CONVERT_TZ(end_date, '+00:00', :tz))) as id,
+                        DATE(CONVERT_TZ(end_date, '+00:00', :tz)) as date,
+                        '23:59:59' as time,
                         'apple_health' as type,
                         'Daily Steps' as activity_type,
-                        CONCAT(
-                            ROUND(total_steps, 0), ' steps recorded by Apple Health'
-                        ) as description,
+                        CONCAT(ROUND(SUM(value), 0), ' steps recorded by Apple Health') as description,
                         NULL as duration_minutes,
-                        ROUND(total_steps, 0) as steps,
+                        CAST(ROUND(SUM(value), 0) AS UNSIGNED) as steps,
                         NULL as calories_burned,
                         NULL as distance_km,
                         'Apple Health Steps' as source,
-                        date_col as sort_timestamp
-                    FROM (
-                        SELECT 
-                            DATE(start_date) as date_col,
-                            SUM(value) as total_steps
-                        FROM health_data_display 
-                        WHERE user_id = :user_id 
-                          AND data_type = 'StepCount'
-                          AND DATE(start_date) BETWEEN :start_date AND :end_date
-                          AND value > 0
-                        GROUP BY DATE(start_date)
-                    ) step_summary
-                    ORDER BY date_col DESC
-                """), {'user_id': user_id, 'start_date': start_date, 'end_date': end_date}).fetchall()
+                        DATE(CONVERT_TZ(end_date, '+00:00', :tz)) as sort_timestamp
+                    FROM health_data_archive 
+                    WHERE user_id = :user_id 
+                      AND data_type IN ('StepCount', 'Steps')
+                      AND DATE(CONVERT_TZ(end_date, '+00:00', :tz)) BETWEEN :start_date AND :end_date
+                      AND value > 0
+                    GROUP BY DATE(CONVERT_TZ(end_date, '+00:00', :tz))
+                    ORDER BY DATE(CONVERT_TZ(end_date, '+00:00', :tz)) DESC
+                """)
                 
-                print(f"📊 Found {len(apple_steps)} Apple Health step entries")
+                apple_steps = conn.execute(apple_steps_query, {
+                    'user_id': user_id, 
+                    'start_date': start_date, 
+                    'end_date': end_date, 
+                    'tz': tz_offset
+                }).fetchall()
+                
+                print(f"📊 Found {len(apple_steps)} Apple Health step entries in {days_back} days")
+                
+                # FALLBACK: If no recent step data found, extend search to last 30 days  
+                if not apple_steps and days_back <= 7:
+                    print(f"⚠️ No step data found in last {days_back} days, extending search to 30 days")
+                    extended_start_date = end_date - timedelta(days=30)
+                    
+                    apple_steps = conn.execute(apple_steps_query, {
+                        'user_id': user_id, 
+                        'start_date': extended_start_date, 
+                        'end_date': end_date, 
+                        'tz': tz_offset
+                    }).fetchall()
+                    
+                    if apple_steps:
+                        print(f"✅ Found {len(apple_steps)} Apple Health step entries in extended 30-day window")
+                        # Limit to latest 10 entries when using fallback
+                        apple_steps = apple_steps[:10]
+                    else:
+                        print(f"❌ No step data found even in 30-day window for user_id={user_id}")
+                
                 for row in apple_steps:
                     print(f"  • {row[1]}: {row[7]} steps")
                     
@@ -3088,73 +4247,10 @@ def get_activity_logs():
                 print(f"⚠️ Apple Health steps query failed: {e}")
                 apple_steps = []
 
-            # 4. APPLE HEALTH DISTANCE DATA (daily summaries) from DISPLAY table
-            try:
-                apple_distance = conn.execute(text("""
-                    SELECT 
-                        CONCAT('apple_distance_', date_col) as id,
-                        date_col as date,
-                        '23:58:00' as time,
-                        'apple_health' as type,
-                        'Walking/Running Distance' as activity_type,
-                        CONCAT(
-                            ROUND(total_distance_km, 2), ' km distance recorded by Apple Health'
-                        ) as description,
-                        NULL as duration_minutes,
-                        NULL as steps,
-                        NULL as calories_burned,
-                        ROUND(total_distance_km, 2) as distance_km,
-                        'Apple Health Distance' as source,
-                        date_col as sort_timestamp
-                    FROM (
-                        SELECT 
-                            DATE(start_date) as date_col,
-                            SUM(value) / 1000 as total_distance_km
-                        FROM health_data_display 
-                        WHERE user_id = :user_id 
-                          AND data_type = 'DistanceWalkingRunning'
-                          AND DATE(start_date) BETWEEN :start_date AND :end_date
-                          AND value > 500
-                        GROUP BY DATE(start_date)
-                    ) distance_summary
-                    ORDER BY date_col DESC
-                """), {'user_id': user_id, 'start_date': start_date, 'end_date': end_date}).fetchall()
-                
-                print(f"📊 Found {len(apple_distance)} Apple Health distance entries")
-                for row in apple_distance:
-                    print(f"  • {row[1]}: {row[9]} km")
-                    
-            except Exception as e:
-                print(f"⚠️ Apple Health distance query failed: {e}")
-                apple_distance = []
+            # REMOVED: Distance data should NOT be in activity logs - only in walking/running section
+            apple_distance = []  # Keep empty to maintain code structure
             
-            # Debug: Check what step data exists in health_data_display table (dashboard data source)
-            try:
-                step_debug = conn.execute(text("""
-                    SELECT 
-                        DATE(start_date) as date,
-                        data_type,
-                        COUNT(*) as entry_count,
-                        SUM(value) as total_value,
-                        AVG(value) as avg_value,
-                        MIN(value) as min_value,
-                        MAX(value) as max_value,
-                        MAX(unit) as unit
-                    FROM health_data_display 
-                    WHERE user_id = :user_id 
-                      AND data_type IN ('StepCount', 'ActiveEnergyBurned', 'DistanceWalkingRunning')
-                      AND DATE(start_date) >= :debug_start_date
-                    GROUP BY DATE(start_date), data_type
-                    ORDER BY DATE(start_date) DESC, data_type
-                    LIMIT 20
-                """), {'user_id': user_id, 'debug_start_date': end_date - timedelta(days=7)}).fetchall()
-                
-                print(f"🔍 HEALTH DATA DEBUG (last 7 days):")
-                for row in step_debug:
-                    print(f"  📅 {row[0]} | {row[1]} | Count: {row[2]} | Total: {row[3]} | Unit: {row[7]}")
-                    
-            except Exception as e:
-                print(f"⚠️ Health data debug query failed: {e}")
+            # Debug removed: display table not used anymore for steps
 
         # Combine all activity logs
         all_activities = []
@@ -3210,30 +4306,15 @@ def get_activity_logs():
                 'sort_timestamp': row[11]
             })
 
-        # Process Apple Health distance
-        for row in apple_distance:
-            all_activities.append({
-                'id': row[0],
-                'date': str(row[1]),
-                'time': str(row[2]),
-                'type': row[3],
-                'activity_type': row[4],
-                'description': row[5],
-                'duration_minutes': row[6] if row[6] else None,
-                'steps': row[7] if row[7] else None,
-                'calories_burned': row[8] if row[8] else None,
-                'distance_km': row[9] if row[9] else None,
-                'source': row[10],
-                'sort_timestamp': row[11]
-            })
+        # REMOVED: Distance data should not be in activity logs - only in walking/running section
 
         # Debug: Log what we found
         print(f"📊 Activity logs found:")
         print(f"  • Manual activities: {len(manual_activities)}")
         print(f"  • Apple workouts: {len(apple_workouts)}")
         print(f"  • Apple steps: {len(apple_steps)}")
-        print(f"  • Apple distance: {len(apple_distance)}")
         print(f"  • Total combined: {len(all_activities)}")
+        print(f"  ✅ Distance data excluded from activity logs (appears only in walking/running section)")
         
         # Sort all activities by timestamp (most recent first)
         # Handle both datetime and date objects for sorting
@@ -3354,6 +4435,233 @@ def health_check():
         "version": "1.0.0"
     }), 200
 
+@app.route('/api/enhanced-sleep-analysis', methods=['GET'])
+def enhanced_sleep_analysis():
+    """Enhanced sleep analysis endpoint for detailed sleep insights"""
+    try:
+        clerk_user_id = request.args.get('clerk_user_id')
+        days = request.args.get('days', default=7, type=int)
+        
+        if not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "clerk_user_id parameter is required"
+            }), 400
+        
+        # Get the database user_id from clerk_user_id
+        try:
+            user_id = get_user_id_from_clerk(clerk_user_id)
+        except ValueError as e:
+            return jsonify({
+                "success": False,
+                "error": "User not found"
+            }), 404
+        
+        # Query sleep data from both display and archive tables
+        with engine.connect() as conn:
+            # First try display table for recent data
+            display_sleep_query = text("""
+                SELECT DATE(end_date) as sleep_date,
+                       TIMESTAMPDIFF(MINUTE, start_date, end_date) / 60.0 as hours_slept,
+                       start_date,
+                       end_date,
+                       source_name,
+                       'display' as data_source
+                FROM health_data_display
+                WHERE user_id = :user_id 
+                AND data_type = 'SleepAnalysis'
+                AND end_date >= DATE_SUB(CURDATE(), INTERVAL :days DAY)
+                ORDER BY end_date DESC
+            """)
+            
+            display_results = conn.execute(display_sleep_query, {
+                'user_id': user_id, 
+                'days': days
+            }).fetchall()
+            
+            # Fallback to archive table if display table has limited data
+            archive_sleep_query = text("""
+                SELECT DATE(end_date) as sleep_date,
+                       TIMESTAMPDIFF(MINUTE, start_date, end_date) / 60.0 as hours_slept,
+                       start_date,
+                       end_date,
+                       source_name,
+                       'archive' as data_source
+                FROM health_data_archive
+                WHERE user_id = :user_id 
+                AND data_type = 'SleepAnalysis'
+                AND end_date >= DATE_SUB(CURDATE(), INTERVAL :days DAY)
+                ORDER BY end_date DESC
+            """)
+            
+            archive_results = conn.execute(archive_sleep_query, {
+                'user_id': user_id, 
+                'days': days
+            }).fetchall()
+            
+            # Combine results, prioritizing display data
+            sleep_data = []
+            seen_dates = set()
+            
+            # Add display data first
+            for row in display_results:
+                sleep_date = str(row.sleep_date)
+                if sleep_date not in seen_dates:
+                    seen_dates.add(sleep_date)
+                    sleep_data.append({
+                        "date": sleep_date,
+                        "hours_slept": round(float(row.hours_slept or 0), 1),
+                        "start_time": row.start_date.isoformat() if row.start_date else None,
+                        "end_time": row.end_date.isoformat() if row.end_date else None,
+                        "source": row.source_name or "Unknown",
+                        "data_source": row.data_source
+                    })
+            
+            # Add archive data for missing dates
+            for row in archive_results:
+                sleep_date = str(row.sleep_date)
+                if sleep_date not in seen_dates:
+                    seen_dates.add(sleep_date)
+                    sleep_data.append({
+                        "date": sleep_date,
+                        "hours_slept": round(float(row.hours_slept or 0), 1),
+                        "start_time": row.start_date.isoformat() if row.start_date else None,
+                        "end_time": row.end_date.isoformat() if row.end_date else None,
+                        "source": row.source_name or "Unknown",
+                        "data_source": row.data_source
+                    })
+            
+            # Sort by date (most recent first)
+            sleep_data.sort(key=lambda x: x["date"], reverse=True)
+            
+            # Calculate sleep insights
+            if sleep_data:
+                hours_list = [d["hours_slept"] for d in sleep_data if d["hours_slept"] > 0]
+                if hours_list:
+                    avg_sleep = sum(hours_list) / len(hours_list)
+                    min_sleep = min(hours_list)
+                    max_sleep = max(hours_list)
+                    
+                    # Sleep quality assessment
+                    good_nights = len([h for h in hours_list if h >= 7])
+                    sleep_quality = "Good" if good_nights >= len(hours_list) * 0.7 else "Needs Improvement"
+                    
+                    insights = {
+                        "average_sleep": round(avg_sleep, 1),
+                        "min_sleep": round(min_sleep, 1),
+                        "max_sleep": round(max_sleep, 1),
+                        "nights_with_data": len(hours_list),
+                        "good_nights": good_nights,
+                        "sleep_quality": sleep_quality,
+                        "recommendation": "Aim for 7-9 hours of sleep nightly" if avg_sleep < 7 else "Great sleep habits!"
+                    }
+                else:
+                    insights = None
+            else:
+                insights = None
+            
+            print(f"📊 Enhanced sleep analysis for user {user_id}: Found {len(sleep_data)} sleep records over {days} days")
+            if not sleep_data:
+                print(f"⚠️ No sleep data found - checking if user has any sleep data in archive")
+                
+            return jsonify({
+                "success": True,
+                "sleep_data": sleep_data,
+                "insights": insights,
+                "total_records": len(sleep_data),
+                "days_requested": days,
+                "user_id": user_id
+            }), 200
+            
+    except Exception as e:
+        print(f"❌ Error in enhanced sleep analysis: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Enhanced sleep analysis failed: {str(e)}"
+        }), 500
+
+@app.route('/api/repair-display-table', methods=['POST'])
+def repair_display_table():
+    """Repair display table by populating it from archive table when it's empty"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        
+        if not user_id:
+            return jsonify({
+                "success": False,
+                "error": "user_id is required"
+            }), 400
+        
+        with engine.connect() as conn:
+            # Check if display table is empty or has very little data
+            display_count_query = text("""
+                SELECT data_type, COUNT(*) as count
+                FROM health_data_display
+                WHERE user_id = :user_id
+                AND start_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+                GROUP BY data_type
+            """)
+            
+            display_counts = conn.execute(display_count_query, {'user_id': user_id}).fetchall()
+            display_data_types = {row.data_type: row.count for row in display_counts}
+            
+            # Check archive table to see what data is available
+            archive_count_query = text("""
+                SELECT data_type, COUNT(*) as count
+                FROM health_data_archive
+                WHERE user_id = :user_id
+                AND start_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+                GROUP BY data_type
+            """)
+            
+            archive_counts = conn.execute(archive_count_query, {'user_id': user_id}).fetchall()
+            archive_data_types = {row.data_type: row.count for row in archive_counts}
+            
+            # Find data types that need repair (exist in archive but missing/low in display)
+            data_types_to_repair = []
+            for data_type, archive_count in archive_data_types.items():
+                display_count = display_data_types.get(data_type, 0)
+                if display_count < archive_count * 0.5:  # Less than 50% of archive data
+                    data_types_to_repair.append(data_type)
+            
+            print(f"🔧 Display table repair for user {user_id}:")
+            print(f"   Archive data types: {archive_data_types}")
+            print(f"   Display data types: {display_data_types}")
+            print(f"   Data types needing repair: {data_types_to_repair}")
+            
+            if not data_types_to_repair:
+                return jsonify({
+                    "success": True,
+                    "message": "Display table is healthy, no repair needed",
+                    "archive_counts": archive_data_types,
+                    "display_counts": display_data_types
+                }), 200
+            
+            # Use transaction for repair
+            with engine.begin() as trans_conn:
+                populate_display_table_from_archive(trans_conn, user_id, data_types_to_repair)
+            
+            # Check results after repair
+            final_counts = trans_conn.execute(display_count_query, {'user_id': user_id}).fetchall()
+            final_display_data_types = {row.data_type: row.count for row in final_counts}
+            
+            return jsonify({
+                "success": True,
+                "message": f"Display table repaired for {len(data_types_to_repair)} data types",
+                "repaired_data_types": data_types_to_repair,
+                "before_repair": display_data_types,
+                "after_repair": final_display_data_types,
+                "archive_counts": archive_data_types
+            }), 200
+            
+    except Exception as e:
+        print(f"❌ Error repairing display table: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Display table repair failed: {str(e)}"
+        }), 500
+
 # User Registration and Management Endpoints
 @app.route('/api/register-user', methods=['POST'])
 def register_user():
@@ -3434,7 +4742,7 @@ def get_user_profile():
             
             # Convert result to dictionary
             user_data = {
-                "user_id": result.user_id,
+                "user_id": result.id,
                 "clerk_user_id": result.clerk_user_id,
                 "email": result.email,
                 "full_name": result.full_name,
@@ -3458,6 +4766,9 @@ def get_user_profile():
                 "insulin_type": result.insulin_type,
                 "daily_basal_dose": float(result.daily_basal_dose) if result.daily_basal_dose else None,
                 "insulin_to_carb_ratio": float(result.insulin_to_carb_ratio) if result.insulin_to_carb_ratio else None,
+                # Target glucose range
+                "target_glucose_min": int(result.target_glucose_min) if getattr(result, "target_glucose_min", None) is not None else 70,
+                "target_glucose_max": int(result.target_glucose_max) if getattr(result, "target_glucose_max", None) is not None else 140,
             }
             
             return jsonify({
@@ -3515,7 +4826,7 @@ def save_onboarding_data():
                     onboarding_completed = TRUE,
                     onboarding_completed_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE user_id = :user_id
+                WHERE id = :user_id
             """)
             
             conn.execute(update_query, {
@@ -3527,7 +4838,7 @@ def save_onboarding_data():
                 'weight_value': data.get('weight_value'),
                 'weight_unit': data.get('weight_unit'),
                 'has_diabetes': data.get('has_diabetes'),
-                'diabetes_type': data.get('diabetes_type'),
+                'diabetes_type': data.get('diaboses_type'),
                 'year_of_diagnosis': data.get('year_of_diagnosis'),
                 'uses_insulin': data.get('uses_insulin'),
                 'insulin_type': data.get('insulin_type'),
@@ -3596,672 +4907,1120 @@ def network_test():
             "message": "Network diagnostic failed"
         }), 500
 
-@app.route('/api/debug-health-data', methods=['GET'])
-def debug_health_data():
-    """Provides raw data from the health_data_archive table for debugging."""
+@app.route('/api/debug-data-types', methods=['GET'])
+def debug_data_types():
+    """Debug endpoint to check what data types are actually in the database"""
     try:
-        user_id = request.args.get('user_id', 1)
-        days = int(request.args.get('days', 7))
-        end_date = datetime.now(timezone.utc)
-        start_date = end_date - timedelta(days=days)
-
+        user_id = request.args.get('user_id', 10, type=int)
+        
         with engine.connect() as conn:
-            query = text("""
-                SELECT data_type, start_date, end_date, value, unit, sample_id, source_name, metadata
-                FROM health_data_archive
+            # Check display table
+            display_query = text("""
+                SELECT data_type, COUNT(*) as count,
+                       MIN(DATE(start_date)) as earliest_date,
+                       MAX(DATE(start_date)) as latest_date
+                FROM health_data_display 
                 WHERE user_id = :user_id
-                  AND start_date >= :start_date
-                ORDER BY start_date DESC
+                GROUP BY data_type
+                ORDER BY data_type
             """)
+            display_results = conn.execute(display_query, {'user_id': user_id}).fetchall()
             
-            results = conn.execute(query, {
-                'user_id': user_id,
-                'start_date': start_date
-            }).fetchall()
-
-            data = [{
-                'data_type': r.data_type,
-                'start_date': r.start_date.isoformat() if r.start_date else None,
-                'end_date': r.end_date.isoformat() if r.end_date else None,
-                'value': r.value,
-                'unit': r.unit,
-                'sample_id': r.sample_id,
-                'source_name': r.source_name,
-                'metadata': r.metadata,
-            } for r in results]
-
-        return jsonify({
-            'success': True,
-            'user_id': user_id,
-            'days_queried': days,
-            'record_count': len(data),
-            'table_queried': 'health_data_archive',
-            'data': data
-        })
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-# @app.route('/api/simulate-step-data', methods=['POST'])
-# def simulate_step_data():
-#     """Simulate Apple Health step data for testing dashboard display"""
-#     try:
-#         user_id = request.args.get('user_id', 1, type=int)
-        
-#         with engine.connect() as conn:
-#             # Add step data for June 25, 2025 (your Apple Health data)
-#             test_dates = [
-#                 ('2025-06-24', 4200),
-#                 ('2025-06-25', 3411),  # Your actual data
-#                 ('2025-06-23', 5800),
-#                 ('2025-06-22', 7100),
-#                 ('2025-06-21', 2900)
-#             ]
-            
-#             simulated_entries = []
-            
-#             for date_str, steps in test_dates:
-#                 insert_query = text("""
-#                     INSERT INTO health_data_archive 
-#                     (user_id, data_type, value, unit, start_date, end_date, source_name, data_subtype, created_at)
-#                     VALUES (:user_id, :data_type, :value, :unit, :start_date, :end_date, :source_name, :data_subtype, NOW())
-#                     ON DUPLICATE KEY UPDATE 
-#                     value = VALUES(value),
-#                     updated_at = NOW()
-#                 """)
-                
-#                 conn.execute(insert_query, {
-#                     'user_id': user_id,
-#                     'data_type': 'StepCount',
-#                     'value': steps,
-#                     'unit': 'count',
-#                     'start_date': f'{date_str} 00:00:00',
-#                     'end_date': f'{date_str} 23:59:59',
-#                     'source_name': 'Apple Health (Simulated)',
-#                     'data_subtype': 'DailyTotal'
-#                 })
-                
-#                 simulated_entries.append({
-#                     'date': date_str,
-#                     'steps': steps
-#                 })
-            
-#             conn.commit()
-            
-#         return jsonify({
-#             'success': True,
-#             'message': f'Successfully simulated {len(simulated_entries)} step data entries',
-#             'simulated_data': simulated_entries
-#         })
-        
-#     except Exception as e:
-#         return jsonify({
-#             'success': False,
-#             'error': str(e),
-#             'message': 'Failed to simulate step data'
-#         }), 500
-
-# @app.route('/api/clear-simulated-health-data', methods=['POST'])
-# def clear_simulated_health_data():
-#     """Clear simulated health data to prepare for real Apple Health sync"""
-#     try:
-#         data = request.get_json()
-#         user_id = data.get('user_id', 1)
-        
-#         with engine.connect() as conn:
-#             # Delete simulated health data (identified by source_name containing 'Simulated')
-#             delete_query = text("""
-#                 DELETE FROM health_data_archive 
-#                 WHERE user_id = :user_id 
-#                   AND (
-#                     source_name LIKE '%Simulated%' 
-#                     OR source_name LIKE '%Apple Health (Simulated)%'
-#                     OR data_subtype = 'DailyTotal'
-#                   )
-#             """)
-            
-#             result = conn.execute(delete_query, {'user_id': user_id})
-#             deleted_count = result.rowcount
-#             conn.commit()
-            
-#             print(f"🗑️ Cleared {deleted_count} simulated health data entries for user {user_id}")
-            
-#         return jsonify({
-#             'success': True,
-#             'deleted_count': deleted_count,
-#             'message': f'Successfully cleared {deleted_count} simulated health data entries'
-#         })
-        
-#     except Exception as e:
-#         print(f"❌ Error clearing simulated health data: {e}")
-#         return jsonify({
-#             'success': False,
-#             'error': str(e),
-#             'message': 'Failed to clear simulated health data'
-#         }), 500
-
-# @app.route('/api/test-step-query', methods=['POST'])
-# def test_step_query():
-#     """Test endpoint to diagnose Apple Health step query issues"""
-#     try:
-#         data = request.get_json()
-#         user_id = data.get('user_id', 1)
-        
-#         # Calculate date range (last 7 days)
-#         end_date = date.today()
-#         start_date = end_date - timedelta(days=7)
-        
-#         with engine.connect() as conn:
-#             # Test the exact query used in activity logs
-#             print(f"🧪 Testing Apple Health step query for user {user_id}, date range: {start_date} to {end_date}")
-            
-#             try:
-#                 apple_steps = conn.execute(text("""
-#                     SELECT 
-#                         CONCAT('apple_steps_', date_col) as id,
-#                         date_col as date,
-#                         '23:59:00' as time,
-#                         'apple_health' as type,
-#                         'Daily Steps' as activity_type,
-#                         CONCAT(
-#                             ROUND(total_steps, 0), ' steps recorded by Apple Health'
-#                         ) as description,
-#                         NULL as duration_minutes,
-#                         ROUND(total_steps, 0) as steps,
-#                         NULL as calories_burned,
-#                         NULL as distance_km,
-#                         'Apple Health Steps' as source,
-#                         date_col as sort_timestamp
-#                     FROM (
-#                         SELECT 
-#                             DATE(start_date) as date_col,
-#                             SUM(value) as total_steps
-#                         FROM health_data_archive 
-#                         WHERE user_id = :user_id 
-#                           AND data_type = 'StepCount'
-#                           AND DATE(start_date) BETWEEN :start_date AND :end_date
-#                           AND value > 0
-#                         GROUP BY DATE(start_date)
-#                     ) step_summary
-#                     ORDER BY date_col DESC
-#                 """), {'user_id': user_id, 'start_date': start_date, 'end_date': end_date}).fetchall()
-                
-#                 print(f"🧪 Apple Health step query returned {len(apple_steps)} results")
-                
-#                 results = []
-#                 for row in apple_steps:
-#                     result_dict = {
-#                         'id': row[0],
-#                         'date': str(row[1]),
-#                         'time': str(row[2]),
-#                         'type': row[3],
-#                         'activity_type': row[4],
-#                         'description': row[5],
-#                         'duration_minutes': row[6],
-#                         'steps': row[7],
-#                         'calories_burned': row[8],
-#                         'distance_km': row[9],
-#                         'source': row[10]
-#                     }
-#                     results.append(result_dict)
-#                     print(f"🧪 Result: {result_dict}")
-                
-#                 # Also test the raw data
-#                 raw_step_data = conn.execute(text("""
-#                     SELECT 
-#                         DATE(start_date) as date,
-#                         data_type,
-#                         value,
-#                         unit,
-#                         source_name,
-#                         start_date,
-#                         end_date
-#                     FROM health_data_archive 
-#                     WHERE user_id = :user_id 
-#                       AND data_type = 'StepCount'
-#                       AND DATE(start_date) BETWEEN :start_date AND :end_date
-#                     ORDER BY start_date DESC
-#                 """), {'user_id': user_id, 'start_date': start_date, 'end_date': end_date}).fetchall()
-                
-#                 raw_data = []
-#                 for row in raw_step_data:
-#                     raw_data.append({
-#                         'date': str(row[0]),
-#                         'data_type': row[1],
-#                         'value': row[2],
-#                         'unit': row[3],
-#                         'source_name': row[4],
-#                         'start_date': str(row[5]),
-#                         'end_date': str(row[6])
-#                     })
-                
-#                 return jsonify({
-#                     'success': True,
-#                     'query_results': results,
-#                     'raw_step_data': raw_data,
-#                     'query_result_count': len(results),
-#                     'raw_data_count': len(raw_data),
-#                     'date_range': f"{start_date} to {end_date}",
-#                     'message': f"Found {len(results)} processed step entries and {len(raw_data)} raw step records"
-#                 })
-                
-#             except Exception as query_error:
-#                 print(f"🧪 Query error: {query_error}")
-#                 return jsonify({
-#                     'success': False,
-#                     'error': f"Query failed: {str(query_error)}",
-#                     'date_range': f"{start_date} to {end_date}"
-#                 })
-        
-#     except Exception as e:
-#         print(f"🧪 Test endpoint error: {e}")
-#         return jsonify({
-#             'success': False,
-#             'error': f"Test failed: {str(e)}"
-#         }), 500
-
-# @app.route('/api/clear-all-health-data', methods=['POST'])
-# def clear_all_health_data():
-#     """Clear ALL health data for a user from both archive and display tables."""
-#     try:
-#         data = request.get_json()
-#         user_id = data.get('user_id', 1)
-        
-#         with engine.begin() as conn: # Use a transaction
-#             # Delete ALL health data for the user from archive
-#             delete_archive_query = text("""
-#                 DELETE FROM health_data_archive 
-#                 WHERE user_id = :user_id
-#             """)
-#             archive_result = conn.execute(delete_archive_query, {'user_id': user_id})
-#             archive_deleted_count = archive_result.rowcount
-            
-#             # Delete ALL health data for the user from display
-#             delete_display_query = text("""
-#                 DELETE FROM health_data_display 
-#                 WHERE user_id = :user_id
-#             """)
-#             display_result = conn.execute(delete_display_query, {'user_id': user_id})
-#             display_deleted_count = display_result.rowcount
-            
-#             total_deleted = archive_deleted_count + display_deleted_count
-#             print(f"🗑️ Cleared {archive_deleted_count} archive and {display_deleted_count} display entries for user {user_id}")
-            
-#         return jsonify({
-#             'success': True,
-#             'deleted_count': total_deleted,
-#             'message': f'Successfully cleared {total_deleted} total health data entries. Ready for real Apple Health sync.'
-#         })
-        
-#     except Exception as e:
-#         print(f"❌ Error clearing all health data: {e}")
-#         return jsonify({
-#             'success': False,
-#             'error': str(e),
-#             'message': 'Failed to clear all health data'
-#         }), 500
-
-@app.route('/api/verify-apple-health-data', methods=['POST'])
-def verify_apple_health_data():
-    """Receive and log Apple Health data for manual verification before dashboard integration"""
-    # create_verification_health_data_table() # This is now called at startup
-    try:
-        data = request.get_json()
-        user_id = data.get('user_id', 1)
-        health_data = data.get('health_data', {})
-        
-        print("🔍 Receiving Apple Health data for verification...")
-        
-        with engine.connect() as conn:
-            transaction = conn.begin()
-            now = datetime.now()
-            total_records = 0
-            for data_type, records in health_data.items():
-                if isinstance(records, list) and records:
-                    total_records += len(records)
-                    conn.execute(text("""
-                        INSERT INTO verification_health_data (user_id, data_type, data, created_at)
-                        VALUES (:user_id, :data_type, :data, :created_at)
-                    """), {
-                        'user_id': user_id,
-                        'data_type': data_type,
-                        'data': json.dumps(records),
-                        'created_at': now
-                    })
-            
-            transaction.commit()
-        
-        print(f"✅ Stored {total_records} records for verification.")
-        
-        return jsonify({
-            'success': True,
-            'message': 'Apple Health data received and stored for verification.',
-        })
-        
-    except Exception as e:
-        print(f"❌ Error in /api/verify-apple-health-data: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'message': 'Failed to process Apple Health verification data'
-        }), 500
-
-@app.route('/api/approve-apple-health-data', methods=['POST'])
-def approve_apple_health_data():
-    data = request.get_json()
-    user_id = data.get('user_id', 1)
-
-    with engine.connect() as conn:
-        transaction = conn.begin()
-        try:
-            # 1. Fetch all unverified data for the user
-            verified_data_query = text("""
-                SELECT id, data_type, data, created_at
-                FROM verification_health_data
-                WHERE user_id = :user_id AND verified = FALSE
+            # Check archive table
+            archive_query = text("""
+                SELECT data_type, COUNT(*) as count,
+                       MIN(DATE(start_date)) as earliest_date,
+                       MAX(DATE(start_date)) as latest_date
+                FROM health_data_archive 
+                WHERE user_id = :user_id
+                GROUP BY data_type
+                ORDER BY data_type
             """)
-            unverified_records = conn.execute(verified_data_query, {'user_id': user_id}).fetchall()
-
-            if not unverified_records:
-                return jsonify({"success": True, "message": "No unverified Apple Health data to approve.", "approved_records": 0})
-
-            # Get the timestamp of the most recent sync to process only that batch
-            latest_timestamp = max(r.created_at for r in unverified_records)
+            archive_results = conn.execute(archive_query, {'user_id': user_id}).fetchall()
             
-            # Filter for only the records from the most recent sync
-            records_to_process = [r for r in unverified_records if r.created_at == latest_timestamp]
-
-            all_records_to_insert = []
-
-            for record in records_to_process:
-                data_type = record.data_type
-                health_data_list = json.loads(record.data)
-                
-                print(f"✅ Processing approval for {data_type} with {len(health_data_list)} records.")
-
-                # --- SPECIALIZED HANDLING FOR STEPCOUNT ---
-                if data_type == 'StepCount':
-                    for entry in health_data_list:
-                        entry_date_str = entry['date'].split('T')[0]
-                        entry_date = datetime.fromisoformat(entry_date_str)
-                        start_of_day_utc = datetime(entry_date.year, entry_date.month, entry_date.day, tzinfo=timezone.utc)
-                        end_of_day_utc = start_of_day_utc + timedelta(days=1, seconds=-1)
-
-                        record_to_insert = {
-                            'user_id': user_id, 'data_type': 'StepCount', 'data_subtype': 'daily_summary',
-                            'value': entry['value'], 'value_string': None, 'unit': 'count',
-                            'start_date': start_of_day_utc, 'end_date': end_of_day_utc,
-                            'source_name': entry.get('source', 'Multiple'), 'source_bundle_id': None, 
-                            'device_name': None, 'device_manufacturer': None,
-                            'sample_id': f"daily_summary_{user_id}_{entry_date_str}",
-                            'entry_type': 'summary', 'category_type': None, 'workout_activity_type': None,
-                            'total_energy_burned': None, 'total_distance': None,
-                            'average_quantity': None, 'minimum_quantity': None, 'maximum_quantity': None,
-                            'metadata': json.dumps({'original_source': entry.get('source', 'Multiple')})
-                        }
-                        all_records_to_insert.append(record_to_insert)
-
-                # --- GENERIC HANDLING FOR OTHER HEALTH DATA (Sleep, etc.) ---
-                else:
-                    for entry in health_data_list:
-                        # Initialize a full dictionary for the table schema
-                        record_to_insert = {
-                            'user_id': user_id, 'data_type': data_type,
-                            'data_subtype': None, 'value': None, 'value_string': None, 'unit': None,
-                            'start_date': parse_iso_datetime(entry.get('startDate')),
-                            'end_date': parse_iso_datetime(entry.get('endDate')),
-                            'source_name': None, 'source_bundle_id': None, 'device_name': None, 'device_manufacturer': None,
-                            'sample_id': entry.get('sampleId') or entry.get('uuid') or str(uuid.uuid4()),
-                            'entry_type': 'sample', 'category_type': None, 'workout_activity_type': None,
-                            'total_energy_burned': None, 'total_distance': None,
-                            'average_quantity': None, 'minimum_quantity': None, 'maximum_quantity': None,
-                            'metadata': None
-                        }
-                        
-                        metadata = entry.get('metadata', {}) or {}
-                        if isinstance(metadata, str):
-                            try:
-                                metadata = json.loads(metadata)
-                            except json.JSONDecodeError:
-                                metadata = {}
-                        
-                        # Populate fields from entry
-                        record_to_insert.update({
-                            'data_subtype': entry.get('dataSubtype') or entry.get('value'),
-                            'value': entry.get('quantity') or entry.get('value'),
-                            'unit': entry.get('unit'),
-                            'source_name': entry.get('sourceName') or (entry.get('source', {}) or {}).get('name') or (entry.get('device', {}) or {}).get('name'),
-                            'source_bundle_id': (entry.get('source', {}) or {}).get('bundleIdentifier'),
-                            'device_name': (entry.get('device', {}) or {}).get('name'),
-                            'device_manufacturer': (entry.get('device', {}) or {}).get('manufacturer'),
-                            'entry_type': 'sample' if 'quantity' in entry else 'category',
-                            'metadata': json.dumps(metadata) # Store metadata with timezone
-                        })
-                        all_records_to_insert.append(record_to_insert)
-
-            # 3. BULK INSERT ALL PROCESSED RECORDS
-            if all_records_to_insert:
-                sample_ids_to_delete = [r['sample_id'] for r in all_records_to_insert if r['sample_id']]
-                if sample_ids_to_delete:
-                    delete_query = text("""
-                        DELETE FROM health_data_archive
-                        WHERE user_id = :user_id AND sample_id IN :sample_ids
-                    """)
-                    conn.execute(delete_query, {'user_id': user_id, 'sample_ids': tuple(sample_ids_to_delete)})
-                    print(f"✅ Cleared {len(sample_ids_to_delete)} existing records for fresh insertion.")
-
-                print(f"✅ Inserting {len(all_records_to_insert)} total records into the health_data_archive table.")
-                health_data_table = Table('health_data_archive', MetaData(), autoload_with=engine)
-                conn.execute(health_data_table.insert(), all_records_to_insert)
-            else:
-                print("ℹ️ No new records to insert.")
-
-            # 4. MARK THE BATCH AS VERIFIED
-            update_query = text("""
-                UPDATE verification_health_data
-                SET verified = TRUE
-                WHERE user_id = :user_id AND created_at = :timestamp
-            """)
-            conn.execute(update_query, {'user_id': user_id, 'timestamp': latest_timestamp})
-
-            transaction.commit()
             return jsonify({
-                "success": True,
-                "message": f"Successfully approved and integrated {len(all_records_to_insert)} Apple Health records into dashboard",
-                "approved_records": len(all_records_to_insert)
+                'user_id': user_id,
+                'display_table': [
+                    {
+                        'data_type': row.data_type,
+                        'count': row.count,
+                        'earliest_date': str(row.earliest_date),
+                        'latest_date': str(row.latest_date)
+                    } for row in display_results
+                ],
+                'archive_table': [
+                    {
+                        'data_type': row.data_type,
+                        'count': row.count,
+                        'earliest_date': str(row.earliest_date),
+                        'latest_date': str(row.latest_date)
+                    } for row in archive_results
+                ]
             })
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-        except Exception as e:
-            if 'transaction' in locals() and transaction.is_active:
-                transaction.rollback()
-            print(f"❌ Error during data approval: {e}")
-            return jsonify({"success": False, "message": f"An error occurred: {e}"}), 500
-
-# @app.route('/api/get-verification-data', methods=['GET'])
-# def get_verification_data():
-#     """Get the current verification data for manual review"""
+# @app.route('/api/debug-health-data', methods=['GET'])
+# def debug_health_data():
+#     """Provides comprehensive health data analysis for debugging and historical sync detection."""
 #     try:
 #         user_id = request.args.get('user_id', 1)
+#         days = int(request.args.get('days', 30))  # Default to 30 days for historical analysis
+#         end_date = datetime.now(timezone.utc)
+#         start_date = end_date - timedelta(days=days)
+
+#         with engine.connect() as conn:
+#             # First check display table (primary source)
+#             display_query = text("""
+#                 SELECT 
+#                     data_type,
+#                     COUNT(*) as record_count,
+#                     COUNT(DISTINCT DATE(start_date)) as unique_days,
+#                     MIN(start_date) as earliest_date,
+#                     MAX(start_date) as latest_date,
+#                     GROUP_CONCAT(DISTINCT DATE(start_date) ORDER BY DATE(start_date) SEPARATOR ',') as date_range
+#                 FROM health_data_display
+#                 WHERE user_id = :user_id
+#                   AND start_date >= :start_date
+#                 GROUP BY data_type
+#                 ORDER BY data_type
+#             """)
+            
+#             display_results = conn.execute(display_query, {
+#                 'user_id': user_id,
+#                 'start_date': start_date
+#             }).fetchall()
+
+#             # Also check archive table as fallback
+#             archive_query = text("""
+#                 SELECT 
+#                     data_type,
+#                     COUNT(*) as record_count,
+#                     COUNT(DISTINCT DATE(start_date)) as unique_days,
+#                     MIN(start_date) as earliest_date,
+#                     MAX(start_date) as latest_date,
+#                     GROUP_CONCAT(DISTINCT DATE(start_date) ORDER BY DATE(start_date) SEPARATOR ',') as date_range
+#                 FROM health_data_archive
+#                 WHERE user_id = :user_id
+#                   AND start_date >= :start_date
+#                 GROUP BY data_type
+#                 ORDER BY data_type
+#             """)
+            
+#             archive_results = conn.execute(archive_query, {
+#                 'user_id': user_id,
+#                 'start_date': start_date
+#             }).fetchall()
+
+#             # Process display table results (primary)
+#             health_data_types = {}
+#             for r in display_results:
+#                 date_range = r.date_range.split(',') if r.date_range else []
+#                 health_data_types[r.data_type] = {
+#                     'record_count': r.record_count,
+#                     'unique_days': r.unique_days,
+#                     'earliest_date': r.earliest_date.isoformat() if r.earliest_date else None,
+#                     'latest_date': r.latest_date.isoformat() if r.latest_date else None,
+#                     'date_range': date_range,
+#                     'source': 'display'
+#                 }
+
+#             # Add archive data for types not in display
+#             for r in archive_results:
+#                 if r.data_type not in health_data_types:
+#                     date_range = r.date_range.split(',') if r.date_range else []
+#                     health_data_types[r.data_type] = {
+#                         'record_count': r.record_count,
+#                         'unique_days': r.unique_days,
+#                         'earliest_date': r.earliest_date.isoformat() if r.earliest_date else None,
+#                         'latest_date': r.latest_date.isoformat() if r.latest_date else None,
+#                         'date_range': date_range,
+#                         'source': 'archive'
+#                     }
+
+#             # Calculate overall statistics
+#             total_records = sum(info['record_count'] for info in health_data_types.values())
+#             total_unique_days = len(set().union(*[set(info['date_range']) for info in health_data_types.values() if info['date_range']]))
+#             data_types_with_data = len([info for info in health_data_types.values() if info['unique_days'] > 0])
+
+#         return jsonify({
+#             'success': True,
+#             'user_id': user_id,
+#             'days_queried': days,
+#             'health_data_types': health_data_types,
+#             'summary': {
+#                 'total_records': total_records,
+#                 'total_unique_days': total_unique_days,
+#                 'data_types_with_data': data_types_with_data,
+#                 'total_data_types': len(health_data_types)
+#             }
+#         })
+#     except Exception as e:
+#         return jsonify({'success': False, 'error': str(e)}), 500
+
+# @app.route('/api/verify-apple-health-data', methods=['POST'])
+# def verify_apple_health_data():
+#     """Receive and log Apple Health data for manual verification before dashboard integration"""
+#     # create_verification_health_data_table() # This is now called at startup
+#     try:
+#         data = request.get_json()
+#         user_id = data.get('user_id', 1)
+#         health_data = data.get('health_data', {})
+        
+#         print("🔍 Receiving Apple Health data for verification...")
         
 #         with engine.connect() as conn:
-#             verification_data = conn.execute(text("""
-#                 SELECT data_type, verification_data, created_at, verified
-#                 FROM apple_health_verification 
-#                 WHERE user_id = :user_id 
-#                 ORDER BY created_at DESC
-#                 LIMIT 10
-#             """), {'user_id': user_id}).fetchall()
+#             transaction = conn.begin()
+#             now = datetime.now()
+#             total_records = 0
+#             for data_type, records in health_data.items():
+#                 if isinstance(records, list) and records:
+#                     total_records += len(records)
+#                     conn.execute(text("""
+#                         INSERT INTO verification_health_data (user_id, data_type, data, created_at)
+#                         VALUES (:user_id, :data_type, :data, :created_at)
+#                     """), {
+#                         'user_id': user_id,
+#                         'data_type': data_type,
+#                         'data': json.dumps(records),
+#                         'created_at': now
+#                     })
             
-#             results = []
-#             for row in verification_data:
-#                 results.append({
-#                     'data_type': row[0],
-#                     'data': json.loads(row[1]),
-#                     'created_at': str(row[2]),
-#                     'verified': bool(row[3])
-#                 })
+#             transaction.commit()
+        
+#         print(f"✅ Stored {total_records} records for verification.")
         
 #         return jsonify({
 #             'success': True,
-#             'verification_data': results
+#             'message': 'Apple Health data received and stored for verification.',
 #         })
         
 #     except Exception as e:
+#         print(f"❌ Error in /api/verify-apple-health-data: {e}")
 #         return jsonify({
 #             'success': False,
-#             'error': str(e)
+#             'error': str(e),
+#             'message': 'Failed to process Apple Health verification data'
 #         }), 500
 
-# def get_comprehensive_sleep_data(user_id: int = 1, days_back: int = 25):
-#     """Get comprehensive sleep data for extended period with less restrictive filtering."""
-#     try:
-#         with engine.connect() as conn:
-#             # Get all raw sleep analysis samples for the user for the specified period
-#             start_date = datetime.now() - timedelta(days=days_back)
+# @app.route('/api/approve-apple-health-data', methods=['POST'])
+# def approve_apple_health_data():
+#     data = request.get_json()
+#     user_id = data.get('user_id', 1)
+
+#     with engine.connect() as conn:
+#         transaction = conn.begin()
+#         try:
+#             # 1. Fetch all unverified data for the user
+#             verified_data_query = text("""
+#                 SELECT id, data_type, data, created_at
+#                 FROM verification_health_data
+#                 WHERE user_id = :user_id AND verified = FALSE
+#             """)
+#             unverified_records = conn.execute(verified_data_query, {'user_id': user_id}).fetchall()
+
+#             if not unverified_records:
+#                 return jsonify({"success": True, "message": "No unverified Apple Health data to approve.", "approved_records": 0})
+
+#             # Get the timestamp of the most recent sync to process only that batch
+#             latest_timestamp = max(r.created_at for r in unverified_records)
             
-#             raw_sleep_records = conn.execute(text("""
-#                 SELECT start_date, end_date, metadata, value
-#                 FROM health_data_archive
-#                 WHERE data_type = 'SleepAnalysis' AND user_id = :uid
-#                 AND start_date >= :start_date
-#                 ORDER BY start_date
-#             """), {"uid": user_id, "start_date": start_date}).fetchall()
+#             # Filter for only the records from the most recent sync
+#             records_to_process = [r for r in unverified_records if r.created_at == latest_timestamp]
 
-#             if not raw_sleep_records:
-#                 return {"message": "No sleep data found", "sleep_sessions": []}
+#             all_records_to_insert = []
 
-#             print(f"🛏️ Processing {len(raw_sleep_records)} raw sleep records for comprehensive analysis...")
-
-#             # --- LESS RESTRICTIVE FILTERING ---
-#             sleep_sessions = []
-#             for record in raw_sleep_records:
-#                 # Parse timezone info
-#                 metadata_str = record.metadata or '{}'
-#                 metadata = {}
-#                 try:
-#                     temp_data = json.loads(metadata_str)
-#                     while isinstance(temp_data, str):
-#                         temp_data = json.loads(temp_data)
-#                     metadata = temp_data
-#                 except (json.JSONDecodeError, TypeError):
-#                     metadata = {}
-
-#                 user_timezone_str = metadata.get('HKTimeZone', 'UTC')
-#                 try:
-#                     user_tz = ZoneInfo(user_timezone_str)
-#                 except ZoneInfoNotFoundError:
-#                     user_tz = ZoneInfo('UTC')
-
-#                 start_local = record.start_date.replace(tzinfo=timezone.utc).astimezone(user_tz)
-#                 end_local = record.end_date.replace(tzinfo=timezone.utc).astimezone(user_tz)
-#                 duration_hours = (end_local - start_local).total_seconds() / 3600
-
-#                 # --- MORE INCLUSIVE FILTERING ---
-#                 # Only skip very short sessions (< 5 minutes) - these are likely just movements
-#                 if duration_hours < 0.08:  # Less than 5 minutes
-#                     continue
+#             for record in records_to_process:
+#                 data_type = record.data_type
+#                 health_data_list = json.loads(record.data)
                 
-#                 # Don't filter by exact times - include everything that could be sleep
-#                 # Only exclude if duration is unreasonable (> 16 hours)
-#                 if duration_hours > 16:
-#                     continue
+#                 print(f"✅ Processing approval for {data_type} with {len(health_data_list)} records.")
 
-#                 sleep_sessions.append({
-#                     'start': start_local,
-#                     'end': end_local,
-#                     'duration': duration_hours,
-#                     'start_time': start_local.strftime('%H:%M'),
-#                     'end_time': end_local.strftime('%H:%M'),
-#                     'date': start_local.strftime('%Y-%m-%d'),
-#                     'end_date': end_local.strftime('%Y-%m-%d'),
-#                     'formatted_duration': f"{int(duration_hours)}h {int((duration_hours % 1) * 60)}m",
-#                     'value': record.value
-#                 })
+#                 # --- SPECIALIZED HANDLING FOR STEPCOUNT ---
+#                 if data_type == 'StepCount':
+#                     for entry in health_data_list:
+#                         entry_date_str = entry['date'].split('T')[0]
+#                         entry_date = datetime.fromisoformat(entry_date_str)
+#                         start_of_day_utc = datetime(entry_date.year, entry_date.month, entry_date.day, tzinfo=timezone.utc)
+#                         end_of_day_utc = start_of_day_utc + timedelta(days=1, seconds=-1)
 
-#             print(f"📊 Found {len(sleep_sessions)} total sleep sessions (inclusive filtering)")
+#                         record_to_insert = {
+#                             'user_id': user_id, 'data_type': 'StepCount', 'data_subtype': 'daily_summary',
+#                             'value': entry['value'], 'value_string': None, 'unit': 'count',
+#                             'start_date': start_of_day_utc, 'end_date': end_of_day_utc,
+#                             'source_name': entry.get('source', 'Multiple'), 'source_bundle_id': None, 
+#                             'device_name': None, 'device_manufacturer': None,
+#                             'sample_id': f"daily_summary_{user_id}_{entry_date_str}",
+#                             'entry_type': 'summary', 'category_type': None, 'workout_activity_type': None,
+#                             'total_energy_burned': None, 'total_distance': None,
+#                             'average_quantity': None, 'minimum_quantity': None, 'maximum_quantity': None,
+#                             'metadata': json.dumps({'original_source': entry.get('source', 'Multiple')})
+#                         }
+#                         all_records_to_insert.append(record_to_insert)
 
-#             # --- GROUP BY NIGHT FOR DAILY SUMMARIES ---
-#             daily_summaries = {}
-#             for session in sleep_sessions:
-#                 # Determine which night/day this belongs to
-#                 # If sleep ends before 2 PM, it belongs to that end date
-#                 # If sleep ends after 2 PM, it belongs to the next day
-#                 if session['end'].hour < 14:  # Before 2 PM
-#                     night_date = session['end_date']
+#                 # --- GENERIC HANDLING FOR OTHER HEALTH DATA (Sleep, etc.) ---
 #                 else:
-#                     next_day = session['end'] + timedelta(days=1)
-#                     night_date = next_day.strftime('%Y-%m-%d')
+#                     for entry in health_data_list:
+#                         # Initialize a full dictionary for the table schema
+#                         record_to_insert = {
+#                             'user_id': user_id, 'data_type': data_type,
+#                             'data_subtype': None, 'value': None, 'value_string': None, 'unit': None,
+#                             'start_date': parse_iso_datetime(entry.get('startDate')),
+#                             'end_date': parse_iso_datetime(entry.get('endDate')),
+#                             'source_name': None, 'source_bundle_id': None, 'device_name': None, 'device_manufacturer': None,
+#                             'sample_id': entry.get('sampleId') or entry.get('uuid') or str(uuid.uuid4()),
+#                             'entry_type': 'sample', 'category_type': None, 'workout_activity_type': None,
+#                             'total_energy_burned': None, 'total_distance': None,
+#                             'average_quantity': None, 'minimum_quantity': None, 'maximum_quantity': None,
+#                             'metadata': None
+#                         }
+                        
+#                         metadata = entry.get('metadata', {}) or {}
+#                         if isinstance(metadata, str):
+#                             try:
+#                                 metadata = json.loads(metadata)
+#                             except json.JSONDecodeError:
+#                                 metadata = {}
+                        
+#                         # Populate fields from entry
+#                         record_to_insert.update({
+#                             'data_subtype': entry.get('dataSubtype') or entry.get('value'),
+#                             'value': entry.get('quantity') or entry.get('value'),
+#                             'unit': entry.get('unit'),
+#                             'source_name': entry.get('sourceName') or (entry.get('source', {}) or {}).get('name') or (entry.get('device', {}) or {}).get('name'),
+#                             'source_bundle_id': (entry.get('source', {}) or {}).get('bundleIdentifier'),
+#                             'device_name': (entry.get('device', {}) or {}).get('name'),
+#                             'device_manufacturer': (entry.get('device', {}) or {}).get('manufacturer'),
+#                             'entry_type': 'sample' if 'quantity' in entry else 'category',
+#                             'metadata': json.dumps(metadata) # Store metadata with timezone
+#                         })
+#                         all_records_to_insert.append(record_to_insert)
 
-#                 if night_date not in daily_summaries:
-#                     daily_summaries[night_date] = []
-#                 daily_summaries[night_date].append(session)
+#             # 3. BULK INSERT ALL PROCESSED RECORDS
+#             if all_records_to_insert:
+#                 sample_ids_to_delete = [r['sample_id'] for r in all_records_to_insert if r['sample_id']]
+#                 if sample_ids_to_delete:
+#                     delete_query = text("""
+#                         DELETE FROM health_data_archive
+#                         WHERE user_id = :user_id AND sample_id IN :sample_ids
+#                     """)
+#                     conn.execute(delete_query, {'user_id': user_id, 'sample_ids': tuple(sample_ids_to_delete)})
+#                     print(f"✅ Cleared {len(sample_ids_to_delete)} existing records for fresh insertion.")
 
-#             # --- CREATE COMPREHENSIVE DAILY SUMMARIES ---
-#             comprehensive_summaries = []
-#             for date_key, sessions in daily_summaries.items():
-#                 if not sessions:
-#                     continue
+#                 print(f"✅ Inserting {len(all_records_to_insert)} total records into the health_data_archive table.")
+#                 health_data_table = Table('health_data_archive', MetaData(), autoload_with=engine)
+#                 conn.execute(health_data_table.insert(), all_records_to_insert)
+#             else:
+#                 print("ℹ️ No new records to insert.")
 
-#                 # Sort sessions by duration to find main sleep period
-#                 sessions.sort(key=lambda x: x['duration'], reverse=True)
-                
-#                 # Take the longest session as primary sleep, but include others if significant
-#                 main_session = sessions[0]
-#                 total_sleep_hours = main_session['duration']
-#                 earliest_start = main_session['start']
-#                 latest_end = main_session['end']
-                
-#                 # Include other sessions if they're substantial (> 30 minutes)
-#                 for session in sessions[1:]:
-#                     if session['duration'] > 0.5:  # More than 30 minutes
-#                         total_sleep_hours += session['duration'] * 0.6  # Weight secondary sessions less
-#                         earliest_start = min(earliest_start, session['start'])
-#                         latest_end = max(latest_end, session['end'])
+#             # 4. MARK THE BATCH AS VERIFIED
+#             update_query = text("""
+#                 UPDATE verification_health_data
+#                 SET verified = TRUE
+#                 WHERE user_id = :user_id AND created_at = :timestamp
+#             """)
+#             conn.execute(update_query, {'user_id': user_id, 'timestamp': latest_timestamp})
 
-#                 # Apply moderate sleep efficiency
-#                 efficient_sleep_hours = total_sleep_hours * 0.85
-
-#                 # Only include reasonable sleep durations
-#                 if 0.5 <= efficient_sleep_hours <= 15:
-#                     comprehensive_summaries.append({
-#                         "sleep_date": date_key,
-#                         "sleep_start": earliest_start.strftime('%H:%M'),
-#                         "sleep_end": latest_end.strftime('%H:%M'),
-#                         "sleep_hours": round(efficient_sleep_hours, 2),
-#                         "formatted_sleep": f"{int(efficient_sleep_hours)}h {int((efficient_sleep_hours % 1) * 60)}m",
-#                         "raw_sessions": len([s for s in sessions if s['duration'] > 0.08]),
-#                         "main_duration": round(main_session['duration'], 2),
-#                         "bedtime": earliest_start.strftime('%Y-%m-%d %H:%M'),
-#                         "wake_time": latest_end.strftime('%Y-%m-%d %H:%M')
-#                     })
-
-#             # Sort by date
-#             comprehensive_summaries.sort(key=lambda x: x['sleep_date'], reverse=True)
-            
-#             print(f"✅ Generated {len(comprehensive_summaries)} comprehensive daily sleep summaries")
-            
-#             return {
+#             transaction.commit()
+#             return jsonify({
 #                 "success": True,
-#                 "total_raw_sessions": len(sleep_sessions),
-#                 "daily_summaries": comprehensive_summaries,
-#                 "raw_sessions": sleep_sessions[:50],  # Limit to first 50 for response size
-#                 "days_analyzed": days_back
-#             }
+#                 "message": f"Successfully approved and integrated {len(all_records_to_insert)} Apple Health records into dashboard",
+#                 "approved_records": len(all_records_to_insert)
+#             })
 
-#     except Exception as e:
-#         print(f"❌ Error getting comprehensive sleep data: {e}")
-#         return {"error": str(e), "success": False}
+#         except Exception as e:
+#             if 'transaction' in locals() and transaction.is_active:
+#                 transaction.rollback()
+#             print(f"❌ Error during data approval: {e}")
+#             return jsonify({"success": False, "message": f"An error occurred: {e}"}), 500
 
-# Add endpoint for comprehensive sleep analysis
-# @app.route('/api/comprehensive-sleep-analysis', methods=['GET'])
-# def comprehensive_sleep_analysis():
-#     try:
-#         user_id = request.args.get('user_id', 1, type=int)
-#         days_back = request.args.get('days', 25, type=int)
+import threading
+import time
+
+# --- CGM Connection Endpoints (Dexcom) ---
+
+@app.route('/api/connect-dexcom', methods=['POST'])
+def connect_dexcom():
+    """
+    Establish a Dexcom CGM connection for the user.
+    Validates credentials, encrypts password, stores connection, fetches initial readings.
+    """
+    data = request.get_json()
+    required_fields = ['clerk_user_id', 'username', 'password']
+    for field in required_fields:
+        if field not in data:
+            return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
+    
+    clerk_user_id = data['clerk_user_id']
+    username = data['username']
+    password = data['password']
+    region = data.get('region')  # Do not default to 'us' here
+    cgm_type = data.get('cgm_type', 'dexcom-g6-g5-one-plus')
+
+    # Resolve user_id
+    user_id = get_user_id_from_clerk(clerk_user_id)
+    if not user_id:
+        return jsonify({'success': False, 'error': 'User not found'}), 404
+
+    # Try all regions if region is not provided
+    regions_to_try = [region] if region else list(DexcomConfig.REGIONS.keys())
+    last_error = None
+    for reg in regions_to_try:
+        try:
+            from pydexcom import Region
+            region_enum = Region.US if reg == 'us' else (Region.OUS if reg == 'ous' else Region.JP)
+            dexcom = Dexcom(username=username, password=password, region=region_enum)
+            glucose = dexcom.get_current_glucose_reading()
+            # If successful, break and use this region
+            region = reg
+            break
+        except Exception as e:
+            last_error = str(e)
+            continue
+    else:
+        # If all regions failed
+        error_msg = last_error or 'Unknown error connecting to Dexcom.'
+        if 'invalid password' in error_msg.lower():
+            return jsonify({'success': False, 'error': 'Invalid Dexcom credentials'}), 401
+        elif 'region' in error_msg.lower():
+            return jsonify({'success': False, 'error': 'Region mismatch. Please check your Dexcom region.'}), 400
+        elif 'network' in error_msg.lower():
+            return jsonify({'success': False, 'error': 'Network error. Please try again later.'}), 503
+        else:
+            return jsonify({'success': False, 'error': 'Dexcom connection failed: ' + error_msg}), 500
+
+    # Encrypt password
+    encrypted_password = CGMSecurity.encrypt_password(password)
+
+    # Store connection in DB
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO cgm_connections (user_id, cgm_type, username, password_encrypted, region, active)
+                VALUES (:user_id, :cgm_type, :username, :encrypted_password, :region, 1)
+                ON DUPLICATE KEY UPDATE 
+                    username = VALUES(username),
+                    password_encrypted = VALUES(password_encrypted),
+                    region = VALUES(region),
+                    active = 1,
+                    updated_at = CURRENT_TIMESTAMP
+            """), {
+                'user_id': user_id,
+                'cgm_type': cgm_type,
+                'username': username,
+                'encrypted_password': encrypted_password,
+                'region': region
+            })
+            conn.commit()
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Database error: ' + str(e)}), 500
+
+    # Fetch initial readings
+    try:
+        readings = []
+        for r in dexcom.get_glucose_readings(max_count=12):
+            readings.append({
+                'value': r.value,
+                'datetime': r.datetime.isoformat(),
+                'trend': r.trend_direction
+            })
+    except Exception as e:
+        readings = []
+
+    return jsonify({'success': True, 'message': f'Dexcom connected successfully (region: {region})', 'region': region, 'initial_readings': readings})
+
+@app.route('/api/connect-cgm-mobile', methods=['POST'])
+def connect_cgm_mobile():
+    """
+    Mobile-optimized CGM connection endpoint with better timeout handling and error messages.
+    Specifically designed for mobile apps that may have network restrictions.
+    """
+    import signal
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    
+    data = request.get_json()
+    required_fields = ['clerk_user_id', 'username', 'password', 'cgm_type']
+    for field in required_fields:
+        if field not in data:
+            return jsonify({
+                'success': False, 
+                'error': f'Missing required field: {field}',
+                'cgmType': data.get('cgm_type', 'unknown'),
+                'timestamp': datetime.now().isoformat()
+            }), 400
+    
+    clerk_user_id = data['clerk_user_id']
+    username = data['username']
+    password = data['password']
+    cgm_type = data['cgm_type']
+    region = data.get('region', 'us')
+    
+    print(f"🔗 Mobile CGM connection attempt: {username[:3]}*** ({cgm_type}) region: {region}")
+    
+    # Resolve user_id
+    try:
+        user_id = get_user_id_from_clerk(clerk_user_id)
+        if not user_id:
+            return jsonify({
+                'success': False, 
+                'error': 'User not found',
+                'cgmType': cgm_type,
+                'timestamp': datetime.now().isoformat()
+            }), 404
+    except Exception as e:
+        return jsonify({
+            'success': False, 
+            'error': f'User lookup failed: {str(e)}',
+            'cgmType': cgm_type,
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+    def test_cgm_connection_with_timeout():
+        """Test CGM connection with specific timeout handling"""
+        try:
+            if cgm_type == 'freestyle-libre-2':
+                # LibreLinkUp connection
+                result = test_librelink_connection(username, password)
+            elif cgm_type.startswith('dexcom'):
+                # Dexcom connection with timeout
+                result = test_dexcom_connection(username, password, region)
+            else:
+                return {
+                    'success': False,
+                    'error': f'Unsupported CGM type: {cgm_type}',
+                    'cgmType': cgm_type,
+                    'timestamp': datetime.now().isoformat()
+                }
+            
+            return result
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            # Specific mobile network error handling
+            if 'timeout' in error_msg or 'timed out' in error_msg:
+                return {
+                    'success': False,
+                    'error': 'Network request timed out',
+                    'message': 'Mobile connection timeout. Try connecting to WiFi or check cellular signal.',
+                    'cgmType': cgm_type,
+                    'timestamp': datetime.now().isoformat()
+                }
+            elif 'connection' in error_msg or 'network' in error_msg:
+                return {
+                    'success': False,
+                    'error': 'Network connection failed',
+                    'message': 'Unable to reach CGM servers. Check your internet connection.',
+                    'cgmType': cgm_type,
+                    'timestamp': datetime.now().isoformat()
+                }
+            elif 'invalid' in error_msg or 'unauthorized' in error_msg:
+                return {
+                    'success': False,
+                    'error': 'Invalid credentials',
+                    'message': 'Please check your username and password.',
+                    'cgmType': cgm_type,
+                    'timestamp': datetime.now().isoformat()
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f'Connection failed: {str(e)}',
+                    'message': 'CGM connection failed. Please try again.',
+                    'cgmType': cgm_type,
+                    'timestamp': datetime.now().isoformat()
+                }
+
+    # Execute connection test with timeout (mobile-friendly: 45 seconds)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(test_cgm_connection_with_timeout)
+            try:
+                # 45-second timeout for mobile connections
+                connection_result = future.result(timeout=45)
+            except TimeoutError:
+                return jsonify({
+                    'success': False,
+                    'error': 'Network request timed out',
+                    'message': 'Connection timeout after 45 seconds. Try connecting to WiFi for better connectivity.',
+                    'cgmType': cgm_type,
+                    'timestamp': datetime.now().isoformat()
+                }), 408
+                
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'Connection test failed: {str(e)}',
+            'message': 'Unable to test CGM connection.',
+            'cgmType': cgm_type,
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+    # Handle connection test result
+    if not connection_result.get('success'):
+        print(f"❌ Mobile CGM connection failed: {connection_result}")
+        return jsonify(connection_result), 400
+
+    print(f"✅ Mobile CGM connection successful: {connection_result.get('message', 'Connected')}")
+
+    # Store connection in database if successful
+    try:
+        encrypted_password = CGMSecurity.encrypt_password(password)
         
-#         result = get_comprehensive_sleep_data(user_id, days_back)
-#         return jsonify(result)
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO cgm_connections (user_id, cgm_type, username, password_encrypted, region, active)
+                VALUES (:user_id, :cgm_type, :username, :encrypted_password, :region, 1)
+                ON DUPLICATE KEY UPDATE 
+                    username = VALUES(username),
+                    password_encrypted = VALUES(password_encrypted),
+                    region = VALUES(region),
+                    active = 1,
+                    updated_at = CURRENT_TIMESTAMP,
+                    connection_status = 'connected',
+                    last_error_message = NULL
+            """), {
+                'user_id': user_id,
+                'cgm_type': cgm_type,
+                'username': username,
+                'encrypted_password': encrypted_password,
+                'region': region
+            })
+            conn.commit()
+            
+        print(f"✅ Stored CGM connection for user {user_id}")
         
-#     except Exception as e:
+    except Exception as e:
+        print(f"❌ Database error storing CGM connection: {e}")
+        return jsonify({
+            'success': False,
+            'error': 'Database error while saving connection',
+            'message': 'Connection tested successfully but failed to save. Please try again.',
+            'cgmType': cgm_type,
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+    # Return success with current glucose data
+    current_glucose = connection_result.get('current_glucose')
+    response_data = {
+        'success': True,
+        'message': f'CGM connected successfully',
+        'cgmType': cgm_type,
+        'region': region,
+        'timestamp': datetime.now().isoformat()
+    }
+    
+    if current_glucose:
+        response_data['currentGlucose'] = {
+            'value': current_glucose['value'],
+            'trend': current_glucose.get('trend', 'unknown'),
+            'trendArrow': current_glucose.get('trend_arrow', '?'),
+            'timestamp': current_glucose.get('timestamp')
+        }
+    
+    return jsonify(response_data), 200
+
+
+@app.route('/api/connect-librelink', methods=['POST'])
+def connect_librelink():
+    """
+    Establish a LibreLinkUp CGM connection for the user.
+    Validates credentials, encrypts password, stores connection, fetches initial readings.
+    """
+    data = request.get_json()
+    required_fields = ['clerk_user_id', 'username', 'password']
+    for field in required_fields:
+        if field not in data:
+            return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
+    
+    clerk_user_id = data['clerk_user_id']
+    username = data['username']
+    password = data['password']
+    cgm_type = 'freestyle-libre-2'
+
+    # Resolve user_id
+    user_id = get_user_id_from_clerk(clerk_user_id)
+    if not user_id:
+        return jsonify({'success': False, 'error': 'User not found'}), 404
+
+    # Test LibreLinkUp credentials
+    try:
+        client = PyLibreLinkUp(email=username, password=password)
+        client.authenticate()
+        
+        # Get patients and latest reading
+        patients = client.get_patients()
+        if not patients:
+            return jsonify({'success': False, 'error': 'No patients found in LibreLinkUp account'}), 400
+            
+        current_glucose = client.latest(patient_identifier=patients[0])
+    except Exception as e:
+        error_msg = str(e)
+        if 'invalid' in error_msg.lower() or 'unauthorized' in error_msg.lower() or 'authentication' in error_msg.lower():
+            return jsonify({'success': False, 'error': 'Invalid LibreLinkUp credentials'}), 401
+        elif 'network' in error_msg.lower():
+            return jsonify({'success': False, 'error': 'Network error. Please try again later.'}), 503
+        else:
+            return jsonify({'success': False, 'error': 'LibreLinkUp connection failed: ' + error_msg}), 500
+
+    # Encrypt password
+    encrypted_password = CGMSecurity.encrypt_password(password)
+
+    # Store connection in DB
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO cgm_connections (user_id, cgm_type, username, password_encrypted, region, active)
+                VALUES (:user_id, :cgm_type, :username, :encrypted_password, :region, 1)
+                ON DUPLICATE KEY UPDATE 
+                    username = VALUES(username),
+                    password_encrypted = VALUES(password_encrypted),
+                    region = VALUES(region),
+                    active = 1,
+                    updated_at = CURRENT_TIMESTAMP
+            """), {
+                'user_id': user_id,
+                'cgm_type': cgm_type,
+                'username': username,
+                'encrypted_password': encrypted_password,
+                'region': 'global'  # LibreLinkUp doesn't use regions like Dexcom
+            })
+            conn.commit()
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Database error: ' + str(e)}), 500
+
+    # Fetch initial readings from LibreLinkUp
+    try:
+        readings = []
+        # Get graph data (last 12 hours)
+        graph_data = client.graph(patient_identifier=patients[0])
+        
+        for reading in graph_data[-12:]:  # Get last 12 readings
+            readings.append({
+                'value': reading.value,
+                'datetime': reading.timestamp.isoformat() if reading.timestamp else None,
+                'trend': getattr(reading, 'trend', None)
+            })
+    except Exception as e:
+        readings = []
+
+    return jsonify({'success': True, 'message': 'LibreLinkUp connected successfully', 'initial_readings': readings})
+
+@app.route('/api/cgm-status', methods=['GET'])
+def cgm_status():
+    """
+    Check user's CGM connection status.
+    """
+    clerk_user_id = request.args.get('clerk_user_id')
+    if not clerk_user_id:
+        return jsonify({'success': False, 'error': 'Missing clerk_user_id'}), 400
+    
+    user_id = get_user_id_from_clerk(clerk_user_id)
+    if not user_id:
+        return jsonify({'success': False, 'error': 'User not found'}), 404
+    
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT * FROM cgm_connections WHERE user_id = :user_id AND active = 1"), {'user_id': user_id})
+            row = result.fetchone()
+            if row:
+                return jsonify({'success': True, 'connected': True, 'cgm_type': row.cgm_type, 'region': row.region, 'username': row.username})
+            else:
+                return jsonify({'success': True, 'connected': False})
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Database error: ' + str(e)}), 500
+
+@app.route('/api/disconnect-cgm', methods=['DELETE'])
+def disconnect_cgm():
+    """
+    Remove CGM connection and stop syncing.
+    """
+    data = request.get_json()
+    clerk_user_id = data.get('clerk_user_id')
+    if not clerk_user_id:
+        return jsonify({'success': False, 'error': 'Missing clerk_user_id'}), 400
+    
+    user_id = get_user_id_from_clerk(clerk_user_id)
+    if not user_id:
+        return jsonify({'success': False, 'error': 'User not found'}), 404
+    
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("UPDATE cgm_connections SET active = 0 WHERE user_id = :user_id"), {'user_id': user_id})
+            conn.commit()
+        return jsonify({'success': True, 'message': 'CGM disconnected'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Database error: ' + str(e)}), 500
+
+@app.route('/api/test-cgm-connection', methods=['POST'])
+def test_cgm_connection():
+    """
+    Test existing CGM connection without re-entering credentials.
+    """
+    data = request.get_json()
+    clerk_user_id = data.get('clerk_user_id')
+    if not clerk_user_id:
+        return jsonify({'success': False, 'error': 'Missing clerk_user_id'}), 400
+    
+    user_id = get_user_id_from_clerk(clerk_user_id)
+    if not user_id:
+        return jsonify({'success': False, 'error': 'User not found'}), 404
+    
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT * FROM cgm_connections WHERE user_id = :user_id AND active = 1"), {'user_id': user_id})
+            row = result.fetchone()
+            if not row:
+                return jsonify({'success': False, 'error': 'No active CGM connection found'}), 404
+            
+            try:
+                password = CGMSecurity.decrypt_password(row.password_encrypted)
+                from pydexcom import Region
+                region_enum = Region.US if row.region == 'us' else (Region.OUS if row.region == 'ous' else Region.JP)
+                dexcom = Dexcom(username=row.username, password=password, region=region_enum)
+                glucose = dexcom.get_current_glucose_reading()
+                return jsonify({'success': True, 'glucose': glucose.value, 'trend': glucose.trend_direction, 'datetime': glucose.datetime.isoformat()})
+            except Exception as e:
+                return jsonify({'success': False, 'error': 'Dexcom connection failed: ' + str(e)}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': 'Database error: ' + str(e)}), 500
+
+# --- Background CGM Sync Job ---
+
+def background_cgm_sync_job(interval_minutes=5):
+    """
+    Background job to periodically fetch ONLY the current glucose reading for all active CGM connections.
+    Fixed to prevent duplicate readings by fetching only current/latest reading every 5 minutes.
+    """
+    while True:
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(text("SELECT * FROM cgm_connections WHERE active = 1"))
+                connections = result.fetchall()
+                for row in connections:
+                    try:
+                        user_id = row.user_id
+                        cgm_type = row.cgm_type
+                        username = row.username
+                        password = CGMSecurity.decrypt_password(row.password_encrypted)
+                        
+                        current_reading = None
+                        
+                        if cgm_type == 'freestyle-libre-2':
+                            # Handle LibreLinkUp connection - get ONLY current reading
+                            client = PyLibreLinkUp(email=username, password=password)
+                            client.authenticate()
+                            patients = client.get_patients()
+                            
+                            if patients:
+                                # Get only the current/latest reading
+                                latest_reading = client.latest(patient_identifier=patients[0])
+                                if latest_reading:
+                                    current_reading = {
+                                        'value': latest_reading.value,
+                                        'datetime': latest_reading.timestamp,
+                                        'trend': getattr(latest_reading, 'trend', None)
+                                    }
+                        
+                        elif cgm_type.startswith('dexcom'):
+                            # Handle Dexcom connection - get ONLY current reading
+                            from pydexcom import Region
+                            region = row.region if row.region != 'global' else 'us'
+                            region_enum = Region.US if region == 'us' else (Region.OUS if region == 'ous' else Region.JP)
+                            dexcom = Dexcom(username=username, password=password, region=region_enum)
+                            current_glucose = dexcom.get_current_glucose_reading()
+                            
+                            if current_glucose:
+                                current_reading = {
+                                    'value': current_glucose.value,
+                                    'datetime': current_glucose.datetime,
+                                    'trend': current_glucose.trend_direction
+                                }
+                        
+                        # Insert ONLY the current reading if we got one
+                        if current_reading:
+                            # Enhanced duplicate prevention with proper unique constraint check
+                            conn.execute(text("""
+                                INSERT INTO glucose_log (user_id, glucose_level, timestamp)
+                                VALUES (:user_id, :value, :reading_time)
+                                ON DUPLICATE KEY UPDATE 
+                                    glucose_level = VALUES(glucose_level),
+                                    created_at = created_at  -- Keep original created_at
+                            """), {
+                                'user_id': user_id,
+                                'value': current_reading['value'],
+                                'reading_time': current_reading['datetime']
+                            })
+                            
+                            conn.commit()
+                            print(f"✅ {cgm_type} sync successful for user {user_id}: Current glucose {current_reading['value']} mg/dL at {current_reading['datetime']}")
+                        else:
+                            print(f"⚠️  {cgm_type} sync for user {user_id}: No current reading available")
+                        
+                    except Exception as e:
+                        print(f"❌ {row.cgm_type} sync failed for user {row.user_id}: {e}")
+                        
+        except Exception as e:
+            print(f"❌ CGM background sync job error: {e}")
+            
+        time.sleep(interval_minutes * 60)
+
+def cleanup_duplicate_glucose_readings(user_id: int = None):
+    """
+    Clean up duplicate glucose readings by keeping only the earliest created_at for each user_id + timestamp combo.
+    This fixes the issue where background sync was creating too many duplicate readings.
+    """
+    try:
+        with engine.connect() as conn:
+            if user_id:
+                # Clean up for specific user
+                cleanup_query = text("""
+                    DELETE gl1 FROM glucose_log gl1
+                    INNER JOIN glucose_log gl2 
+                    WHERE gl1.user_id = gl2.user_id 
+                      AND gl1.timestamp = gl2.timestamp
+                      AND gl1.id > gl2.id
+                      AND gl1.user_id = :user_id
+                """)
+                result = conn.execute(cleanup_query, {'user_id': user_id})
+            else:
+                # Clean up for all users
+                cleanup_query = text("""
+                    DELETE gl1 FROM glucose_log gl1
+                    INNER JOIN glucose_log gl2 
+                    WHERE gl1.user_id = gl2.user_id 
+                      AND gl1.timestamp = gl2.timestamp
+                      AND gl1.id > gl2.id
+                """)
+                result = conn.execute(cleanup_query)
+            
+            deleted_count = result.rowcount
+            conn.commit()
+            
+            if deleted_count > 0:
+                print(f"✅ Cleaned up {deleted_count} duplicate glucose readings" + (f" for user {user_id}" if user_id else ""))
+            else:
+                print(f"ℹ️ No duplicate glucose readings found" + (f" for user {user_id}" if user_id else ""))
+                
+            return deleted_count
+            
+    except Exception as e:
+        print(f"❌ Error cleaning up duplicate glucose readings: {e}")
+        return 0
+
+def backfill_cgm_historical_data(user_id: int, days: int = 7):
+    """
+    Backfill historical glucose data for the specified number of days.
+    Fetches historical readings from CGM APIs and populates the glucose_log table.
+    """
+    try:
+        with engine.connect() as conn:
+            # Get user's CGM connection details
+            cgm_query = text("""
+                SELECT cgm_type, username, encrypted_password, region 
+                FROM cgm_connections 
+                WHERE user_id = :user_id AND is_active = TRUE
+            """)
+            cgm_result = conn.execute(cgm_query, {'user_id': user_id}).fetchone()
+            
+            if not cgm_result:
+                print(f"❌ No active CGM connection found for user {user_id}")
+                return 0
+            
+            cgm_type = cgm_result.cgm_type
+            username = cgm_result.username
+            encrypted_password = cgm_result.encrypted_password
+            region = cgm_result.region
+            
+            # Decrypt password
+            decrypted_password = cipher.decrypt(encrypted_password.encode()).decode()
+            
+            print(f"🔄 Starting {days}-day historical backfill for user {user_id} ({cgm_type})")
+            
+            total_readings = 0
+            
+            if cgm_type.lower() == 'dexcom':
+                from pydexcom import Dexcom
+                
+                dexcom = Dexcom(username, decrypted_password)
+                
+                # Get historical readings for the specified number of days
+                # Dexcom returns readings in 5-minute intervals, so ~288 per day
+                max_readings = days * 288 + 50  # Add buffer for overlap
+                
+                print(f"📊 Fetching up to {max_readings} historical readings from Dexcom...")
+                dexcom_readings = dexcom.get_glucose_readings(max_count=max_readings)
+                
+                if dexcom_readings:
+                    # Filter readings to only include the specified number of days
+                    from datetime import datetime, timedelta
+                    cutoff_time = datetime.now() - timedelta(days=days)
+                    
+                    filtered_readings = [
+                        reading for reading in dexcom_readings 
+                        if reading.datetime >= cutoff_time
+                    ]
+                    
+                    print(f"📈 Processing {len(filtered_readings)} filtered historical readings...")
+                    
+                    # Insert historical readings
+                    for reading in filtered_readings:
+                        try:
+                            conn.execute(text("""
+                                INSERT INTO glucose_log (user_id, glucose_level, timestamp)
+                                VALUES (:user_id, :value, :reading_time)
+                                ON DUPLICATE KEY UPDATE 
+                                    glucose_level = VALUES(glucose_level),
+                                    created_at = created_at
+                            """), {
+                                'user_id': user_id,
+                                'value': reading.value,
+                                'reading_time': reading.datetime
+                            })
+                            total_readings += 1
+                        except Exception as e:
+                            print(f"⚠️ Error inserting reading {reading.datetime}: {e}")
+                            continue
+                    
+                    conn.commit()
+                    print(f"✅ Dexcom historical backfill completed: {total_readings} readings inserted")
+                
+            elif cgm_type.lower() == 'libre':
+                from pylibrelinkup import PyLibreLinkUp
+                
+                libre = PyLibreLinkUp(
+                    email=username,
+                    password=decrypted_password,
+                    region=region or 'us'
+                )
+                
+                libre.login()
+                
+                # LibreLinkUp historical readings
+                print(f"📊 Fetching historical readings from LibreLinkUp...")
+                libre_data = libre.get_data()
+                
+                if libre_data and 'history' in libre_data:
+                    # Filter readings to only include the specified number of days
+                    from datetime import datetime, timedelta
+                    cutoff_time = datetime.now() - timedelta(days=days)
+                    
+                    filtered_readings = [
+                        reading for reading in libre_data['history']
+                        if datetime.fromisoformat(reading['datetime'].replace('Z', '+00:00')) >= cutoff_time
+                    ]
+                    
+                    print(f"📈 Processing {len(filtered_readings)} filtered historical readings...")
+                    
+                    # Insert historical readings
+                    for reading in filtered_readings:
+                        try:
+                            reading_time = datetime.fromisoformat(reading['datetime'].replace('Z', '+00:00'))
+                            conn.execute(text("""
+                                INSERT INTO glucose_log (user_id, glucose_level, timestamp)
+                                VALUES (:user_id, :value, :reading_time)
+                                ON DUPLICATE KEY UPDATE 
+                                    glucose_level = VALUES(glucose_level),
+                                    created_at = created_at
+                            """), {
+                                'user_id': user_id,
+                                'value': reading['value'],
+                                'reading_time': reading_time
+                            })
+                            total_readings += 1
+                        except Exception as e:
+                            print(f"⚠️ Error inserting reading {reading['datetime']}: {e}")
+                            continue
+                    
+                    conn.commit()
+                    print(f"✅ LibreLinkUp historical backfill completed: {total_readings} readings inserted")
+            
+            return total_readings
+            
+    except Exception as e:
+        print(f"❌ Error during historical backfill for user {user_id}: {e}")
+        return 0
+
+@app.route('/api/backfill-cgm-historical', methods=['POST'])
+def backfill_cgm_historical_endpoint():
+    """API endpoint to backfill historical CGM data"""
+    try:
+        data = request.get_json() or {}
+        clerk_user_id = data.get('clerk_user_id')
+        days = data.get('days', 7)  # Default to 7 days
+        
+        if not clerk_user_id:
+            return jsonify({
+                "success": False,
+                "error": "clerk_user_id is required"
+            }), 400
+        
+        try:
+            user_id = get_user_id_from_clerk(clerk_user_id)
+        except ValueError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e)
+            }), 404
+        
+        # Run the backfill
+        readings_added = backfill_cgm_historical_data(user_id, days)
+        
+        return jsonify({
+            "success": True,
+            "message": f"Historical backfill completed. Added {readings_added} readings for {days} days.",
+            "readings_added": readings_added,
+            "days_backfilled": days,
+            "user_id": user_id
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+@app.route('/api/cleanup-duplicate-glucose', methods=['POST'])
+def cleanup_duplicate_glucose_endpoint():
+    """API endpoint to manually trigger cleanup of duplicate glucose readings"""
+    try:
+        data = request.get_json() or {}
+        clerk_user_id = data.get('clerk_user_id')
+        
+        user_id = None
+        if clerk_user_id:
+            try:
+                user_id = get_user_id_from_clerk(clerk_user_id)
+            except ValueError as e:
+                return jsonify({
+                    "success": False,
+                    "error": str(e)
+                }), 404
+        
+        deleted_count = cleanup_duplicate_glucose_readings(user_id)
+        
+        return jsonify({
+            "success": True,
+            "message": f"Cleanup completed. Removed {deleted_count} duplicate readings.",
+            "duplicates_removed": deleted_count,
+            "user_id": user_id
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+
+# Start background sync job in a separate thread (after database initialization)
+def start_cgm_background_sync():
+    cgm_sync_thread = threading.Thread(target=background_cgm_sync_job, args=(5,), daemon=True)
+    cgm_sync_thread.start()
+    print("✅ CGM background sync job started")
+        
+#     except Exception as e:UPDATE users SET
 #         return jsonify({'error': str(e), 'success': False}), 500
 
 def get_improved_sleep_data(user_id: int = 1, days_back: int = 25):
@@ -4271,12 +6030,13 @@ def get_improved_sleep_data(user_id: int = 1, days_back: int = 25):
     """
     try:
         with engine.connect() as conn:
-            start_date_dt = datetime.now(timezone.utc) - timedelta(days=days_back)
+            # CRITICAL FIX: Use timezone-naive datetime for database comparison since DB stores naive datetimes
+            start_date_dt = datetime.now() - timedelta(days=days_back)
             
-            # Fetch all raw sleep analysis records from DISPLAY table
+            # Fetch all raw sleep analysis records from ARCHIVE table only
             raw_sleep_query = text("""
                 SELECT start_date, end_date, value, metadata
-                FROM health_data_display
+                FROM health_data_archive
                 WHERE data_type = 'SleepAnalysis' AND user_id = :uid
                   AND end_date >= :start_date
                 ORDER BY end_date
@@ -4343,7 +6103,8 @@ def get_improved_sleep_data(user_id: int = 1, days_back: int = 25):
             except ZoneInfoNotFoundError:
                 user_tz = ZoneInfo('UTC')
             
-            # Calculate the 7-day range based on user's timezone
+            # FIXED: Always use current date to generate 7-day range for consistent dashboard behavior
+            # This ensures the dashboard always shows today + 6 previous days, regardless of when the last sleep data was
             today_local = datetime.now(user_tz).date()
             seven_days_range = []
             
@@ -4351,7 +6112,7 @@ def get_improved_sleep_data(user_id: int = 1, days_back: int = 25):
                 target_date = today_local - timedelta(days=i)
                 seven_days_range.append(target_date.strftime('%Y-%m-%d'))
             
-            print(f"📅 Generating complete 7-day range: {seven_days_range}")
+            print(f"📅 Generating current 7-day range (today + 6 previous days): {seven_days_range}")
 
             # --- STEP 3: Process each day in the 7-day range ---
             daily_summaries = []
@@ -4364,6 +6125,8 @@ def get_improved_sleep_data(user_id: int = 1, days_back: int = 25):
                     # Find the longest sleep session (main sleep period)
                     main_session = max(sessions, key=lambda s: s['duration_hours'])
                     main_session_duration = main_session['duration_hours']
+                    
+
                     
                     if main_session_duration >= 0.5:  # At least 30 minutes of main sleep
                         try:
@@ -4390,8 +6153,19 @@ def get_improved_sleep_data(user_id: int = 1, days_back: int = 25):
                             display_hours += 1
                             display_minutes = 0
 
-                        # For prediction, round the original float hours to 2 decimal places
-                        prediction_sleep_hours = round(main_session_duration_hours, 2)
+                        # For prediction, convert to hours.minutes format (e.g., 7.56 for 7h 56m)
+                        # This is more accurate than decimal hours
+                        total_minutes = main_session_duration_hours * 60
+                        hours = int(total_minutes // 60)
+                        minutes = int(round(total_minutes % 60))
+                        
+                        # Handle edge case where rounding minutes results in 60
+                        if minutes == 60:
+                            hours += 1
+                            minutes = 0
+                        
+                        # Convert to hours.minutes format (e.g., 7.56 for 7h 56m)
+                        prediction_sleep_hours = round(hours + (minutes / 100), 2)
 
                         authentic_bedtime = main_start_local.strftime('%H:%M')
                         authentic_wake_time = main_end_local.strftime('%H:%M')
@@ -4449,328 +6223,17 @@ def get_improved_sleep_data(user_id: int = 1, days_back: int = 25):
         return {"error": str(e), "success": False}
 
 # Add endpoint for improved sleep analysis
-@app.route('/api/improved-sleep-analysis', methods=['GET'])
-def improved_sleep_analysis():
-    try:
-        user_id = request.args.get('user_id', 1, type=int)
-        days_back = request.args.get('days', 25, type=int)
-        
-        result = get_improved_sleep_data(user_id, days_back)
-        return jsonify(result)
-        
-    except Exception as e:
-        return jsonify({'error': str(e), 'success': False}), 500
-
-# @app.route('/api/debug-sleep-timezone', methods=['GET'])
-# def debug_sleep_timezone():
-#     """Debug endpoint to analyze sleep data timezone issues."""
+# @app.route('/api/improved-sleep-analysis', methods=['GET'])
+# def improved_sleep_analysis():
 #     try:
 #         user_id = request.args.get('user_id', 1, type=int)
-#         days_back = request.args.get('days', 7, type=int)
+#         days_back = request.args.get('days', 25, type=int)
         
-#         with engine.connect() as conn:
-#             # Get raw sleep data with all metadata
-#             raw_sleep_query = text("""
-#                 SELECT id, start_date, end_date, value, metadata, sample_id, source_name, created_at
-#                 FROM health_data_archive
-#                 WHERE data_type = 'SleepAnalysis' AND user_id = :uid
-#                 AND start_date >= NOW() - INTERVAL :days DAY
-#                 ORDER BY start_date DESC
-#             """)
-#             raw_sleep_results = conn.execute(raw_sleep_query, {"uid": user_id, "days": days_back}).fetchall()
-            
-#             # Count timezone metadata
-#             samples_with_timezone = 0
-#             samples_without_timezone = 0
-#             suspicious_patterns = []
-            
-#             raw_samples = []
-#             for row in raw_sleep_results:
-#                 # Parse metadata for timezone info
-#                 metadata_str = row.metadata or '{}'
-#                 metadata = {}
-#                 timezone_from_metadata = None
-                
-#                 try:
-#                     temp_data = json.loads(metadata_str)
-#                     while isinstance(temp_data, str):
-#                         temp_data = json.loads(temp_data)
-#                     metadata = temp_data
-#                     timezone_from_metadata = metadata.get('HKTimeZone', None)
-#                 except (json.JSONDecodeError, TypeError):
-#                     pass
-                
-#                 if timezone_from_metadata:
-#                     samples_with_timezone += 1
-#                 else:
-#                     samples_without_timezone += 1
-                
-#                 # Check for suspicious patterns (exact times)
-#                 end_time = row.end_date.strftime('%H:%M:%S')
-#                 if end_time.endswith(':30:00') or end_time.endswith(':30:01'):
-#                     suspicious_patterns.append({
-#                         'sample_id': row.sample_id,
-#                         'start_date': row.start_date.isoformat(),
-#                         'end_date': row.end_date.isoformat(),
-#                         'end_time': end_time,
-#                         'duration_hours': round((row.end_date - row.start_date).total_seconds() / 3600, 2)
-#                     })
-                
-#                 raw_samples.append({
-#                     'sample_id': row.sample_id,
-#                     'start_date': row.start_date.isoformat() if row.start_date else None,
-#                     'end_date': row.end_date.isoformat() if row.end_date else None,
-#                     'value': row.value,
-#                     'duration_hours': round((row.end_date - row.start_date).total_seconds() / 3600, 2) if row.start_date and row.end_date else 0,
-#                     'source_name': row.source_name,
-#                     'timezone_from_metadata': timezone_from_metadata or "None"
-#                 })
-        
-#         return jsonify({
-#             'success': True,
-#             'debug_info': {
-#                 'total_sleep_records': len(raw_sleep_results),
-#                 'server_timezone': str(datetime.now().astimezone().tzinfo),
-#                 'timezone_analysis': {
-#                     'samples_with_timezone': samples_with_timezone,
-#                     'samples_without_timezone': samples_without_timezone
-#                 },
-#                 'suspicious_patterns': suspicious_patterns,
-#                 'raw_samples': raw_samples[:20]  # Limit for response size
-#             }
-#         })
+#         result = get_improved_sleep_data(user_id, days_back)
+#         return jsonify(result)
         
 #     except Exception as e:
 #         return jsonify({'error': str(e), 'success': False}), 500
-
-# @app.route('/api/verify-real-wake-times', methods=['GET'])
-# def verify_real_wake_times():
-#     """NEW: Debug endpoint to verify that we're preserving exact Apple Health wake times."""
-#     try:
-#         user_id = request.args.get('user_id', 1, type=int)
-#         days_back = request.args.get('days', 7, type=int)
-        
-#         # Get improved sleep analysis
-#         sleep_analysis = get_improved_sleep_data(user_id, days_back)
-        
-#         if not sleep_analysis.get('success'):
-#             return jsonify({'error': 'Sleep analysis failed'}), 500
-        
-#         # Get raw data for comparison
-#         with engine.connect() as conn:
-#             raw_sleep_query = text("""
-#                 SELECT start_date, end_date, value, sample_id
-#                 FROM health_data_archive
-#                 WHERE data_type = 'SleepAnalysis' AND user_id = :uid
-#                 AND start_date >= NOW() - INTERVAL :days DAY
-#                 ORDER BY start_date DESC
-#             """)
-#             raw_results = conn.execute(raw_sleep_query, {"uid": user_id, "days": days_back}).fetchall()
-        
-#         # Create comparison
-#         verification_results = []
-#         for summary in sleep_analysis['daily_summaries']:
-#             # Find corresponding raw sessions for this date
-#             date_str = summary['date']
-#             raw_sessions_for_date = []
-            
-#             for row in raw_results:
-#                 # Check if this session belongs to this sleep date
-#                 session_date = row.end_date.strftime('%Y-%m-%d')
-#                 if session_date == date_str:
-#                     raw_sessions_for_date.append({
-#                         'start': row.start_date.strftime('%H:%M:%S'),
-#                         'end': row.end_date.strftime('%H:%M:%S'),
-#                         'duration_h': round((row.end_date - row.start_date).total_seconds() / 3600, 2),
-#                         'sample_id': row.sample_id
-#                     })
-            
-#             verification_results.append({
-#                 'sleep_date': date_str,
-#                 'processed_wake_time': summary.get('wake_time'),
-#                 'processed_sleep_end': summary.get('sleep_end'),
-#                 'raw_wake_time': summary.get('raw_wake_time'),
-#                 'raw_sessions_count': len(raw_sessions_for_date),
-#                 'raw_sessions': raw_sessions_for_date[:3],  # Show top 3
-#                 'timezone_preserved': 'timezone_info' in summary
-#             })
-        
-#         return jsonify({
-#             'success': True,
-#             'verification_results': verification_results,
-#             'summary': {
-#                 'total_sleep_days': len(verification_results),
-#                 'days_with_exact_times': len([r for r in verification_results if r.get('raw_wake_time')]),
-#                 'analysis_method': 'exact_healthkit_timestamps_preserved'
-#             }
-#         })
-        
-#     except Exception as e:
-#         return jsonify({'error': str(e), 'success': False}), 500
-
-# @app.route('/api/clean-duplicate-distance-data', methods=['POST'])
-# def clean_duplicate_distance_data():
-#     """Clean up duplicate distance data that's causing inflated walking/running distances."""
-#     try:
-#         user_id = request.json.get('user_id', 1)
-        
-#         with engine.connect() as conn:
-#             # Find duplicate distance entries (same value, same timestamp, different or missing sample_id)
-#             duplicate_query = text("""
-#                 SELECT start_date, end_date, value, unit, COUNT(*) as count
-#                 FROM health_data_archive 
-#                 WHERE user_id = :user_id 
-#                   AND data_type = 'DistanceWalkingRunning'
-#                 GROUP BY start_date, end_date, value, unit
-#                 HAVING COUNT(*) > 1
-#                 ORDER BY start_date DESC, count DESC
-#             """)
-            
-#             duplicates = conn.execute(duplicate_query, {"user_id": user_id}).fetchall()
-            
-#             if not duplicates:
-#                 return jsonify({
-#                     "success": True,
-#                     "message": "No duplicate distance data found",
-#                     "duplicates_removed": 0
-#                 })
-            
-#             total_removed = 0
-#             duplicate_analysis = []
-            
-#             for dup in duplicates:
-#                 # Get all entries for this duplicate group
-#                 group_query = text("""
-#                     SELECT id, sample_id, start_date, end_date, value, source_name
-#                     FROM health_data_archive 
-#                     WHERE user_id = :user_id 
-#                       AND data_type = 'DistanceWalkingRunning'
-#                       AND start_date = :start_date
-#                       AND end_date = :end_date  
-#                       AND value = :value
-#                       AND unit = :unit
-#                     ORDER BY id
-#                 """)
-                
-#                 group_entries = conn.execute(group_query, {
-#                     "user_id": user_id,
-#                     "start_date": dup.start_date,
-#                     "end_date": dup.end_date,
-#                     "value": dup.value,
-#                     "unit": dup.unit
-#                 }).fetchall()
-                
-#                 # Keep only ONE entry per group - prefer the one with a real sample_id
-#                 entries_to_keep = []
-#                 entries_to_remove = []
-                
-#                 for entry in group_entries:
-#                     if entry.sample_id and entry.sample_id != 'None' and len(entries_to_keep) == 0:
-#                         entries_to_keep.append(entry)
-#                     else:
-#                         entries_to_remove.append(entry)
-                
-#                 # If no entry has a real sample_id, keep the first one
-#                 if not entries_to_keep and group_entries:
-#                     entries_to_keep.append(group_entries[0])
-#                     entries_to_remove = group_entries[1:]
-                
-#                 # Remove the duplicate entries
-#                 for entry in entries_to_remove:
-#                     delete_query = text("DELETE FROM health_data_archive WHERE id = :id")
-#                     conn.execute(delete_query, {"id": entry.id})
-#                     total_removed += 1
-                
-#                 duplicate_analysis.append({
-#                     "timestamp": f"{dup.start_date} to {dup.end_date}",
-#                     "value": f"{dup.value} {dup.unit}",
-#                     "duplicates_found": dup.count,
-#                     "duplicates_removed": len(entries_to_remove),
-#                     "kept_entry": entries_to_keep[0].sample_id if entries_to_keep else None
-#                 })
-            
-#             conn.commit()
-            
-#             return jsonify({
-#                 "success": True,
-#                 "message": f"Successfully cleaned {total_removed} duplicate distance entries",
-#                 "total_duplicates_removed": total_removed,
-#                 "duplicate_groups_processed": len(duplicates),
-#                 "analysis": duplicate_analysis
-#             })
-            
-#     except Exception as e:
-#         print(f"❌ Error cleaning duplicate distance data: {e}")
-#         return jsonify({
-#             "success": False,
-#             "error": str(e),
-#             "message": "Failed to clean duplicate distance data"
-#         }), 500
-
-# @app.route('/api/clean-simulated-entries', methods=['POST'])
-# def clean_simulated_entries():
-#     """Remove entries with null sample_id and source_name, which are indicators of simulated/test data."""
-#     try:
-#         user_id = request.json.get('user_id', 1)
-        
-#         with engine.connect() as conn:
-#             # Find entries that look like simulated data
-#             simulated_query = text("""
-#                 SELECT id, data_type, start_date, end_date, value, unit, sample_id, source_name
-#                 FROM health_data_archive 
-#                 WHERE user_id = :user_id 
-#                   AND sample_id IS NULL 
-#                   AND source_name IS NULL
-#                 ORDER BY start_date DESC
-#             """)
-            
-#             simulated_entries = conn.execute(simulated_query, {"user_id": user_id}).fetchall()
-            
-#             if not simulated_entries:
-#                 return jsonify({
-#                     "success": True,
-#                     "message": "No simulated entries found",
-#                     "entries_removed": 0
-#                 })
-            
-#             # Remove the simulated entries
-#             delete_query = text("""
-#                 DELETE FROM health_data_archive 
-#                 WHERE user_id = :user_id 
-#                   AND sample_id IS NULL 
-#                   AND source_name IS NULL
-#             """)
-            
-#             result = conn.execute(delete_query, {"user_id": user_id})
-#             removed_count = result.rowcount
-#             conn.commit()
-            
-#             # Categorize what was removed
-#             removed_analysis = {}
-#             for entry in simulated_entries:
-#                 data_type = entry.data_type
-#                 if data_type not in removed_analysis:
-#                     removed_analysis[data_type] = []
-#                 removed_analysis[data_type].append({
-#                     "value": entry.value,
-#                     "unit": entry.unit,
-#                     "date": f"{entry.start_date} to {entry.end_date}"
-#                 })
-            
-#             return jsonify({
-#                 "success": True,
-#                 "message": f"Successfully removed {removed_count} simulated entries",
-#                 "entries_removed": removed_count,
-#                 "removed_by_type": removed_analysis
-#             })
-            
-#     except Exception as e:
-#         print(f"❌ Error cleaning simulated entries: {e}")
-#         return jsonify({
-#             "success": False,
-#             "error": str(e),
-#             "message": "Failed to clean simulated entries"
-#         }), 500
 
 def migrate_display_to_archive_for_user(user_id: int) -> int:
     """
@@ -4837,387 +6300,105 @@ def migrate_display_to_archive_for_user(user_id: int) -> int:
         print(f"❌ Error migrating data for user {user_id}: {e}")
         return 0
 
-def auto_clean_health_data_duplicates(user_id: int = 1) -> int:
-    """
-    Automatically clean duplicates for critical health data types that are prone to duplication.
-    This runs after each sync to maintain data integrity.
-    Returns the number of duplicate records removed.
-    """
-    try:
-        total_cleaned = 0
-        
-        with engine.connect() as conn:
-            # Critical data types that are prone to duplication during sync
-            critical_data_types = [
-                'DistanceWalkingRunning',
-                'ActiveEnergyBurned', 
-                'StepCount',
-                'HeartRate',
-                'BloodGlucose'
-            ]
-            
-            for data_type in critical_data_types:
-                # Find duplicate entries (same sample_id, same timestamp, same value)
-                duplicate_query = text("""
-                    SELECT sample_id, start_date, end_date, value, unit, COUNT(*) as count
-                    FROM health_data_archive 
-                    WHERE user_id = :user_id 
-                      AND data_type = :data_type
-                      AND sample_id IS NOT NULL
-                      AND sample_id != ''
-                    GROUP BY sample_id, start_date, end_date, value, unit
-                    HAVING COUNT(*) > 1
-                    ORDER BY start_date DESC
-                """)
-                
-                duplicates = conn.execute(duplicate_query, {
-                    "user_id": user_id,
-                    "data_type": data_type
-                }).fetchall()
-                
-                for dup in duplicates:
-                    # Get all entries for this duplicate group
-                    group_query = text("""
-                        SELECT id, sample_id, start_date, end_date, value, source_name
-                        FROM health_data_archive 
-                        WHERE user_id = :user_id 
-                          AND data_type = :data_type
-                          AND sample_id = :sample_id
-                          AND start_date = :start_date
-                          AND end_date = :end_date  
-                          AND value = :value
-                          AND unit = :unit
-                        ORDER BY id ASC
-                    """)
-                    
-                    group_entries = conn.execute(group_query, {
-                        "user_id": user_id,
-                        "data_type": data_type,
-                        "sample_id": dup.sample_id,
-                        "start_date": dup.start_date,
-                        "end_date": dup.end_date,
-                        "value": dup.value,
-                        "unit": dup.unit
-                    }).fetchall()
-                    
-                    # Keep only the FIRST entry (oldest ID), remove the rest
-                    if len(group_entries) > 1:
-                        entries_to_remove = group_entries[1:]  # Skip the first one
-                        
-                        for entry in entries_to_remove:
-                            delete_query = text("DELETE FROM health_data_archive WHERE id = :id")
-                            conn.execute(delete_query, {"id": entry.id})
-                            total_cleaned += 1
-                        
-                        print(f"🧹 {data_type}: Cleaned {len(entries_to_remove)} duplicates for sample {dup.sample_id}")
-            
-            # Also clean entries with null sample_id AND null source_name (definitely simulated)
-            simulated_cleanup_query = text("""
-                DELETE FROM health_data_archive 
-                WHERE user_id = :user_id 
-                  AND sample_id IS NULL 
-                  AND source_name IS NULL
-                  AND data_type IN ('DistanceWalkingRunning', 'ActiveEnergyBurned', 'StepCount')
-            """)
-            
-            result = conn.execute(simulated_cleanup_query, {"user_id": user_id})
-            simulated_cleaned = result.rowcount
-            total_cleaned += simulated_cleaned
-            
-            if simulated_cleaned > 0:
-                print(f"🧹 Removed {simulated_cleaned} simulated entries with null identifiers")
-            
-            conn.commit()
-            
-        return total_cleaned
-        
-    except Exception as e:
-        print(f"❌ Error in auto-clean duplicates: {e}")
-        return 0
-
-# NOTE: Manual sync endpoint removed 
-# The previous endpoint was generating simulated data with fake UUIDs instead of 
-# pulling real Apple Health data. Real HealthKit integration should be implemented instead.
-#
-# For missing sleep data, the proper solution is to:
-# 1. Implement real HealthKit integration on iOS
-# 2. Use proper Apple HealthKit APIs to pull authentic data
-# 3. Ensure data authenticity and user trust
-
-# ✅ NEW: Verification endpoint to compare raw HealthKit vs processed sleep data
-# @app.route('/api/verify-sleep-authenticity', methods=['GET'])
-# def verify_sleep_authenticity():
-#     """Compare raw HealthKit sleep data against processed dashboard data to verify authenticity"""
+# def auto_clean_health_data_duplicates(user_id: int = 1) -> int:
+#     """
+#     Automatically clean duplicates for critical health data types that are prone to duplication.
+#     This runs after each sync to maintain data integrity.
+#     Returns the number of duplicate records removed.
+#     """
 #     try:
-#         user_id = request.args.get('user_id', 1, type=int)
-#         days_back = request.args.get('days', 7, type=int)
+#         total_cleaned = 0
         
 #         with engine.connect() as conn:
-#             # Get raw HealthKit sleep data with timezone
-#             raw_sleep_query = text("""
-#                 SELECT start_date, end_date, metadata, value
-#                 FROM health_data_archive
-#                 WHERE data_type = 'SleepAnalysis' AND user_id = :uid
-#                 AND start_date >= NOW() - INTERVAL :days DAY
-#                 ORDER BY start_date DESC
-#             """)
-#             raw_sleep_results = conn.execute(raw_sleep_query, {"uid": user_id, "days": days_back}).fetchall()
+#             # Critical data types that are prone to duplication during sync
+#             critical_data_types = [
+#                 'DistanceWalkingRunning',
+#                 'ActiveEnergyBurned', 
+#                 'StepCount',
+#                 'HeartRate',
+#                 'BloodGlucose'
+#             ]
             
-#         # Get processed sleep data from our improved function
-#         improved_result = get_improved_sleep_data(user_id, days_back)
-        
-#         # Create comparison
-#         comparison_results = []
-        
-#         for summary in improved_result.get('daily_summaries', []):
-#             date_str = summary['date']
-            
-#             # Find corresponding raw data for this date
-#             raw_sessions_for_date = []
-#             for row in raw_sleep_results:
-#                 # Parse timezone from metadata
-#                 metadata_str = row.metadata or '{}'
-#                 try:
-#                     metadata = json.loads(metadata_str)
-#                     while isinstance(metadata, str):
-#                         metadata = json.loads(metadata)
-#                 except (json.JSONDecodeError, TypeError):
-#                     metadata = {}
+#             for data_type in critical_data_types:
+#                 # Find duplicate entries (same sample_id, same timestamp, same value)
+#                 duplicate_query = text("""
+#                     SELECT sample_id, start_date, end_date, value, unit, COUNT(*) as count
+#                     FROM health_data_archive 
+#                     WHERE user_id = :user_id 
+#                       AND data_type = :data_type
+#                       AND sample_id IS NOT NULL
+#                       AND sample_id != ''
+#                     GROUP BY sample_id, start_date, end_date, value, unit
+#                     HAVING COUNT(*) > 1
+#                     ORDER BY start_date DESC
+#                 """)
                 
-#                 user_timezone_str = metadata.get('HKTimeZone', 'UTC')
-#                 try:
-#                     user_tz = ZoneInfo(user_timezone_str)
-#                 except ZoneInfoNotFoundError:
-#                     user_tz = ZoneInfo('UTC')
+#                 duplicates = conn.execute(duplicate_query, {
+#                     "user_id": user_id,
+#                     "data_type": data_type
+#                 }).fetchall()
                 
-#                 # Convert to local time to check date
-#                 end_local = row.end_date.replace(tzinfo=timezone.utc).astimezone(user_tz)
-#                 if end_local.strftime('%Y-%m-%d') == date_str:
-#                     start_local = row.start_date.replace(tzinfo=timezone.utc).astimezone(user_tz)
-#                     duration_hours = (end_local - start_local).total_seconds() / 3600
+#                 for dup in duplicates:
+#                     # Get all entries for this duplicate group
+#                     group_query = text("""
+#                         SELECT id, sample_id, start_date, end_date, value, source_name
+#                         FROM health_data_archive 
+#                         WHERE user_id = :user_id 
+#                           AND data_type = :data_type
+#                           AND sample_id = :sample_id
+#                           AND start_date = :start_date
+#                           AND end_date = :end_date  
+#                           AND value = :value
+#                           AND unit = :unit
+#                         ORDER BY id ASC
+#                     """)
                     
-#                     raw_sessions_for_date.append({
-#                         'raw_start_utc': row.start_date.isoformat(),
-#                         'raw_end_utc': row.end_date.isoformat(),
-#                         'raw_start_local': start_local.strftime('%H:%M:%S'),
-#                         'raw_end_local': end_local.strftime('%H:%M:%S'),
-#                         'raw_duration_hours': round(duration_hours, 3),
-#                         'timezone': user_timezone_str
-#                     })
+#                     group_entries = conn.execute(group_query, {
+#                         "user_id": user_id,
+#                         "data_type": data_type,
+#                         "sample_id": dup.sample_id,
+#                         "start_date": dup.start_date,
+#                         "end_date": dup.end_date,
+#                         "value": dup.value,
+#                         "unit": dup.unit
+#                     }).fetchall()
+                    
+#                     # Keep only the FIRST entry (oldest ID), remove the rest
+#                     if len(group_entries) > 1:
+#                         entries_to_remove = group_entries[1:]  # Skip the first one
+                        
+#                         for entry in entries_to_remove:
+#                             delete_query = text("DELETE FROM health_data_archive WHERE id = :id")
+#                             conn.execute(delete_query, {"id": entry.id})
+#                             total_cleaned += 1
+                        
+#                         print(f"🧹 {data_type}: Cleaned {len(entries_to_remove)} duplicates for sample {dup.sample_id}")
             
-#             comparison_results.append({
-#                 'date': date_str,
-#                 'processed_bedtime': summary.get('bedtime'),
-#                 'processed_wake_time': summary.get('wake_time'),
-#                 'processed_sleep_hours': summary.get('sleep_hours'),
-#                 'processed_formatted': summary.get('formatted_sleep'),
-#                 'debug_timezone': summary.get('_debug_timezone'),
-#                 'debug_raw_start': summary.get('_debug_raw_start'),
-#                 'debug_raw_end': summary.get('_debug_raw_end'),
-#                 'raw_sessions': raw_sessions_for_date,
-#                 'raw_sessions_count': len(raw_sessions_for_date),
-#                 'authenticity_status': 'VERIFIED' if raw_sessions_for_date else 'NO_RAW_DATA'
-#             })
-        
-#         return jsonify({
-#             'success': True,
-#             'verification_date': datetime.now().isoformat(),
-#             'total_days_checked': len(comparison_results),
-#             'comparison_results': comparison_results,
-#             'summary': {
-#                 'days_with_raw_data': len([r for r in comparison_results if r['raw_sessions_count'] > 0]),
-#                 'days_missing_raw_data': len([r for r in comparison_results if r['raw_sessions_count'] == 0]),
-#                 'verification_status': 'Authentic HealthKit data preserved' if any(r['raw_sessions_count'] > 0 for r in comparison_results) else 'No raw HealthKit data found'
-#             }
-#         })
-        
-#     except Exception as e:
-#         return jsonify({'error': str(e), 'success': False}), 500
-
-# ✅ NEW: Enhanced sleep data collection to bypass Sleep Schedule truncation
-# @app.route('/api/enhanced-sleep-analysis', methods=['GET'])
-# def enhanced_sleep_analysis():
-#     """Enhanced sleep analysis that captures both InBed and Asleep samples to bypass Sleep Schedule limitations."""
-#     try:
-#         user_id = request.args.get('user_id', 1, type=int)
-#         days_back = request.args.get('days', 7, type=int)
-        
-#         with engine.connect() as conn:
-#             # Get ALL sleep analysis samples (InBed=0, Asleep=1, Awake=2)
-#             enhanced_sleep_query = text("""
-#                 SELECT start_date, end_date, value, metadata, sample_id, source_name
-#                 FROM health_data_archive
-#                 WHERE data_type = 'SleepAnalysis' AND user_id = :uid
-#                 AND start_date >= NOW() - INTERVAL :days DAY
-#                 ORDER BY start_date
+#             # Also clean entries with null sample_id AND null source_name (definitely simulated)
+#             simulated_cleanup_query = text("""
+#                 DELETE FROM health_data_archive 
+#                 WHERE user_id = :user_id 
+#                   AND sample_id IS NULL 
+#                   AND source_name IS NULL
+#                   AND data_type IN ('DistanceWalkingRunning', 'ActiveEnergyBurned', 'StepCount')
 #             """)
-#             raw_sleep_results = conn.execute(enhanced_sleep_query, {"uid": user_id, "days": days_back}).fetchall()
-
-#             # Separate samples by type
-#             inbed_samples = []
-#             asleep_samples = []
-#             awake_samples = []
             
-#             for record in raw_sleep_results:
-#                 # Parse timezone
-#                 metadata_str = record.metadata or '{}'
-#                 metadata = {}
-#                 try:
-#                     temp_data = json.loads(metadata_str)
-#                     while isinstance(temp_data, str):
-#                         temp_data = json.loads(temp_data)
-#                     metadata = temp_data
-#                 except (json.JSONDecodeError, TypeError):
-#                     metadata = {}
-
-#                 user_timezone_str = metadata.get('HKTimeZone', 'UTC')
-#                 try:
-#                     user_tz = ZoneInfo(user_timezone_str)
-#                 except ZoneInfoNotFoundError:
-#                     user_tz = ZoneInfo('UTC')
-
-#                 start_local = record.start_date.replace(tzinfo=timezone.utc).astimezone(user_tz)
-#                 end_local = record.end_date.replace(tzinfo=timezone.utc).astimezone(user_tz)
-#                 duration_hours = (end_local - start_local).total_seconds() / 3600
-
-#                 sample_data = {
-#                     'sample_id': record.sample_id,
-#                     'start_local': start_local.strftime('%Y-%m-%d %H:%M:%S'),
-#                     'end_local': end_local.strftime('%Y-%m-%d %H:%M:%S'),
-#                     'duration_hours': round(duration_hours, 3),
-#                     'source_name': record.source_name,
-#                     'raw_value': float(record.value)
-#                 }
-                
-#                 # Categorize by sleep analysis type
-#                 value = float(record.value)
-#                 if value == 0.0:  # HKCategoryValueSleepAnalysisInBed
-#                     inbed_samples.append(sample_data)
-#                 elif value == 1.0:  # HKCategoryValueSleepAnalysisAsleep  
-#                     asleep_samples.append(sample_data)
-#                 elif value == 2.0:  # HKCategoryValueSleepAnalysisAwake
-#                     awake_samples.append(sample_data)
-
-#             # Check for Sleep Schedule truncation patterns
-#             truncated_sessions = []
-#             for sample in inbed_samples:
-#                 end_time = sample['end_local'].split(' ')[1]  # Get time part
-#                 if end_time.startswith('07:00:0'):  # Ends at exactly 7:00:00 or 7:00:01
-#                     truncated_sessions.append(sample)
-
-#             # Analysis summary
-#             analysis = {
-#                 'total_samples': len(raw_sleep_results),
-#                 'sample_breakdown': {
-#                     'inbed_samples': len(inbed_samples),
-#                     'asleep_samples': len(asleep_samples), 
-#                     'awake_samples': len(awake_samples)
-#                 },
-#                 'sleep_schedule_analysis': {
-#                     'potentially_truncated_sessions': len(truncated_sessions),
-#                     'truncation_percentage': round((len(truncated_sessions) / len(inbed_samples)) * 100, 1) if inbed_samples else 0,
-#                     'truncated_sessions': truncated_sessions
-#                 },
-#                 'recommendations': []
-#             }
-
-#             # Generate recommendations
-#             if len(truncated_sessions) > len(inbed_samples) * 0.5:  # More than 50% truncated
-#                 analysis['recommendations'].append({
-#                     'type': 'sleep_schedule_extension',
-#                     'priority': 'HIGH',
-#                     'message': f'{analysis["sleep_schedule_analysis"]["truncation_percentage"]}% of sleep sessions end exactly at 7:00 AM, suggesting Sleep Schedule truncation. Consider extending your Apple Health Sleep Schedule to 9:00 AM or later to capture full sleep data.',
-#                     'action': 'Extend Sleep Schedule in Apple Health app'
-#                 })
+#             result = conn.execute(simulated_cleanup_query, {"user_id": user_id})
+#             simulated_cleaned = result.rowcount
+#             total_cleaned += simulated_cleaned
             
-#             if len(asleep_samples) == 0:
-#                 analysis['recommendations'].append({
-#                     'type': 'missing_asleep_data', 
-#                     'priority': 'MEDIUM',
-#                     'message': 'No "Asleep" samples found - only "InBed" samples. Enable detailed sleep tracking on Apple Watch or ensure sleep focus mode is active.',
-#                     'action': 'Check Apple Watch sleep tracking settings'
-#                 })
-
-#             return jsonify({
-#                 'success': True,
-#                 'analysis': analysis,
-#                 'sample_details': {
-#                     'inbed_samples': inbed_samples[:10],  # Show first 10
-#                     'asleep_samples': asleep_samples[:10],
-#                     'awake_samples': awake_samples[:10]
-#                 }
-#             })
-
-#     except Exception as e:
-#         return jsonify({'error': str(e), 'success': False}), 500
-
-# Test endpoint to verify 7-day sleep pattern fix
-# @app.route('/api/test-7-day-sleep-patterns', methods=['GET'])
-# def test_7_day_sleep_patterns():
-#     """Test endpoint to verify that sleep patterns always return exactly 7 days"""
-#     try:
-#         user_id = request.args.get('user_id', 1, type=int)
-        
-#         # Call the improved sleep function with 7 days
-#         sleep_result = get_improved_sleep_data(user_id, 7)
-        
-#         if not sleep_result.get('success'):
-#             return jsonify({
-#                 'success': False,
-#                 'error': sleep_result.get('error', 'Unknown error'),
-#                 'message': 'Sleep analysis failed'
-#             })
-        
-#         daily_summaries = sleep_result.get('daily_summaries', [])
-        
-#         # Verify we have exactly 7 days
-#         expected_days = 7
-#         actual_days = len(daily_summaries)
-        
-#         # Check dates are consecutive and in proper order
-#         today = datetime.now().date()
-#         expected_dates = []
-#         for i in range(7):
-#             expected_dates.append((today - timedelta(days=i)).strftime('%Y-%m-%d'))
-        
-#         actual_dates = [summary['date'] for summary in daily_summaries]
-        
-#         # Count days with and without data
-#         days_with_data = len([s for s in daily_summaries if s.get('has_data', True)])
-#         days_without_data = len([s for s in daily_summaries if not s.get('has_data', True)])
-        
-#         test_results = {
-#             'success': True,
-#             'test_name': '7-Day Sleep Pattern Consistency Test',
-#             'results': {
-#                 'expected_days': expected_days,
-#                 'actual_days': actual_days,
-#                 'days_match': actual_days == expected_days,
-#                 'expected_dates': expected_dates,
-#                 'actual_dates': actual_dates,
-#                 'dates_match': actual_dates == expected_dates,
-#                 'days_with_data': days_with_data,
-#                 'days_without_data': days_without_data,
-#                 'complete_range_returned': sleep_result.get('complete_range', False)
-#             },
-#             'test_status': 'PASS' if (actual_days == expected_days and actual_dates == expected_dates) else 'FAIL',
-#             'sleep_summaries': daily_summaries
-#         }
-        
-#         if test_results['test_status'] == 'PASS':
-#             print(f"✅ 7-Day Sleep Pattern Test PASSED: {actual_days} days returned with complete date range")
-#         else:
-#             print(f"❌ 7-Day Sleep Pattern Test FAILED: Expected {expected_days} days, got {actual_days}")
-        
-#         return jsonify(test_results)
+#             if simulated_cleaned > 0:
+#                 print(f"🧹 Removed {simulated_cleaned} simulated entries with null identifiers")
+            
+#             conn.commit()
+            
+#         return total_cleaned
         
 #     except Exception as e:
-#         return jsonify({
-#             'success': False,
-#             'test_status': 'ERROR',
-#             'error': str(e),
-#             'message': 'Test endpoint failed'
-#         }), 500
+#         print(f"❌ Error in auto-clean duplicates: {e}")
+#         return 0
+
+
 
 # ✅ NEW: Today's Insights endpoint with hybrid rule-based + LLM approach
 @app.route('/api/insights', methods=['GET'])
@@ -5356,6 +6537,17 @@ def analyze_user_data_for_insights(user_id: int) -> dict:
 def analyze_glucose_data(conn, user_id: int, today: date, yesterday: date) -> dict:
     """Analyze glucose data for insights"""
     try:
+        # Get user's target glucose range
+        user_target = conn.execute(text("""
+            SELECT target_glucose_min, target_glucose_max 
+            FROM users 
+            WHERE id = :user_id
+        """), {'user_id': user_id}).fetchone()
+        
+        # Use user's target range or default to 70-140
+        target_min = user_target.target_glucose_min if user_target and user_target.target_glucose_min else 70
+        target_max = user_target.target_glucose_max if user_target and user_target.target_glucose_max else 140
+        
         # Get today's and yesterday's glucose readings
         today_readings = conn.execute(text("""
             SELECT glucose_level, timestamp 
@@ -5380,7 +6572,7 @@ def analyze_glucose_data(conn, user_id: int, today: date, yesterday: date) -> di
         def calculate_time_in_range(values):
             if not values:
                 return None
-            in_range = [v for v in values if 70 <= v <= 180]
+            in_range = [v for v in values if target_min <= v <= target_max]
             return round((len(in_range) / len(values)) * 100, 1)
         
         # Check for morning rise pattern
@@ -5392,6 +6584,10 @@ def analyze_glucose_data(conn, user_id: int, today: date, yesterday: date) -> di
             'timeInRange': {
                 'today': calculate_time_in_range(today_values),
                 'yesterday': calculate_time_in_range(yesterday_values)
+            },
+            'targetRange': {
+                'min': target_min,
+                'max': target_max
             },
             'highestReading': max(today_values) if today_values else None,
             'lowestReading': min(today_values) if today_values else None,
@@ -5649,42 +6845,52 @@ def analyze_activity_data(conn, user_id: int, today: date) -> dict:
         return {}
 
 def analyze_sleep_data(conn, user_id: int, today: date) -> dict:
-    """Analyze sleep data for insights"""
+    """Analyze sleep data for insights - use same source as dashboard"""
     try:
-        # Get last night's sleep data
-        last_night = conn.execute(text("""
-            SELECT sleep_hours 
-            FROM sleep_summary 
-            WHERE user_id = :user_id 
-            AND sleep_date = :yesterday
-        """), {'user_id': user_id, 'yesterday': today - timedelta(days=1)}).fetchone()
+        # Use the same improved sleep data function as dashboard
+        improved_sleep_result = get_improved_sleep_data(user_id, 7)
         
-        # Get week average
-        week_avg = conn.execute(text("""
-            SELECT AVG(sleep_hours) as avg_sleep
-            FROM sleep_summary 
-            WHERE user_id = :user_id 
-            AND sleep_date >= :week_ago
-        """), {'user_id': user_id, 'week_ago': today - timedelta(days=7)}).fetchone()
-        
-        last_night_hours = float(last_night.sleep_hours) if last_night and last_night.sleep_hours else None
-        week_avg_hours = float(week_avg.avg_sleep) if week_avg and week_avg.avg_sleep else None
-        
-        # Determine quality
-        quality = None
-        if last_night_hours:
-            if last_night_hours >= 7:
-                quality = 'good'
-            elif last_night_hours >= 6:
-                quality = 'average'
-            else:
-                quality = 'poor'
-        
-        return {
-            'lastNightHours': last_night_hours,
-            'averageThisWeek': round(week_avg_hours, 1) if week_avg_hours else None,
-            'quality': quality
-        }
+        if improved_sleep_result.get('success'):
+            daily_summaries = improved_sleep_result.get('daily_summaries', [])
+            
+            # Find today's sleep data (most recent completed sleep)
+            today_str = today.strftime('%Y-%m-%d')
+            
+            last_night_hours = None
+            week_sleep_hours = []
+            
+            for summary in daily_summaries:
+                if summary.get('has_data', False):
+                    week_sleep_hours.append(summary['sleep_hours'])
+                    
+                    # Check if this is today's data (most recent sleep)
+                    if summary['date'] == today_str:
+                        last_night_hours = summary['sleep_hours']
+
+            
+            # Calculate week average
+            week_avg_hours = round(sum(week_sleep_hours) / len(week_sleep_hours), 1) if week_sleep_hours else None
+            
+            # Determine quality
+            quality = None
+            if last_night_hours:
+                if last_night_hours >= 7:
+                    quality = 'good'
+                elif last_night_hours >= 6:
+                    quality = 'average'
+                else:
+                    quality = 'poor'
+            
+
+            
+            return {
+                'lastNightHours': last_night_hours,
+                'averageThisWeek': week_avg_hours,
+                'quality': quality
+            }
+        else:
+            print(f"⚠️ Improved sleep analysis failed for insights, returning empty data")
+            return {}
         
     except Exception as e:
         print(f"❌ Error analyzing sleep data: {e}")
@@ -5723,18 +6929,24 @@ def generate_llm_insights(metrics: dict) -> list:
             'sleep_quality': metrics.get('sleep', {}).get('quality')
         }
         
+
+        
         prompt = f"""You are a friendly diabetes coach. Based on the metrics below, write 2–3 concise, motivating health insights for the user. Be helpful, human, and engaging.
+
+IMPORTANT: Only use actual data provided. Do NOT make up or assume values for missing data. If a metric is null, None, or 0, do not mention it in insights.
 
 Metrics:
 {json.dumps(metrics_summary, indent=2)}
 
 Requirements:
-- Generate 2-3 insights maximum
+- Generate 3 insights maximum
 - Each insight should be 1-2 sentences
 - Be encouraging and actionable
 - Focus on the most important patterns
 - Use a supportive, friendly tone
 - Include specific numbers when relevant
+- ONLY mention metrics that have actual values (not null/None/0)
+- Do NOT generate fake or assumed data
 
 Format each insight as:
 Title: [Brief title]
@@ -5904,6 +7116,82 @@ def generate_rule_based_insights(metrics: dict) -> list:
     
     # Sort by priority and limit to 3
     return sorted(insights, key=lambda x: x['priority'], reverse=True)[:3]
+
+# @app.route('/api/remove-fake-distance-data', methods=['POST'])
+# def remove_fake_distance_data():
+#     """Remove fake/simulated distance data with sample IDs like 'simulated-distance-' or 'test-distance-'"""
+#     try:
+#         data = request.get_json()
+#         user_id = data.get('user_id', 1)
+        
+#         with engine.connect() as conn:
+#             # Find fake distance entries
+#             fake_query = text("""
+#                 SELECT id, sample_id, start_date, end_date, value, unit
+#                 FROM health_data_archive 
+#                 WHERE user_id = :user_id 
+#                   AND data_type = 'DistanceWalkingRunning'
+#                   AND (sample_id LIKE 'simulated-distance-%' 
+#                        OR sample_id LIKE 'test-distance-%'
+#                        OR sample_id IS NULL 
+#                        OR sample_id = '')
+#                 ORDER BY start_date DESC
+#             """)
+            
+#             fake_entries = conn.execute(fake_query, {"user_id": user_id}).fetchall()
+            
+#             if not fake_entries:
+#                 return jsonify({
+#                     "success": True,
+#                     "message": "No fake distance data found",
+#                     "entries_removed": 0
+#                 })
+            
+#             # Remove fake entries from both tables
+#             delete_archive_query = text("""
+#                 DELETE FROM health_data_archive 
+#                 WHERE user_id = :user_id 
+#                   AND data_type = 'DistanceWalkingRunning'
+#                   AND (sample_id LIKE 'simulated-distance-%' 
+#                        OR sample_id LIKE 'test-distance-%'
+#                        OR sample_id IS NULL 
+#                        OR sample_id = '')
+#             """)
+            
+#             delete_display_query = text("""
+#                 DELETE FROM health_data_display 
+#                 WHERE user_id = :user_id 
+#                   AND data_type = 'DistanceWalkingRunning'
+#                   AND (sample_id LIKE 'simulated-distance-%' 
+#                        OR sample_id LIKE 'test-distance-%'
+#                        OR sample_id IS NULL 
+#                        OR sample_id = '')
+#             """)
+            
+#             archive_result = conn.execute(delete_archive_query, {"user_id": user_id})
+#             display_result = conn.execute(delete_display_query, {"user_id": user_id})
+            
+#             total_removed = archive_result.rowcount + display_result.rowcount
+#             conn.commit()
+            
+#             print(f"🧹 Removed {total_removed} fake distance entries for user {user_id}")
+            
+#             return jsonify({
+#                 "success": True,
+#                 "message": f"Successfully removed {total_removed} fake distance entries",
+#                 "entries_removed": total_removed,
+#                 "archive_removed": archive_result.rowcount,
+#                 "display_removed": display_result.rowcount,
+#                 "fake_entries_found": len(fake_entries)
+#             })
+            
+#     except Exception as e:
+#         print(f"❌ Error removing fake distance data: {e}")
+#         return jsonify({
+#             "success": False,
+#             "error": str(e),
+#             "message": "Failed to remove fake distance data"
+#         }), 500
 
 @app.route('/api/migrate-user-health-data', methods=['POST'])
 def migrate_user_health_data():
@@ -6148,7 +7436,10 @@ def update_user_profile():
             'uses_insulin': data.get('uses_insulin'),
             'insulin_type': data.get('insulin_type'),
             'daily_basal_dose': data.get('daily_basal_dose'),
-            'insulin_to_carb_ratio': data.get('insulin_to_carb_ratio')
+            'insulin_to_carb_ratio': data.get('insulin_to_carb_ratio'),
+            # Target glucose range
+            'target_glucose_min': data.get('target_glucose_min'),
+            'target_glucose_max': data.get('target_glucose_max')
         }
         
         # Remove None values to avoid updating fields that weren't provided
@@ -6185,7 +7476,7 @@ def update_user_profile():
             update_query = text(f"""
                 UPDATE users SET 
                 {', '.join(set_clauses)}
-                WHERE user_id = :user_id
+                WHERE id = :user_id
             """)
             
             result = conn.execute(update_query, params)
@@ -6200,12 +7491,13 @@ def update_user_profile():
             
             # Return updated user data
             updated_user = conn.execute(text("""
-                SELECT user_id, full_name, email, height_value, height_unit, 
+                SELECT id, full_name, email, height_value, height_unit, 
                        weight_value, weight_unit, gender, cgm_model, pump_model,
                        profile_image_url, has_diabetes, diabetes_type, year_of_diagnosis,
-                       uses_insulin, insulin_type, daily_basal_dose, insulin_to_carb_ratio, updated_at
+                       uses_insulin, insulin_type, daily_basal_dose, insulin_to_carb_ratio,
+                       target_glucose_min, target_glucose_max, updated_at
                 FROM users 
-                WHERE user_id = :user_id
+                WHERE id = :user_id
             """), {'user_id': user_id}).fetchone()
             
             print(f"✅ Profile updated for user_id {user_id}. Fields updated: {list(update_data.keys())}")
@@ -6215,7 +7507,7 @@ def update_user_profile():
             "message": "Profile updated successfully",
             "updated_fields": list(update_data.keys()),
             "user_data": {
-                "user_id": updated_user.user_id,
+                "user_id": updated_user.id,
                 "full_name": updated_user.full_name,
                 "email": updated_user.email,
                 "height_value": float(updated_user.height_value) if updated_user.height_value else None,
@@ -6233,6 +7525,8 @@ def update_user_profile():
                 "insulin_type": updated_user.insulin_type,
                 "daily_basal_dose": float(updated_user.daily_basal_dose) if updated_user.daily_basal_dose else None,
                 "insulin_to_carb_ratio": float(updated_user.insulin_to_carb_ratio) if updated_user.insulin_to_carb_ratio else None,
+                "target_glucose_min": int(updated_user.target_glucose_min) if updated_user.target_glucose_min else 70,
+                "target_glucose_max": int(updated_user.target_glucose_max) if updated_user.target_glucose_max else 140,
                 "updated_at": updated_user.updated_at.isoformat() if updated_user.updated_at else None
             }
         }), 200
@@ -6371,9 +7665,40 @@ def validate_profile_update_data(data: dict) -> list:
             except (ValueError, TypeError):
                 errors.append("Insulin to carb ratio must be a valid number")
     
+    # Target glucose range validation
+    if 'target_glucose_min' in data or 'target_glucose_max' in data:
+        min_glucose = data.get('target_glucose_min')
+        max_glucose = data.get('target_glucose_max')
+        
+        # Validate individual values
+        if min_glucose is not None:
+            try:
+                min_glucose = int(min_glucose)
+                if min_glucose < 50 or min_glucose > 250:
+                    errors.append("Target glucose minimum must be between 50-250 mg/dL")
+            except (ValueError, TypeError):
+                errors.append("Target glucose minimum must be a valid number")
+        
+        if max_glucose is not None:
+            try:
+                max_glucose = int(max_glucose)
+                if max_glucose < 50 or max_glucose > 250:
+                    errors.append("Target glucose maximum must be between 50-250 mg/dL")
+            except (ValueError, TypeError):
+                errors.append("Target glucose maximum must be a valid number")
+        
+        # Validate that min < max (if both are provided and valid)
+        if (min_glucose is not None and max_glucose is not None and 
+            isinstance(min_glucose, int) and isinstance(max_glucose, int)):
+            if min_glucose >= max_glucose:
+                errors.append("Target glucose minimum must be less than maximum")
+    
     return errors
 
 if __name__ == '__main__':
+    initialize_database()
+    start_cgm_background_sync()  # Start CGM sync after database is ready
+    
     # Print registered routes for debugging
     print("\n--- Flask Registered Routes ---")
     for rule in app.url_map.iter_rules():

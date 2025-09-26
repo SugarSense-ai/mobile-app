@@ -7,6 +7,9 @@
     "icon": "./assets/images/sugar-sense-ai-logo.png",
     "scheme": "sugarsenseai",
     "userInterfaceStyle": "automatic",
+    "linking": {
+      "prefixes": ["sugarsenseai://"]
+    },
     "newArchEnabled": false,
     "ios": {
       "supportsTablet": true,

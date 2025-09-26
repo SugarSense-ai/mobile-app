@@ -16,6 +16,7 @@ export default function InitialLayout() {
     const [apiInitialized, setApiInitialized] = useState(false);
     const [onboardingCompleted, setOnboardingCompleted] = useState<boolean | null>(null);
     const [userRegistered, setUserRegistered] = useState(false);
+    const [lastUserId, setLastUserId] = useState<string | null>(null);
 
     useEffect(() => {
         // Initialize the API connection once.
@@ -75,6 +76,14 @@ export default function InitialLayout() {
             if (result.onboarding_completed !== undefined) {
                 setOnboardingCompleted(result.onboarding_completed);
                 console.log(`📝 InitialLayout: Set onboarding status from backend: ${result.onboarding_completed}`);
+                
+                // Also update local storage to match backend status
+                if (result.onboarding_completed) {
+                    await onboardingService.setOnboardingCompleted(clerkUser.id);
+                } else {
+                    // Clear any stale local storage data for new users
+                    await onboardingService.clearOnboardingStatus(clerkUser.id);
+                }
             }
 
             setUserRegistered(true);
@@ -94,14 +103,17 @@ export default function InitialLayout() {
             if (isSignedIn && user) {
                 console.log(`🔍 InitialLayout: User is signed in (${user.id}), registering and checking onboarding...`);
                 
+                // Store the current user ID for logout cleanup
+                setLastUserId(user.id);
+                
                 // Clean up old onboarding data first (for migration)
                 await onboardingService.cleanupOldOnboardingData();
                 
                 // Register user in backend (idempotent operation)
-                await registerUserInBackend(user);
+                const registrationResult = await registerUserInBackend(user);
                 
-                // Check onboarding status (might be updated by backend registration)
-                if (onboardingCompleted === null) {
+                // Only check onboarding status if registration didn't provide it
+                if (onboardingCompleted === null && registrationResult === null) {
                     await checkAndUpdateOnboardingStatus(user.id);
                 }
             } else {
@@ -139,6 +151,19 @@ export default function InitialLayout() {
             if (userRegistered) {
                 console.log('🔄 InitialLayout: Resetting user registration state after logout');
                 setUserRegistered(false);
+            }
+            
+            // Clear any cached user data from AsyncStorage
+            const userIdToClean = user?.id || lastUserId;
+            if (userIdToClean) {
+                console.log(`🧹 InitialLayout: Clearing cached data for logged out user ${userIdToClean}`);
+                onboardingService.clearOnboardingStatus(userIdToClean).catch(err => 
+                    console.error('Error clearing onboarding status:', err)
+                );
+                AsyncStorage.removeItem(`db_user_id_${userIdToClean}`).catch(err =>
+                    console.error('Error clearing db user id:', err)
+                );
+                setLastUserId(null);
             }
             
             router.replace('/(auth)/login');
@@ -195,7 +220,7 @@ export default function InitialLayout() {
         } else if (onboardingCompleted && !inTabsGroup && !inAllowedScreen) {
             // User has completed onboarding but is not in main app or allowed screen
             console.log('✅ User signed in and onboarding completed. Redirecting to main app...');
-            router.replace('/(tabs)');
+            router.replace('/(tabs)/dashboard');
         } else {
             console.log('👍 User in correct route group or allowed screen. No redirect needed.');
         }

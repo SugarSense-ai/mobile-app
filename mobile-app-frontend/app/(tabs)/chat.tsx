@@ -22,8 +22,10 @@ import { fetchDashboardData, DashboardData } from '@/services/dashboardService';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { COLORS } from '@/constants/theme';
 import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
+import { useUserIds } from '@/services/userService';
 
 export default function ChatScreen() {
+  const { clerkUserId, getDatabaseUserId } = useUserIds();
   const tabBarHeight = useBottomTabBarHeight();
   const scrollViewRef = useRef<ScrollView>(null);
   const inputRef = useRef<TextInput>(null);
@@ -33,6 +35,7 @@ export default function ChatScreen() {
   const keyboardHeight = useRef(new Animated.Value(0)).current;
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
+  const [currentUserId, setCurrentUserId] = useState<number | null>(null);
   const isMounted = useRef(true);
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -85,10 +88,29 @@ export default function ChatScreen() {
   }, []);
 
   useEffect(() => {
+    // Initialize user ID
+    const initializeUserId = async () => {
+      try {
+        const dbUserId = await getDatabaseUserId();
+        if (dbUserId) {
+          setCurrentUserId(dbUserId);
+          console.log('✅ Chat: Initialized with database user ID:', dbUserId);
+        } else {
+          console.error('❌ Chat: Failed to get database user ID');
+        }
+      } catch (error) {
+        console.error('❌ Chat: Error getting user ID:', error);
+      }
+    };
+
     // Fetch dashboard data on component mount
     const fetchDashboardDataAsync = async () => {
       try {
-        const data = await fetchDashboardData();
+        if (!currentUserId) {
+          console.log('⏳ Chat: Waiting for user ID to fetch dashboard data...');
+          return;
+        }
+        const data = await fetchDashboardData(7, currentUserId);
         if (isMounted.current) {
           setDashboardData(data);
         }
@@ -105,8 +127,12 @@ export default function ChatScreen() {
       setGalleryPermission(galleryStatus.status === 'granted');
     })();
 
+    initializeUserId();
+    
+    if (currentUserId) {
     fetchDashboardDataAsync();
-  }, []);
+    }
+  }, [currentUserId]);
 
   useEffect(() => {
     if (isLoading) {
@@ -173,6 +199,7 @@ export default function ChatScreen() {
       sleepSummary: {
         hours: dashboardData.sleep.summary.avg_sleep_hours || 0,
         quality: dashboardData.sleep.summary.avg_sleep_hours > 7 ? 'good' : dashboardData.sleep.summary.avg_sleep_hours > 5 ? 'average' : 'poor',
+        dailySleep: dashboardData.sleep.data.map((d: any) => ({ date: d.date, hours: d.total_hours })),
       },
       activitySummary: {
         stepsToday: todaysActivity ? (todaysActivity as any).steps : 0,
@@ -301,7 +328,7 @@ export default function ChatScreen() {
       const healthSnapshot = buildHealthSnapshot();
       
       // Call the unified sendMessage service function
-      const aiResponse = await sendMessage(textToSend, healthSnapshot, currentChatMessages, imageToSend);
+      const aiResponse = await sendMessage(textToSend, healthSnapshot, currentChatMessages, imageToSend, clerkUserId);
       
       // Create the AI's response message
       const newAiMessage: ChatMessage = {

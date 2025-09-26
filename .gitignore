@@ -50,3 +50,37 @@ ehthumbs.db
 .yarn/build-state.yml
 .yarn/install-state.json
 .pnp.*
+
+# Files to exclude from repository
+AWS_DEPLOYMENT_GUIDE.md
+CLAUDE.md
+DEPLOYMENT_CHECKLIST.md
+MOBILE_CGM_IMPLEMENTATION_COMPLETE.md
+SMART_SYNC_IMPLEMENTATION.md
+refer.py
+
+# Database and cache files
+*.db
+*.sqlite3
+model/health_app.db
+user_data.db
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Model specific files to exclude
+model/.encryption_key
+model/*.csv
+model/*.json
+model/add_realistic_sleep_data.py
+model/debug_*.py
+model/display_glucose_readings.py
+model/fix_sleep_data.py
+model/quick_sync_test.py
+model/simulate_mobile_request.py
+model/test_*.py

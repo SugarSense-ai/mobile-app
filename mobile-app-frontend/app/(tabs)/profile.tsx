@@ -2,15 +2,22 @@ import React, { useState, useEffect } from 'react';
 import { View, ScrollView, Text, TouchableOpacity, Switch, Alert, Modal, TextInput, StyleSheet, KeyboardAvoidingView, TouchableWithoutFeedback, Keyboard, Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Avatar, ListItem, Icon } from 'react-native-elements';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
+import { useAuth, useUser } from '@clerk/clerk-expo';
+import { useRouter } from 'expo-router';
 import { styles } from '@/styles/profile.styles';
 import { COLORS } from '@/constants/theme';
 import { 
-  setAppleHealthSyncEnabled, 
-  isAppleHealthSyncEnabledState, 
+  isAppleHealthSyncEnabledState,
+  setAppleHealthSyncEnabled,
   triggerManualSync,
-  hasHealthKitPermissions 
+  performFreshResync,
+  hasHealthKitPermissions
 } from '@/services/healthKit';
+import { useUserIds } from '@/services/userService';
+import config from '@/constants/config';
+import apiClient from '@/services/apiClient';
+import { testApiConnection } from '@/services/testApiClient';
 
 const AVATAR_SIZE = 80;
 const dummyUser = {
@@ -27,11 +34,20 @@ const dummyUser = {
 };
 
 const ProfileScreen = () => {
+    const { user: clerkUser } = useUser();
     const navigation = useNavigation();
-    const [user, setUser] = useState(dummyUser);
-    const [appleHealthSyncEnabled, setAppleHealthSyncEnabledLocal] = useState(false);
+    const { signOut } = useAuth();
+    const router = useRouter();
+    const { getDatabaseUserId } = useUserIds();
+    
+    const [currentUserId, setCurrentUserId] = useState<number | null>(null);
+    const [user, setUser] = useState(dummyUser); // retains placeholder values for other profile fields
+    // Store the display name in state so it can be refreshed when the profile updates.
+    const [displayName, setDisplayName] = useState<string>(() => clerkUser?.fullName || clerkUser?.firstName || 'Welcome');
+    const [appleHealthSyncEnabledLocal, setAppleHealthSyncEnabledLocal] = useState(false);
     const [isSyncing, setIsSyncing] = useState(false);
     const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
+    const [hasCompletedInitialSync, setHasCompletedInitialSync] = useState(false);
     
     // Insulin Calculator state
     const [calculatorVisible, setCalculatorVisible] = useState(false);
@@ -56,17 +72,136 @@ const ProfileScreen = () => {
     const [basalHistory, setBasalHistory] = useState<any[]>([]);
     const [timingWarning, setTimingWarning] = useState<string | null>(null);
     const [consistencyMessage, setConsistencyMessage] = useState<string | null>(null);
+    
+    // Target Glucose Range state
+    const [targetGlucoseMin, setTargetGlucoseMin] = useState(70);
+    const [targetGlucoseMax, setTargetGlucoseMax] = useState(140);
+    const [targetGlucoseModalVisible, setTargetGlucoseModalVisible] = useState(false);
+    const [tempTargetMin, setTempTargetMin] = useState('70');
+    const [tempTargetMax, setTempTargetMax] = useState('140');
+    
+    // Connection status
+    const [isConnected, setIsConnected] = useState(false);
+    const [connectionStatus, setConnectionStatus] = useState('Checking connection...');
+
+    // Initialize user ID and test API connection
+    useEffect(() => {
+        const initializeUserId = async () => {
+            try {
+                const dbUserId = await getDatabaseUserId();
+                if (dbUserId) {
+                    setCurrentUserId(dbUserId);
+                    console.log('✅ Profile: Initialized with database user ID:', dbUserId);
+                } else {
+                    console.error('❌ Profile: Failed to get database user ID');
+                }
+            } catch (error) {
+                console.error('❌ Profile: Error getting user ID:', error);
+            }
+        };
+
+        const testConnection = async () => {
+            console.log('🔬 Profile: Testing API connection...');
+            setConnectionStatus('Testing connection...');
+            const testResult = await testApiConnection();
+            if (testResult.success) {
+                console.log(`✅ Profile: API connection verified (${testResult.responseTime}ms)`);
+                setIsConnected(true);
+                setConnectionStatus(`Connected (${testResult.responseTime}ms)`);
+            } else {
+                console.error(`❌ Profile: API connection failed: ${testResult.error}`);
+                setIsConnected(false);
+                setConnectionStatus(`Connection failed: ${testResult.error}`);
+            }
+        };
+
+        initializeUserId();
+        testConnection();
+    }, []);
+
+    // Refresh the display name whenever the screen gains focus or the Clerk user changes.
+    useFocusEffect(
+        React.useCallback(() => {
+            const fetchDisplayName = async () => {
+                if (!clerkUser?.id) return;
+                try {
+                    const result = await apiClient.get(`/api/user-profile?clerk_user_id=${clerkUser.id}`);
+                    
+                    if (result.success && result.data?.user) {
+                        const userData = result.data.user;
+                        // Update display name
+                        if (userData.full_name) {
+                            setDisplayName(userData.full_name);
+                        } else {
+                            // Fallback to Clerk's stored name if backend doesn't have it
+                            setDisplayName(clerkUser.fullName || clerkUser.firstName || 'Welcome');
+                        }
+                        
+                        // Update target glucose range
+                        if (userData.target_glucose_min !== undefined && userData.target_glucose_max !== undefined) {
+                            setTargetGlucoseMin(userData.target_glucose_min);
+                            setTargetGlucoseMax(userData.target_glucose_max);
+                            setTempTargetMin(userData.target_glucose_min.toString());
+                            setTempTargetMax(userData.target_glucose_max.toString());
+                        }
+                    } else {
+                        console.error('Failed to fetch user profile:', result.error);
+                        // Fallback to Clerk's stored name if backend doesn't have it
+                        setDisplayName(clerkUser.fullName || clerkUser.firstName || 'Welcome');
+                    }
+                } catch (error) {
+                    console.error('Failed to fetch display name:', error);
+                    setDisplayName(clerkUser?.fullName || clerkUser?.firstName || 'Welcome');
+                }
+            };
+
+            fetchDisplayName();
+        }, [clerkUser?.id])
+    );
 
     // Load basal history from persistence on mount
     useEffect(() => {
         const loadHistory = async () => {
             try {
-                const stored = await AsyncStorage.getItem('BASAL_HISTORY');
-                if (stored) {
-                    setBasalHistory(JSON.parse(stored));
+                if (clerkUser?.id) {
+                    const result = await apiClient.get(`/api/basal-dose-history?clerk_user_id=${clerkUser.id}`);
+                    
+                    if (result.success && result.data?.basal_logs) {
+                        // Convert backend format to frontend format
+                        const convertedHistory = result.data.basal_logs.map((log: any) => ({
+                            insulinType: 'basal',
+                            insulinName: log.insulin_name,
+                            doseUnits: log.dose_units,
+                            timestamp: log.timestamp,
+                        }));
+                        setBasalHistory(convertedHistory);
+                        console.log(`✅ Loaded ${convertedHistory.length} basal history records`);
+                    } else {
+                        console.error('Failed to load basal history:', result.error);
+                        // Fallback to AsyncStorage for backward compatibility
+                        const stored = await AsyncStorage.getItem('BASAL_HISTORY');
+                        if (stored) {
+                            setBasalHistory(JSON.parse(stored));
+                        }
+                    }
+                } else {
+                    // Fallback to AsyncStorage for backward compatibility
+                    const stored = await AsyncStorage.getItem('BASAL_HISTORY');
+                    if (stored) {
+                        setBasalHistory(JSON.parse(stored));
+                    }
                 }
             } catch (error) {
                 console.error('Failed to load basal history', error);
+                // Try fallback to AsyncStorage
+                try {
+                    const stored = await AsyncStorage.getItem('BASAL_HISTORY');
+                    if (stored) {
+                        setBasalHistory(JSON.parse(stored));
+                    }
+                } catch (fallbackError) {
+                    console.error('Fallback load also failed', fallbackError);
+                }
             }
         };
         loadHistory();
@@ -81,6 +216,26 @@ const ProfileScreen = () => {
         }
     };
 
+    // Load settings and initial sync status
+    useEffect(() => {
+        const loadSettings = async () => {
+            try {
+                const syncEnabled = isAppleHealthSyncEnabledState();
+                setAppleHealthSyncEnabledLocal(syncEnabled);
+                
+                // Set initial sync status based on sync being enabled
+                setHasCompletedInitialSync(syncEnabled);
+                
+                if (syncEnabled) {
+                    setLastSyncTime('Previously synced');
+                }
+            } catch (error) {
+                console.error('Error loading settings:', error);
+            }
+        };
+
+        loadSettings();
+    }, []);
 
     const resetCalculatorState = () => {
         setCarbs('');
@@ -168,10 +323,15 @@ const ProfileScreen = () => {
     };
 
     const performInitialSync = async () => {
+        if (!currentUserId) {
+            Alert.alert('Error', 'User ID not available. Please try again.');
+            return;
+        }
+
         setIsSyncing(true);
         try {
-            console.log('🔄 Starting initial Apple Health sync...');
-            const result = await triggerManualSync(1, 7); // User ID 1, last 7 days
+            console.log(`🔄 Starting initial Apple Health sync for user ${currentUserId}...`);
+            const result = await triggerManualSync(currentUserId, 7); // Current user ID, last 7 days
             
             if (result.success) {
                 setLastSyncTime(new Date().toLocaleString());
@@ -199,25 +359,14 @@ const ProfileScreen = () => {
         }
     };
 
-    const handleManualSync = async () => {
-        if (!appleHealthSyncEnabled) {
-            Alert.alert(
-                'Apple Health Sync Disabled',
-                'Please enable Apple Health sync first to manually sync data.',
-                [{ text: 'OK' }]
-            );
-            return;
-        }
 
-        await performInitialSync();
-    };
 
     const handleSelectDiabetesType = (type: string) => {
         setUser({ ...user, diabetesType: type });
         setDiabetesTypeModalVisible(false);
     };
 
-    const handleLogBasalDose = () => {
+    const handleLogBasalDose = async () => {
         if (!basalInsulinName.trim() || !basalDose) {
             Alert.alert('Missing Fields', 'Please fill in all fields.');
             return;
@@ -227,52 +376,81 @@ const ProfileScreen = () => {
             Alert.alert('Invalid Input', 'Dose must be a positive number.');
             return;
         }
+
+        if (!clerkUser?.id) {
+            Alert.alert('Error', 'User not authenticated. Please sign in again.');
+            return;
+        }
     
-        const newEntry = {
-            insulinType: 'basal',
-            insulinName: basalInsulinName.trim(),
-            doseUnits: doseUnits,
-            timestamp: new Date().toISOString(),
-        };
-        const updatedHistory = [...basalHistory, newEntry];
-        setBasalHistory(updatedHistory);
-        persistBasalHistory(updatedHistory);
+        try {
+            // Log to backend
+            const result = await apiClient.post('/api/log-basal-dose', {
+                clerk_user_id: clerkUser.id,
+                insulin_name: basalInsulinName.trim(),
+                dose_units: doseUnits,
+                timestamp: new Date().toISOString(),
+            });
 
-        // --- Smart Feedback ---
-        const previousEntries = updatedHistory.slice(0, -1); // exclude new
-        if (previousEntries.length > 0) {
-            const minutesFromMidnight = (dateStr: string) => {
-                const d = new Date(dateStr);
-                return d.getHours() * 60 + d.getMinutes();
-            };
-            const avgMinutes = previousEntries.reduce((acc, e) => acc + minutesFromMidnight(e.timestamp), 0) / previousEntries.length;
-            const newMinutes = minutesFromMidnight(newEntry.timestamp);
-            if (Math.abs(newMinutes - avgMinutes) > 120) {
-                setTimingWarning('⏱️ You took your basal dose significantly later than usual. This may affect fasting glucose.');
-            } else {
-                setTimingWarning(null);
+            if (!result.success) {
+                console.error('Backend error response:', result.error);
+                throw new Error(result.error || 'Failed to log basal dose');
             }
-        }
 
-        // Consistency last 7 days
-        const sevenDaysAgo = new Date();
-        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6); // include today = 7 days
-        const uniqueDays = new Set(
-            updatedHistory
-                .filter(e => new Date(e.timestamp) >= sevenDaysAgo)
-                .map(e => new Date(e.timestamp).toDateString())
-        );
-        if (uniqueDays.size >= 6) {
-            setConsistencyMessage('🎉 Great job! You’ve logged your basal dose consistently this week.');
-        } else {
-            setConsistencyMessage(null);
-        }
+            console.log('✅ Basal dose logged successfully:', result.data);
 
-        console.log('Basal Log:', newEntry);
-        Alert.alert('Success', 'Basal dose logged successfully.');
-        setBasalModalVisible(false);
-        setBasalInsulinName('');
-        setBasalDose('');
+            // Create new entry for local state
+            const newEntry = {
+                insulinType: 'basal',
+                insulinName: basalInsulinName.trim(),
+                doseUnits: doseUnits,
+                timestamp: new Date().toISOString(),
+            };
+            const updatedHistory = [...basalHistory, newEntry];
+            setBasalHistory(updatedHistory);
+            
+            // Also persist locally as backup
+            persistBasalHistory(updatedHistory);
+
+            // --- Smart Feedback ---
+            const previousEntries = updatedHistory.slice(0, -1); // exclude new
+            if (previousEntries.length > 0) {
+                const minutesFromMidnight = (dateStr: string) => {
+                    const d = new Date(dateStr);
+                    return d.getHours() * 60 + d.getMinutes();
+                };
+                const avgMinutes = previousEntries.reduce((acc, e) => acc + minutesFromMidnight(e.timestamp), 0) / previousEntries.length;
+                const newMinutes = minutesFromMidnight(newEntry.timestamp);
+                if (Math.abs(newMinutes - avgMinutes) > 120) {
+                    setTimingWarning('⏱️ You took your basal dose significantly later than usual. This may affect fasting glucose.');
+                } else {
+                    setTimingWarning(null);
+                }
+            }
+
+            // Consistency last 7 days
+            const sevenDaysAgo = new Date();
+            sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6); // include today = 7 days
+            const uniqueDays = new Set(
+                updatedHistory
+                    .filter(e => new Date(e.timestamp) >= sevenDaysAgo)
+                    .map(e => new Date(e.timestamp).toDateString())
+            );
+            if (uniqueDays.size >= 6) {
+                setConsistencyMessage('🎉 Great job! You\'ve logged your basal dose consistently this week.');
+            } else {
+                setConsistencyMessage(null);
+            }
+
+            console.log('Basal Log:', newEntry);
+            Alert.alert('Success', 'Basal dose logged successfully.');
+            setBasalModalVisible(false);
+            setBasalInsulinName('');
+            setBasalDose('');
+        } catch (error) {
+            console.error('Error logging basal dose:', error);
+            const errorMessage = error instanceof Error ? error.message : 'Failed to log basal dose. Please try again.';
+            Alert.alert('Error', errorMessage);
+        }
     };
 
 
@@ -334,12 +512,90 @@ const ProfileScreen = () => {
         }
     };
 
-    const navigateToLeaderboard = () => {
-        console.log('Navigating to Leaderboard');
+    const navigateToEditProfile = () => {
+        router.push('/edit-profile');
     };
 
-    const navigateToEditProfile = () => {
-        console.log('Navigating to Edit Profile');
+    const handleSaveTargetGlucose = async () => {
+        try {
+            // Validate inputs
+            const min = parseInt(tempTargetMin);
+            const max = parseInt(tempTargetMax);
+            
+            if (isNaN(min) || isNaN(max)) {
+                Alert.alert('Invalid Input', 'Please enter valid numbers for both minimum and maximum values.');
+                return;
+            }
+            
+            if (min < 50 || min > 250 || max < 50 || max > 250) {
+                Alert.alert('Invalid Range', 'Target glucose values must be between 50-250 mg/dL.');
+                return;
+            }
+            
+            if (min >= max) {
+                Alert.alert('Invalid Range', 'Minimum value must be less than maximum value.');
+                return;
+            }
+            
+            // Make API call to update target glucose
+            const result = await apiClient.put('/api/update-user-profile', {
+                clerk_user_id: clerkUser?.id,
+                target_glucose_min: min,
+                target_glucose_max: max,
+            });
+            
+            if (result.success) {
+                // Update local state
+                setTargetGlucoseMin(min);
+                setTargetGlucoseMax(max);
+                setTargetGlucoseModalVisible(false);
+                Alert.alert('Success', 'Target glucose range updated successfully.');
+            } else {
+                const errorMessage = result.data?.validation_errors?.join('\n') || result.error || 'Failed to update target glucose range.';
+                Alert.alert('Error', errorMessage);
+            }
+        } catch (error) {
+            console.error('Error updating target glucose:', error);
+            Alert.alert('Error', 'Failed to update target glucose range. Please try again.');
+        }
+    };
+
+    const handleLogout = async () => {
+        Alert.alert(
+            'Sign Out',
+            'Are you sure you want to sign out? Your profile and preferences will be saved.',
+            [
+                {
+                    text: 'Cancel',
+                    style: 'cancel'
+                },
+                {
+                    text: 'Sign Out',
+                    style: 'destructive',
+                    onPress: async () => {
+                        try {
+                            console.log('🚪 Starting logout process...');
+                            
+                            // Sign out from Clerk
+                            await signOut();
+                            
+                            console.log('✅ Successfully signed out');
+                            
+                            // Navigation will be handled automatically by InitialLayout
+                            // which will detect the auth state change and redirect to login
+                            
+                        } catch (error) {
+                            console.error('❌ Error during logout:', error);
+                            Alert.alert(
+                                'Logout Error', 
+                                'Failed to sign out. Please try again.',
+                                [{ text: 'OK' }]
+                            );
+                        }
+                    }
+                }
+            ]
+        );
     };
 
     return (
@@ -354,36 +610,17 @@ const ProfileScreen = () => {
                         containerStyle={styles.avatar}
                     />
                     <View style={styles.headerText}>
-                        <Text style={styles.name}>{user.name}</Text>
-                        <Text style={styles.username}>@{user.username}</Text>
+                        <Text style={styles.name}>{displayName}</Text>
+                        {__DEV__ && (
+                            <Text style={[styles.connectionStatus, { color: isConnected ? COLORS.success : COLORS.error }]}>
+                                {isConnected ? '✅' : '❌'} {connectionStatus}
+                            </Text>
+                        )}
                     </View>
                 </View>
             </View>
 
-            <TouchableOpacity style={styles.card} onPress={navigateToLeaderboard}>
-                <View style={styles.cardHeader}>
-                    <Text style={styles.cardTitle}>Your Ranking</Text>
-                    <Icon name="trophy-outline" type="ionicon" color={COLORS.accent} size={24} />
-                </View>
-                <View style={styles.cardBody}>
-                    <View style={styles.leaderboardItem}>
-                        <Text style={styles.leaderboardLabel}>Rank:</Text>
-                        <Text style={[styles.leaderboardValue, { color: COLORS.primary }]}>{user.leaderboardRank}</Text>
-                    </View>
-                    <View style={styles.leaderboardItem}>
-                        <Text style={styles.leaderboardLabel}>Tokens:</Text>
-                        <Text style={[styles.leaderboardValue, { color: COLORS.success }]}>{user.tokenBalance}</Text>
-                    </View>
-                    <View style={styles.leaderboardItem}>
-                        <Text style={styles.leaderboardLabel}>Activity:</Text>
-                        <Text style={styles.leaderboardValue}>{user.activityScore}</Text>
-                    </View>
-                </View>
-                <TouchableOpacity style={styles.cardFooterButton} onPress={navigateToLeaderboard}>
-                    <Text style={styles.cardFooterText}>View Full Leaderboard</Text>
-                    <Icon name="chevron-forward-outline" type="ionicon" color={COLORS.mediumGray} size={18} />
-                </TouchableOpacity>
-            </TouchableOpacity>
+
 
             {/* Apple Health Integration Section */}
             <View style={styles.section}>
@@ -401,52 +638,48 @@ const ProfileScreen = () => {
                     <ListItem.Content>
                         <ListItem.Title style={styles.listItemTitle}>Sync Apple Health Data</ListItem.Title>
                         <ListItem.Subtitle style={styles.listItemSubtitle}>
-                            {appleHealthSyncEnabled 
+                            {appleHealthSyncEnabledLocal 
                                 ? `Auto-sync enabled${lastSyncTime ? ` • Last sync: ${lastSyncTime}` : ''}`
                                 : 'Manually sync health data from Apple Health'
                             }
                         </ListItem.Subtitle>
                     </ListItem.Content>
                     <Switch
-                        value={appleHealthSyncEnabled}
+                        value={appleHealthSyncEnabledLocal}
                         onValueChange={handleAppleHealthToggle}
                         trackColor={{ false: COLORS.lightGray, true: COLORS.primary + '80' }}
-                        thumbColor={appleHealthSyncEnabled ? COLORS.primary : COLORS.mediumGray}
+                        thumbColor={appleHealthSyncEnabledLocal ? COLORS.primary : COLORS.mediumGray}
                         disabled={isSyncing}
                     />
                 </ListItem>
 
-                {appleHealthSyncEnabled && (
-                    <ListItem 
-                        key="manual-sync" 
-                        bottomDivider 
-                        containerStyle={styles.listItem}
-                        onPress={handleManualSync}
-                        disabled={isSyncing}
-                        underlayColor="transparent"
-                    >
-                        <View style={styles.listItemIconContainer}>
-                            <Icon 
-                                name={isSyncing ? "sync" : "refresh-outline"} 
-                                type="ionicon" 
-                                color={isSyncing ? COLORS.accent : COLORS.secondary} 
-                                size={22} 
-                            />
-                        </View>
-                        <ListItem.Content>
-                            <ListItem.Title style={[styles.listItemTitle, isSyncing && { color: COLORS.mediumGray }]}>
-                                {isSyncing ? 'Syncing...' : 'Manual Sync Now'}
-                            </ListItem.Title>
-                            <ListItem.Subtitle style={styles.listItemSubtitle}>
-                                {isSyncing 
-                                    ? 'Syncing Apple Health data with dashboard'
-                                    : 'Manually trigger Apple Health data sync'
-                                }
-                            </ListItem.Subtitle>
-                        </ListItem.Content>
-                        <ListItem.Chevron color={isSyncing ? COLORS.lightGray : COLORS.mediumGray} />
-                    </ListItem>
-                )}
+
+
+
+            </View>
+
+            {/* Connect Your CGM Section */}
+            <View style={styles.section}>
+                <Text style={styles.sectionTitle}>Connect Your CGM</Text>
+                
+                <ListItem 
+                    key="connect-cgm" 
+                    bottomDivider 
+                    containerStyle={styles.listItem}
+                    onPress={() => router.push('/cgm-connection')}
+                    underlayColor="transparent"
+                >
+                    <View style={styles.listItemIconContainer}>
+                        <Icon name="glasses-outline" type="ionicon" color={COLORS.primary} size={22} />
+                    </View>
+                    <ListItem.Content>
+                        <ListItem.Title style={styles.listItemTitle}>Connect to CGM</ListItem.Title>
+                        <ListItem.Subtitle style={styles.listItemSubtitle}>
+                            Select your CGM (Dexcom or Libre) and connect
+                        </ListItem.Subtitle>
+                    </ListItem.Content>
+                    <ListItem.Chevron color={COLORS.mediumGray} />
+                </ListItem>
             </View>
 
             {/* Personal Information Section */}
@@ -462,13 +695,23 @@ const ProfileScreen = () => {
                     </ListItem.Content>
                     <ListItem.Chevron color={COLORS.mediumGray} />
                 </ListItem>
-                <ListItem key="target-glucose" bottomDivider containerStyle={styles.listItem}>
+                <ListItem 
+                    key="target-glucose" 
+                    bottomDivider 
+                    containerStyle={styles.listItem}
+                    onPress={() => {
+                        setTempTargetMin(targetGlucoseMin.toString());
+                        setTempTargetMax(targetGlucoseMax.toString());
+                        setTargetGlucoseModalVisible(true);
+                    }}
+                    underlayColor="transparent"
+                >
                     <View style={styles.listItemIconContainer}>
                         <Icon name="locate-outline" type="ionicon" color={COLORS.secondary} size={22} />
                     </View>
                     <ListItem.Content>
                         <ListItem.Title style={styles.listItemTitle}>Target Glucose</ListItem.Title>
-                        <ListItem.Subtitle style={styles.listItemSubtitle}>{user.targetGlucose}</ListItem.Subtitle>
+                        <ListItem.Subtitle style={styles.listItemSubtitle}>{targetGlucoseMin}-{targetGlucoseMax} mg/dL</ListItem.Subtitle>
                     </ListItem.Content>
                     <ListItem.Chevron color={COLORS.mediumGray} />
                 </ListItem>
@@ -626,7 +869,7 @@ const ProfileScreen = () => {
 
             {/* Logout Section */}
             <View style={styles.logoutContainer}>
-                <TouchableOpacity style={styles.logoutButton} onPress={() => console.log('Logout')}>
+                <TouchableOpacity style={styles.logoutButton} onPress={handleLogout}>
                     <Icon name="log-out-outline" type="ionicon" color={COLORS.white} size={20} />
                     <Text style={styles.logoutText}>Logout</Text>
                 </TouchableOpacity>
@@ -745,9 +988,14 @@ const ProfileScreen = () => {
                 <TouchableWithoutFeedback onPress={Keyboard.dismiss} style={{ flex: 1 }}>
                     <View style={modalStyles.modalOverlay}>
                         <View style={modalStyles.modalContent}>
-                            <ScrollView showsVerticalScrollIndicator={false}>
-                                <View style={modalStyles.handle} />
-                                <Text style={modalStyles.title}>Log Basal Dose</Text>
+                            <View style={modalStyles.handle} />
+                            <Text style={modalStyles.title}>Log Basal Dose</Text>
+                            
+                            <ScrollView 
+                                showsVerticalScrollIndicator={false}
+                                style={modalStyles.scrollContent}
+                                contentContainerStyle={modalStyles.scrollContentContainer}
+                            >
                                 <TextInput
                                     placeholder="Insulin Name (e.g., Lantus, Levemir)"
                                     placeholderTextColor="#999"
@@ -767,6 +1015,7 @@ const ProfileScreen = () => {
                                 <TouchableOpacity style={modalStyles.button} onPress={handleLogBasalDose}>
                                     <Text style={modalStyles.buttonText}>Log Basal Dose</Text>
                                 </TouchableOpacity>
+                                
                                 {/* Smart Feedback Messages */}
                                 {timingWarning && (
                                     <Text style={modalStyles.warningText}>{timingWarning}</Text>
@@ -804,10 +1053,14 @@ const ProfileScreen = () => {
                                         });
                                     })()}
                                 </View>
-                                <TouchableOpacity style={modalStyles.closeButton} onPress={() => setBasalModalVisible(false)}>
-                                    <Text style={modalStyles.closeButtonText}>Cancel</Text>
-                                </TouchableOpacity>
                             </ScrollView>
+                            
+                            {/* Cancel button fixed at bottom */}
+                            <View style={modalStyles.bottomButtonContainer}>
+                                <TouchableOpacity style={modalStyles.cancelButton} onPress={() => setBasalModalVisible(false)}>
+                                    <Text style={modalStyles.cancelButtonText}>Cancel</Text>
+                                </TouchableOpacity>
+                            </View>
                         </View>
                     </View>
                 </TouchableWithoutFeedback>
@@ -840,6 +1093,69 @@ const ProfileScreen = () => {
             </View>
         </Modal>
 
+        {/* Target Glucose Range Modal */}
+        <Modal
+            visible={targetGlucoseModalVisible}
+            animationType="slide"
+            transparent
+            onRequestClose={() => setTargetGlucoseModalVisible(false)}
+        >
+            <KeyboardAvoidingView
+                style={{ flex: 1 }}
+                behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+                keyboardVerticalOffset={0}
+            >
+                <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+                    <View style={modalStyles.modalOverlay}>
+                        <View style={modalStyles.modalContent}>
+                            <View style={modalStyles.handle} />
+                            
+                            <Text style={modalStyles.title}>Set Target Glucose Range</Text>
+                            <Text style={modalStyles.subtitle}>Define your personal glucose target range (mg/dL)</Text>
+                            
+                            <View style={modalStyles.inputContainer}>
+                                <Text style={modalStyles.inputLabel}>Minimum Value</Text>
+                                <TextInput
+                                    style={modalStyles.input}
+                                    placeholder="70"
+                                    placeholderTextColor="#999"
+                                    keyboardType="numeric"
+                                    value={tempTargetMin}
+                                    onChangeText={setTempTargetMin}
+                                    maxLength={3}
+                                />
+                            </View>
+                            
+                            <View style={modalStyles.inputContainer}>
+                                <Text style={modalStyles.inputLabel}>Maximum Value</Text>
+                                <TextInput
+                                    style={modalStyles.input}
+                                    placeholder="140"
+                                    placeholderTextColor="#999"
+                                    keyboardType="numeric"
+                                    value={tempTargetMax}
+                                    onChangeText={setTempTargetMax}
+                                    maxLength={3}
+                                />
+                            </View>
+                            
+                            <Text style={modalStyles.helperText}>
+                                Recommended range: 70-140 mg/dL for most individuals.
+                                Valid range: 50-250 mg/dL.
+                            </Text>
+                            
+                            <TouchableOpacity style={modalStyles.button} onPress={handleSaveTargetGlucose}>
+                                <Text style={modalStyles.buttonText}>Save Range</Text>
+                            </TouchableOpacity>
+                            
+                            <TouchableOpacity style={modalStyles.closeButton} onPress={() => setTargetGlucoseModalVisible(false)}>
+                                <Text style={modalStyles.closeButtonText}>Cancel</Text>
+                            </TouchableOpacity>
+                        </View>
+                    </View>
+                </TouchableWithoutFeedback>
+            </KeyboardAvoidingView>
+        </Modal>
 
         </>
      );
@@ -854,18 +1170,21 @@ const ProfileScreen = () => {
         backgroundColor: 'rgba(0,0,0,0.5)',
         justifyContent: 'center',
         alignItems: 'center',
-        padding: 20,
     },
     modalContent: {
-        width: '100%',
         backgroundColor: COLORS.white,
+        marginHorizontal: 20,
+        marginVertical: 40,
         borderRadius: 12,
-        padding: 20,
+        paddingHorizontal: 20,
+        paddingTop: 20,
+        paddingBottom: 80, // Extra padding for fixed Cancel button
         shadowColor: '#000',
         shadowOffset: { width: 0, height: 4 },
         shadowOpacity: 0.1,
         shadowRadius: 8,
         elevation: 5,
+        maxHeight: '85%', // Ensure modal doesn't take full height
     },
     handle: {
         width: 40,
@@ -880,6 +1199,28 @@ const ProfileScreen = () => {
         fontWeight: 'bold',
         color: COLORS.textDark,
         marginBottom: 16,
+    },
+    subtitle: {
+        fontSize: 14,
+        color: COLORS.mediumGray,
+        marginBottom: 20,
+        textAlign: 'center',
+    },
+    inputContainer: {
+        marginBottom: 16,
+    },
+    inputLabel: {
+        fontSize: 14,
+        fontWeight: '600',
+        color: COLORS.textDark,
+        marginBottom: 6,
+    },
+    helperText: {
+        fontSize: 12,
+        color: COLORS.mediumGray,
+        marginBottom: 20,
+        fontStyle: 'italic',
+        textAlign: 'center',
     },
     input: {
         borderWidth: 1,
@@ -1005,6 +1346,39 @@ const ProfileScreen = () => {
     pickerCancelButtonText: {
         color: COLORS.accent,
         fontSize: 16,
+    },
+    scrollContent: {
+        flex: 1,
+    },
+    scrollContentContainer: {
+        paddingBottom: 100, // Add padding to the bottom for the fixed button
+    },
+    bottomButtonContainer: {
+        position: 'absolute',
+        bottom: 20,
+        left: 20,
+        right: 20,
+        backgroundColor: COLORS.white,
+        paddingVertical: 10,
+        borderRadius: 12,
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.1,
+        shadowRadius: 4,
+        elevation: 3,
+    },
+    cancelButton: {
+        alignItems: 'center',
+        paddingVertical: 10,
+    },
+    cancelButtonText: {
+        color: COLORS.accent,
+        fontSize: 16,
+    },
+    connectionStatus: {
+        fontSize: 12,
+        marginTop: 4,
+        fontStyle: 'italic',
     },
  });
 

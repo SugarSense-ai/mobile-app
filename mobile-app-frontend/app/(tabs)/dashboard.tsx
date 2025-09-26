@@ -26,15 +26,16 @@ import {
   DashboardData,
   ActivityLogEntry,
 } from '@/services/dashboardService';
-import {
-  syncLatestHealthDataForDashboard,
-  hasHealthKitPermissions,
-  isAppleHealthSyncEnabledState,
-} from '@/services/healthKit';
+// HealthKit sync functions are intentionally not used during pull-to-refresh to keep refresh fast
+import { useUserIds } from '@/services/userService';
+import { useAutoHealthSync } from '@/services/useAutoHealthSync';
+import { quickSyncTodayOnly } from '@/services/healthKit';
 
 const { width } = Dimensions.get('window');
 
 const Dashboard = () => {
+  const { getDatabaseUserId } = useUserIds();
+  const [currentUserId, setCurrentUserId] = useState<number | null>(null);
   const [dashboardData, setDashboardData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -45,19 +46,65 @@ const Dashboard = () => {
   const [sleepWarningVisible, setSleepWarningVisible] = useState(true);
   const [errorInfo, setErrorInfo] = useState<{ message: string; urls: string[] } | null>(null);
 
+  // Initialize user ID
+  useEffect(() => {
+    const initializeUserId = async () => {
+      try {
+        const dbUserId = await getDatabaseUserId();
+        if (dbUserId) {
+          setCurrentUserId(dbUserId);
+          console.log('✅ Dashboard: Initialized with database user ID:', dbUserId);
+        } else {
+          console.error('❌ Dashboard: Failed to get database user ID');
+          Alert.alert('Error', 'Unable to identify user. Please try signing in again.');
+        }
+      } catch (error) {
+        console.error('❌ Dashboard: Error getting user ID:', error);
+        Alert.alert('Error', 'Unable to identify user. Please try signing in again.');
+      }
+    };
+
+    initializeUserId();
+  }, []);
+
   const fetchDashboardData = async () => {
+    if (!currentUserId) {
+      console.log('⏳ Dashboard: Waiting for user ID to be available...');
+      return;
+    }
+
     try {
       // setLoading(true) is called in onRefresh or useEffect
       setErrorInfo(null);
-      console.log('🔄 Starting dashboard data fetch using dashboardService...');
+      console.log(`🔄 Starting dashboard data fetch for user ${currentUserId}...`);
 
-      const data = await fetchDashboardDataFromService(7); // Fetch for 7 days
+      // Pass client timezone offset to ensure per-day grouping matches Apple Health UI
+      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const offsetMinutes = new Date().getTimezoneOffset();
+      const sign = offsetMinutes <= 0 ? '+' : '-';
+      const absMin = Math.abs(offsetMinutes);
+      const hh = String(Math.floor(absMin / 60)).padStart(2, '0');
+      const mm = String(absMin % 60).padStart(2, '0');
+      const tzOffset = `${sign}${hh}:${mm}`;
+      const data = await fetchDashboardDataFromService(7, currentUserId as number, tzOffset);
 
       console.log('✅ Dashboard data received successfully via service:', {
         glucose_entries: data.glucose?.data?.length || 0,
         sleep_entries: data.sleep?.data?.length || 0,
         activity_entries: data.activity?.data?.length || 0,
       });
+      
+      // Check if we have fresh data for today
+      const today = new Date().toISOString().split('T')[0];
+      const hasTodayData = data.activity?.data?.some((entry: any) => entry.date === today) ||
+                          data.sleep?.data?.some((entry: any) => entry.date === today);
+      
+      if (hasTodayData) {
+        console.log('📅 Dashboard contains fresh data for today');
+      } else {
+        console.log('⚠️ Dashboard may not contain today\'s data yet');
+      }
+      
       setDashboardData(data);
     } catch (error) {
       console.error('❌ Error fetching dashboard data from service:', error);
@@ -81,76 +128,108 @@ const Dashboard = () => {
   };
 
   const fetchActivityLogs = async () => {
-    try {
-      setLoadingActivityLogs(true);
-      console.log('🔄 Fetching comprehensive activity logs...');
-      
-      const workingUrl = API_ENDPOINTS.BASE_URL; // Assume config is now reliable
-      
-      console.log(`🔄 Fetching activity logs from: ${workingUrl}/api/activity-logs?days=30`);
-      
-      const response = await fetch(`${workingUrl}/api/activity-logs?days=30`, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        console.log('✅ Activity logs received successfully:', {
-          total_entries: data.activity_logs?.length || 0,
-          manual_entries: data.activity_logs?.filter((log: ActivityLogEntry) => log.type === 'manual').length || 0,
-          apple_health_entries: data.activity_logs?.filter((log: ActivityLogEntry) => log.type === 'apple_health').length || 0
-        });
-        
-        // DEBUG: Log first few entries to see what we're getting
-        console.log('🔍 First 5 activity log entries:');
-        (data.activity_logs || []).slice(0, 5).forEach((log: ActivityLogEntry, index: number) => {
-          console.log(`  ${index + 1}. ID: ${log.id}, Type: ${log.type}, Activity: ${log.activity_type}, Source: ${log.source}`);
-        });
-        
-        // Sort activity logs to prioritize Apple Health entries at the top of each day
-        const sortedLogs = (data.activity_logs || []).sort((a: ActivityLogEntry, b: ActivityLogEntry) => {
-          // First sort by date (newest first)
-          const dateCompare = new Date(b.date).getTime() - new Date(a.date).getTime();
-          if (dateCompare !== 0) return dateCompare;
-          
-          // For same date, prioritize Apple Health entries
-          if (a.type === 'apple_health' && b.type === 'manual') return -1;
-          if (a.type === 'manual' && b.type === 'apple_health') return 1;
-          
-          // For same type, sort by time (newest first)
-          return b.time.localeCompare(a.time);
-        });
-        
-        // Force a fresh state update with sorted data
-        setActivityLogs([]);
-        setTimeout(() => {
-          setActivityLogs(sortedLogs);
-        }, 100);
-      } else {
-        const errorText = await response.text();
-        console.error('❌ Failed to fetch activity logs:', response.status, errorText);
-        Alert.alert('Error', 'Failed to load activity logs');
-      }
-    } catch (error) {
-      console.error('❌ Error fetching activity logs:', error);
-      Alert.alert('Error', 'Unable to load activity logs. Please check your connection.');
-    } finally {
-      setLoadingActivityLogs(false);
+    if (!currentUserId) {
+      console.log('⏳ Dashboard: Waiting for user ID to fetch activity logs...');
+      return;
     }
+
+    const maxRetries = 3;
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        setLoadingActivityLogs(true);
+        console.log(`🔄 Fetching comprehensive activity logs for user ${currentUserId} (attempt ${attempt}/${maxRetries})...`);
+        
+        // Use dynamic URL resolution to find working backend
+        const { getBaseUrl } = await import('@/services/api');
+        const workingUrl = await getBaseUrl();
+        
+        const offsetMinutes = new Date().getTimezoneOffset();
+        const sign = offsetMinutes <= 0 ? '+' : '-';
+        const absMin = Math.abs(offsetMinutes);
+        const hh = String(Math.floor(absMin / 60)).padStart(2, '0');
+        const mm = String(absMin % 60).padStart(2, '0');
+        const tzOffset = `${sign}${hh}:${mm}`;
+        console.log(`🔄 Fetching activity logs from: ${workingUrl}/api/activity-logs?days=7&user_id=${currentUserId}&tz_offset=${encodeURIComponent(tzOffset)}`);
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+        
+        const response = await fetch(`${workingUrl}/api/activity-logs?days=7&user_id=${currentUserId}&tz_offset=${encodeURIComponent(tzOffset)}`, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          signal: controller.signal,
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (response.ok) {
+          const data = await response.json();
+          console.log('✅ Activity logs received successfully:', {
+            total_entries: data.activity_logs?.length || 0,
+            manual_entries: data.activity_logs?.filter((log: ActivityLogEntry) => log.type === 'manual').length || 0,
+            apple_health_entries: data.activity_logs?.filter((log: ActivityLogEntry) => log.type === 'apple_health').length || 0
+          });
+          
+          // DEBUG: Log first few entries to see what we're getting
+          console.log('🔍 First 5 activity log entries:');
+          (data.activity_logs || []).slice(0, 5).forEach((log: ActivityLogEntry, index: number) => {
+            console.log(`  ${index + 1}. ID: ${log.id}, Type: ${log.type}, Activity: ${log.activity_type}, Source: ${log.source}`);
+          });
+
+          setActivityLogs(data.activity_logs || []);
+          return; // Success, exit retry loop
+        } else {
+          throw new Error(`Failed to fetch activity logs: ${response.status} ${response.statusText}`);
+        }
+      } catch (error: any) {
+        lastError = error;
+        console.error(`❌ Activity logs fetch attempt ${attempt} failed:`, error.message);
+        
+        // Check if it's a retryable error
+        const isRetryableError = error.name === 'AbortError' || 
+                                error.message.includes('Network request failed') ||
+                                error.message.includes('fetch') ||
+                                (error.message.includes('Failed to fetch') && error.message.includes('50')); // 5xx errors
+        
+        if (isRetryableError && attempt < maxRetries) {
+          const retryDelay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+          console.log(`⏳ Retrying activity logs fetch in ${retryDelay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+          continue;
+        } else if (!isRetryableError) {
+          // Non-retryable error, break out of retry loop
+          break;
+        }
+      } finally {
+        setLoadingActivityLogs(false);
+      }
+    }
+
+    console.error(`❌ All activity logs fetch attempts failed after ${maxRetries} tries`);
+    console.error('❌ Final error:', lastError);
+    setActivityLogs([]);
   };
   
   const checkSleepDataQuality = async () => {
+    if (!currentUserId) {
+      console.log('⏳ Dashboard: Waiting for user ID to check sleep data quality...');
+      return;
+    }
+
     try {
-      console.log('🔍 Checking sleep data quality for truncation issues...');
+      console.log(`🔍 Checking sleep data quality for user ${currentUserId}...`);
       
-      const workingUrl = API_ENDPOINTS.BASE_URL; // Assume config is now reliable
+      // Use dynamic URL resolution to find working backend
+      const { getBaseUrl } = await import('@/services/api');
+      const workingUrl = await getBaseUrl();
       if (!workingUrl) return;
       
-      const response = await fetch(`${workingUrl}/api/enhanced-sleep-analysis?days=7`, {
+      const response = await fetch(`${workingUrl}/api/enhanced-sleep-analysis?days=7&user_id=${currentUserId}`, {
         method: 'GET',
         headers: { 'Content-Type': 'application/json' },
       });
@@ -181,62 +260,49 @@ const Dashboard = () => {
   };
 
   useEffect(() => {
-    setLoading(true);
-    fetchDashboardData();
-    fetchActivityLogs();
-    checkSleepDataQuality();
-  }, []);
+    if (currentUserId) {
+      console.log(`🚀 Dashboard: User ID available (${currentUserId}), starting data fetch...`);
+      setLoading(true);
+      fetchDashboardData();
+      fetchActivityLogs();
+      checkSleepDataQuality();
+    }
+  }, [currentUserId]);
 
   const onRefresh = async () => {
     // Prevent multiple concurrent refresh operations
-    if (refreshing) {
-      console.log('🔄 Refresh already in progress - skipping duplicate request');
+    if (refreshing || !currentUserId) {
+      console.log('🔄 Refresh skipped - already in progress or no user ID available');
       return;
     }
-    
+
     setRefreshing(true);
-    
+
     try {
-      // Step 1: Check if Apple Health sync is enabled and sync latest data
-      const isSyncEnabled = isAppleHealthSyncEnabledState();
-      const hasPermissions = await hasHealthKitPermissions();
-      
-      if (isSyncEnabled && hasPermissions) {
-        console.log('🔄 Dashboard refresh: Apple Health sync enabled, syncing latest data...');
-        const syncResult = await syncLatestHealthDataForDashboard(1, 15); // Last 15 days
-        
-        if (syncResult.success) {
-          console.log(`✅ Apple Health sync completed successfully: ${syncResult.message}`);
-          if (syncResult.recordsSynced && syncResult.recordsSynced > 0) {
-            // Show a subtle notification about fresh data
-            console.log(`📊 Refreshed dashboard with ${syncResult.recordsSynced} fresh health records`);
-          }
-        } else {
-          console.log('⚠️ Apple Health sync failed during refresh (non-critical):', syncResult.message);
-        }
-      } else if (!isSyncEnabled) {
-        console.log('🔐 Apple Health sync is disabled - skipping sync during refresh');
-      } else {
-        console.log('🔐 No HealthKit permissions - skipping sync during refresh');
+      // First do a quick sync for today's Apple Health data so archive reflects latest steps
+      let timedOut = false;
+      try {
+        console.log('🚀 Quick sync for today before refreshing dashboard...');
+        const result = await quickSyncTodayOnly(currentUserId);
+        console.log(`✅ Quick sync result: ${result.success} (${result.message})`);
+        timedOut = !result.success && /timed out/i.test(result.message || '');
+      } catch (syncErr: any) {
+        console.warn('⚠️ Quick sync failed during pull-to-refresh:', syncErr?.message || syncErr);
       }
-      
-      // Step 2: Fetch latest dashboard data (now includes any synced data)
-      await Promise.all([
-        fetchDashboardData(),
-        fetchActivityLogs(),
-        checkSleepDataQuality(),
-      ]);
-      
+
+      // First fetch immediately
+      await fetchDashboardData();
+
+      // If the quick sync timed out, the backend may still be committing.
+      // Fetch once more shortly after to capture the just-updated archive.
+      if (timedOut) {
+        await new Promise(res => setTimeout(res, 2000));
+        await fetchDashboardData();
+      }
     } catch (error) {
       console.error('❌ Error during dashboard refresh:', error);
-      // Continue with normal refresh even if Apple Health sync fails
-      await Promise.all([
-        fetchDashboardData(),
-        fetchActivityLogs(),
-        checkSleepDataQuality(),
-      ]);
     } finally {
-      // setRefreshing(false) is handled in fetchDashboardData
+      setRefreshing(false);
     }
   };
 
@@ -589,7 +655,12 @@ const Dashboard = () => {
 
   const renderActivityTimeline = () => {
     if (selectedMetric === 'activity') {
-      return renderActivityLogs();
+      // Show only last 7 days for Activity History as well
+      return (
+        <View>
+          {renderActivityLogs()}
+        </View>
+      );
     }
 
     // Original activity timeline for summary view
@@ -603,6 +674,7 @@ const Dashboard = () => {
       );
     }
     
+    // Ensure only last 7 days shown in summary timeline
     return dashboardData.activity.data.slice(0, 7).map((item, index) => (
       <TimelineItem
         key={item.date}
@@ -614,6 +686,49 @@ const Dashboard = () => {
       />
     ));
   };
+
+  // Auto Health Sync Hook - DISABLED to prevent database lock conflicts
+  // const {
+  //   isSyncing: autoSyncing,
+  //   lastSyncTime: autoSyncTime,
+  //   error: autoSyncError,
+  //   triggerManualSync: triggerAutoManualSync,
+  // } = useAutoHealthSync({
+  //   userId: currentUserId,
+  //   syncFn: async (userId: number) => {
+  //     // Skip if manual refresh is in progress
+  //     if (refreshing) {
+  //       console.log('⏭️ Auto-sync skipped - manual refresh in progress');
+  //       return;
+  //     }
+  //     
+  //     // Check if Apple Health sync is enabled before syncing
+  //     const isSyncEnabled = isAppleHealthSyncEnabledState();
+  //     if (isSyncEnabled) {
+  //       try {
+  //         // For auto-refresh, sync 7 days to maintain historical data
+  //         // The backend currently clears all display data for synced types,
+  //         // so we need to sync enough days to maintain the dashboard view
+  //         await syncLatestHealthDataForDashboard(userId, 7);
+  //       } catch (syncError) {
+  //         console.error('❌ Auto-sync Apple Health failed:', syncError);
+  //         // Continue with dashboard refresh even if sync fails
+  //       }
+  //     }
+  //     
+  //     // After syncing (or if sync fails), fetch dashboard data to update UI
+  //     await fetchDashboardData();
+  //     await fetchActivityLogs();
+  //     await checkSleepDataQuality();
+  //   },
+  //   cooldownMs: 120000, // 2 minutes to reduce database conflicts
+  // });
+
+  // Auto-sync indicators disabled; refresh path is fetch-only
+  const autoSyncing = false;
+  const autoSyncTime = null;
+  const autoSyncError = null;
+  const triggerAutoManualSync = null;
 
   if (loading) {
     return (
@@ -658,6 +773,21 @@ const Dashboard = () => {
 
   return (
     <SafeAreaView style={styles.container}>
+      {/* Subtle syncing indicator */}
+      {autoSyncing && (
+        <View style={{ position: 'absolute', top: 10, right: 10, zIndex: 10, backgroundColor: '#FFF8E1', padding: 8, borderRadius: 8, flexDirection: 'row', alignItems: 'center' }}>
+          <Ionicons name="sync" size={16} color="#007AFF" style={{ marginRight: 6 }} />
+          <Text style={{ color: '#007AFF', fontWeight: '600' }}>Syncing...</Text>
+        </View>
+      )}
+      
+      {/* Auto-sync error indicator */}
+      {autoSyncError && !autoSyncing && (
+        <View style={{ position: 'absolute', top: 10, right: 10, zIndex: 10, backgroundColor: '#FFE5E5', padding: 8, borderRadius: 8, flexDirection: 'row', alignItems: 'center' }}>
+          <Ionicons name="alert-circle" size={16} color="#E53E3E" style={{ marginRight: 6 }} />
+          <Text style={{ color: '#E53E3E', fontSize: 12, fontWeight: '600' }}>Sync issue</Text>
+        </View>
+      )}
       <ScrollView
         style={styles.scrollView}
         refreshControl={

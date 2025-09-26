@@ -48,6 +48,8 @@
     <dict>
       <key>NSAllowsArbitraryLoads</key>
       <true/>
+      <key>NSAllowsLocalNetworking</key>
+      <true/>
     </dict>
     <key>NSCameraUsageDescription</key>
     <string>Allow SugarSense.ai to access your camera to take photos for food logging and profile updates.</string>

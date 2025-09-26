@@ -1,5 +1,6 @@
 import { API_ENDPOINTS } from '@/constants/config';
 import { testNetworkConnectivity, NetworkInfo } from '@/constants/networkUtils';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 let apiConfig: { baseUrl: string } = {
   baseUrl: API_ENDPOINTS.BASE_URL,
@@ -11,6 +12,23 @@ let isInitializing = false;
 export const initializeApi = async (): Promise<string> => {
   if (networkInfo?.workingUrl) {
     return networkInfo.workingUrl;
+  }
+
+  // 1️⃣ Try cached URL quickly ---------------------------------------
+  try {
+    const cached = await AsyncStorage.getItem('LAST_WORKING_BACKEND_URL');
+    if (cached) {
+      console.log(`🗄️  Trying cached backend URL first: ${cached}`);
+      const quick = await testNetworkConnectivity([cached], 0);
+      if (quick.workingUrl) {
+        networkInfo = quick;
+        apiConfig.baseUrl = quick.workingUrl;
+        await AsyncStorage.setItem('LAST_WORKING_BACKEND_URL', quick.workingUrl);
+        return quick.workingUrl;
+      }
+    }
+  } catch (e) {
+    console.log('⚠️ Failed to use cached URL', e);
   }
 
   if (isInitializing) {
@@ -35,6 +53,10 @@ export const initializeApi = async (): Promise<string> => {
     if (result.workingUrl) {
       console.log(`✅ API initialized with base URL: ${result.workingUrl}`);
       apiConfig.baseUrl = result.workingUrl;
+      // Cache for next launch
+      try {
+        await AsyncStorage.setItem('LAST_WORKING_BACKEND_URL', result.workingUrl);
+      } catch {}
       return result.workingUrl;
     } else {
       console.error('❌ Failed to find a working backend URL.');
@@ -44,6 +66,21 @@ export const initializeApi = async (): Promise<string> => {
     }
   } catch (error) {
     console.error('Error during API initialization:', error);
+    // Retry once more after a short delay, in case of a startup race condition
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    console.log('🔄 Retrying API initialization one last time...');
+    const finalResult = await testNetworkConnectivity(API_ENDPOINTS.FALLBACK_URLS, 1);
+    if (finalResult.workingUrl) {
+      console.log(`✅ API initialized on second attempt: ${finalResult.workingUrl}`);
+      networkInfo = finalResult;
+      apiConfig.baseUrl = finalResult.workingUrl;
+      await AsyncStorage.setItem('LAST_WORKING_BACKEND_URL', finalResult.workingUrl);
+      isInitializing = false;
+      return finalResult.workingUrl;
+    }
+    
+    console.error('❌ Final API initialization attempt failed.');
+    isInitializing = false;
     throw error;
   } finally {
     isInitializing = false;
